@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,15 +17,19 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE, DEBUG_KERNEL_SMALL_DUMP,
     DEBUG_MODNAME_SYMBOL_FILE, DEBUG_MODULE_PARAMETERS, DEBUG_MODULE_USER_MODE,
     DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL, DEBUG_REGISTER_DESCRIPTION,
-    DEBUG_REGISTER_SUB_REGISTER, DEBUG_STACK_FRAME, DEBUG_STATUS_GO, DEBUG_STATUS_NO_DEBUGGEE,
-    DEBUG_SYMINFO_IMAGEHLP_MODULEW64, DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF,
-    DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE,
-    DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_FLOAT32, DEBUG_VALUE_FLOAT64,
-    DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82, DEBUG_VALUE_FLOAT128, DEBUG_VALUE_INT8,
-    DEBUG_VALUE_INT16, DEBUG_VALUE_INT32, DEBUG_VALUE_INT64, DEBUG_VALUE_VECTOR64,
-    DEBUG_VALUE_VECTOR128, IDebugAdvanced2, IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6,
-    IDebugControl4, IDebugDataSpaces4, IDebugEventContextCallbacks, IDebugOutputCallbacks,
-    IDebugRegisters, IDebugSymbols3, IDebugSystemObjects,
+    DEBUG_REGISTER_SUB_REGISTER, DEBUG_STACK_FRAME, DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED,
+    DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_MASK, DEBUG_STATUS_NO_DEBUGGEE,
+    DEBUG_STATUS_REVERSE_GO, DEBUG_STATUS_REVERSE_STEP_BRANCH, DEBUG_STATUS_REVERSE_STEP_INTO,
+    DEBUG_STATUS_REVERSE_STEP_OVER, DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO,
+    DEBUG_STATUS_STEP_OVER, DEBUG_SYMINFO_IMAGEHLP_MODULEW64, DEBUG_SYMTYPE_CODEVIEW,
+    DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT,
+    DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_FLOAT32,
+    DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82, DEBUG_VALUE_FLOAT128,
+    DEBUG_VALUE_INT8, DEBUG_VALUE_INT16, DEBUG_VALUE_INT32, DEBUG_VALUE_INT64,
+    DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128, IDebugAdvanced2, IDebugBreakpoint,
+    IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
+    IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
+    IDebugSystemObjects,
 };
 use windows::Win32::System::Diagnostics::Debug::IMAGEHLP_MODULEW64;
 
@@ -209,6 +213,140 @@ impl InterruptHandle {
             }
         })
     }
+}
+
+/// How often a watchdog past its deadline raises the break again.
+///
+/// One `SetInterrupt` is a request, not a guarantee: the engine acts on it at its next poll, and a
+/// busy operation can be between polls when it arrives. Repeating costs one call on a path that
+/// has already given up on the deadline.
+const WATCHDOG_REPEAT: Duration = Duration::from_millis(200);
+
+/// A thread that Ctrl+Breaks an operation once a deadline passes — and that stops **the moment**
+/// it is disarmed, rather than at the end of a poll interval.
+///
+/// That last property is the whole reason this is a type rather than two `thread::spawn`s.
+/// Both bounded paths here used to poll a flag on a fixed sleep, so `join` waited out whatever was
+/// left of it: **every** bounded operation paid up to one interval, whether or not it came close to
+/// its deadline. windbg-mcp measured that tax at ~200ms on a command whose unbounded median was
+/// 0.22ms, and routed its cheap queries around the bounded path to avoid it — a design decision
+/// taken to work around a sleep. A condition variable makes the disarm immediate, so the bound
+/// costs nothing until it is actually reached.
+///
+/// The break itself is a closure rather than an [`InterruptHandle`], which is what lets the
+/// behaviour be tested without a debuggee: the unit tests below arm one over a counter.
+struct Watchdog {
+    /// Set by [`Self::disarm`] and read by the thread; the condvar is what wakes it to see that.
+    disarmed: Arc<(Mutex<bool>, Condvar)>,
+    /// Whether the deadline was ever reached — the fact a caller needs, since a forced break is
+    /// not the event it was waiting for.
+    fired: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    /// Arms a watchdog that calls `on_deadline` once `deadline` has passed, and again every
+    /// [`WATCHDOG_REPEAT`] until it is disarmed.
+    ///
+    /// A zero `deadline` fires immediately, which is what a caller asking for no time at all
+    /// means; a caller wanting *no bound* does not arm one.
+    fn arm(deadline: Duration, on_deadline: impl Fn() + Send + 'static) -> Self {
+        let disarmed = Arc::new((Mutex::new(false), Condvar::new()));
+        let fired = Arc::new(AtomicBool::new(false));
+        let woken = Arc::clone(&disarmed);
+        let raised = Arc::clone(&fired);
+        let thread = thread::spawn(move || {
+            let (lock, wake) = &*woken;
+            let start = Instant::now();
+            loop {
+                // Past the deadline the only question left is when to repeat; before it, sleep
+                // exactly as long as there is left, so a watchdog that is never reached wakes
+                // once.
+                let nap = if raised.load(Ordering::SeqCst) {
+                    WATCHDOG_REPEAT
+                } else {
+                    deadline.saturating_sub(start.elapsed())
+                };
+                {
+                    let stop = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if *stop {
+                        return;
+                    }
+                    // The guard is dropped at the end of this block, so the interrupt below is
+                    // never raised while holding a lock the disarming thread wants.
+                    let (stop, _) = wake
+                        .wait_timeout(stop, nap)
+                        .unwrap_or_else(|e| e.into_inner());
+                    if *stop {
+                        return;
+                    }
+                }
+                // A spurious wake-up lands here too, and is harmless: the deadline decides,
+                // not the fact of having woken.
+                if start.elapsed() >= deadline {
+                    on_deadline();
+                    raised.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+        Self {
+            disarmed,
+            fired,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stops the watchdog, waits for its thread, and reports whether it had raised a break.
+    fn disarm(mut self) -> bool {
+        self.stop();
+        self.fired.load(Ordering::SeqCst)
+    }
+
+    /// Idempotent, so [`Drop`] can run it again after [`Self::disarm`] already has — and so a
+    /// panic between arming and disarming still ends the thread rather than leaking it.
+    fn stop(&mut self) {
+        {
+            let (lock, wake) = &*self.disarmed;
+            let mut stop = lock.lock().unwrap_or_else(|e| e.into_inner());
+            *stop = true;
+            wake.notify_all();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Whether an execution status means the engine has been told to run and is waiting for a
+/// `WaitForEvent` to pump it.
+///
+/// Every go and every step, forward and reverse — not `DEBUG_STATUS_BREAK` (stopped),
+/// `DEBUG_STATUS_NO_DEBUGGEE` (nothing to run) or the housekeeping statuses, all of which are
+/// states an ordinary command can be issued in.
+///
+/// Masked because `GetExecutionStatus` is documented to carry flags above the status itself
+/// (`DEBUG_STATUS_INSIDE_WAIT`, `DEBUG_STATUS_WAIT_TIMEOUT`); they do not fit the `u32` this
+/// binding returns, so the mask is insurance rather than a fix, and it costs nothing.
+fn is_running_status(status: u32) -> bool {
+    matches!(
+        status & DEBUG_STATUS_MASK,
+        DEBUG_STATUS_GO
+            | DEBUG_STATUS_GO_HANDLED
+            | DEBUG_STATUS_GO_NOT_HANDLED
+            | DEBUG_STATUS_STEP_OVER
+            | DEBUG_STATUS_STEP_INTO
+            | DEBUG_STATUS_STEP_BRANCH
+            | DEBUG_STATUS_REVERSE_GO
+            | DEBUG_STATUS_REVERSE_STEP_BRANCH
+            | DEBUG_STATUS_REVERSE_STEP_OVER
+            | DEBUG_STATUS_REVERSE_STEP_INTO
+    )
 }
 
 /// Encodes a `&str` as a NUL-terminated UTF-16 buffer for the `*Wide` DbgEng APIs.
@@ -1583,27 +1721,10 @@ impl DebugEngine {
 
         // Arm a watchdog that Ctrl+Breaks the engine after `timeout_ms` so a long `Execute`
         // returns instead of hanging the engine thread. Mirrors `wait_for_event_bounded`.
-        let done = Arc::new(AtomicBool::new(false));
-        let fired = Arc::new(AtomicBool::new(false));
         let watchdog = (timeout_ms > 0).then(|| {
-            let done_watch = Arc::clone(&done);
-            let fired_watch = Arc::clone(&fired);
             let handle = self.interrupt_handle();
-            let deadline = Duration::from_millis(timeout_ms as u64);
-            thread::spawn(move || {
-                let handle = handle; // move the whole (Send) handle, not just the raw field
-                let start = Instant::now();
-                loop {
-                    if done_watch.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    if start.elapsed() >= deadline {
-                        // Repeat in case a busy command swallows one interrupt.
-                        let _ = handle.interrupt();
-                        fired_watch.store(true, Ordering::SeqCst);
-                    }
-                    thread::sleep(Duration::from_millis(200));
-                }
+            Watchdog::arm(Duration::from_millis(u64::from(timeout_ms)), move || {
+                let _ = handle.interrupt();
             })
         });
 
@@ -1612,17 +1733,13 @@ impl DebugEngine {
                 .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_ECHO)
         };
 
-        done.store(true, Ordering::SeqCst);
-        if let Some(w) = watchdog {
-            let _ = w.join();
-        }
+        let by_watchdog = watchdog.is_some_and(Watchdog::disarm);
 
         // Always detach the callbacks before `output_interface`/`output_buffer` drop.
         unsafe {
             let _ = self.client.SetOutputCallbacks(None);
         }
 
-        let by_watchdog = fired.load(Ordering::SeqCst);
         // Either origin aborts the command the same way, so both take the recovery below; only the
         // note is the watchdog's alone. Swapped rather than read, so a request that arrived while
         // this command ran is accounted for here and cannot be charged to the next one.
@@ -1701,32 +1818,13 @@ impl DebugEngine {
     /// So the `bool` below can only ever be `true` for a target that connected; an
     /// unreachable one hangs instead of timing out.
     fn wait_for_event_bounded(&self, timeout_ms: u32) -> (windows::core::Result<()>, bool) {
-        let done = Arc::new(AtomicBool::new(false));
-        let fired = Arc::new(AtomicBool::new(false));
-        let done_watch = Arc::clone(&done);
-        let fired_watch = Arc::clone(&fired);
         let handle = self.interrupt_handle();
-        let deadline = Duration::from_millis(timeout_ms as u64);
-        let watchdog = thread::spawn(move || {
-            let handle = handle; // capture the whole (Send) handle, not just the raw field
-            let start = Instant::now();
-            loop {
-                if done_watch.load(Ordering::SeqCst) {
-                    return;
-                }
-                if start.elapsed() >= deadline {
-                    // Ctrl+Break a connected target so the engine thread's WaitForEvent
-                    // returns with a stop. Repeat in case a busy target ignores one.
-                    let _ = handle.interrupt();
-                    fired_watch.store(true, Ordering::SeqCst);
-                }
-                thread::sleep(Duration::from_millis(300));
-            }
+        // Ctrl+Break a connected target so the engine thread's WaitForEvent returns with a stop.
+        let watchdog = Watchdog::arm(Duration::from_millis(u64::from(timeout_ms)), move || {
+            let _ = handle.interrupt();
         });
         let result = unsafe { self.control.WaitForEvent(0, WAIT_INFINITE) };
-        done.store(true, Ordering::SeqCst);
-        let _ = watchdog.join();
-        (result, fired.load(Ordering::SeqCst))
+        (result, watchdog.disarm())
     }
 
     /// Issues an execution-control command (`g`, `t`, `p`, `g-`, `t-`, `p-`, …) and
@@ -1738,10 +1836,21 @@ impl DebugEngine {
     /// resulting execution (so e.g. a "Breakpoint N hit" message is included), which is
     /// what makes go/step (and TTD forward/reverse navigation) actually advance.
     ///
-    /// Reports [`Interruption::OnRequest`] in `cut_short` when a host asked for the break, so a
-    /// caller can tell "the target stopped" from "somebody stopped it". A **deadline**-forced break
-    /// is deliberately not reported: for go/step the watchdog's bound is an ordinary outcome — the
-    /// target simply had not stopped yet — and callers already treat it as one.
+    /// `cut_short` says which of the three things happened, and a caller that ignores it reports
+    /// "the target stopped here" for two cases where it did not. [`Interruption::OnRequest`] is a
+    /// host asking through an [`InterruptHandle`]; [`Interruption::Deadline`] is `timeout_ms`
+    /// passing with the target still going, so the break is this crate's own and the position is
+    /// wherever the target happened to be; `None` is the target stopping on its own.
+    ///
+    /// **The wait is [`Self::wait_for_event_bounded`] for every target type, and that is load
+    /// bearing rather than uniform-for-neatness.** A live kernel needs the INFINITE wait because a
+    /// finite one returns `E_NOTIMPL` there — but a finite `WaitForEvent` is not usable on the
+    /// others either, and fails far more quietly: on expiry it returns `S_FALSE` with the target
+    /// **still running** and the engine holding no current process/thread, and nothing recovers
+    /// from that. [`Self::run_to_address`] has said so since it was written, and used the bounded
+    /// wait everywhere for that reason, while this function kept the finite one for user-mode,
+    /// dumps and TTD. Measured on a user-mode target: one `go` with nothing to stop it left every
+    /// later command — `bl`, `r`, `? @$ip` — failing with `0x80040205`, permanently.
     pub fn execute_and_wait(
         &self,
         command: &str,
@@ -1759,12 +1868,6 @@ impl DebugEngine {
         if status == DEBUG_STATUS_NO_DEBUGGEE {
             return Err(DbgEngError::NoDebuggee);
         }
-
-        // A live kernel target requires an INFINITE WaitForEvent timeout; a finite one
-        // returns E_NOTIMPL, so go/step would never advance. We instead wait INFINITE but
-        // bound it with a watchdog (below), so `timeout_ms` still caps the wait without
-        // hanging the engine thread. Dumps/TTD/user-mode use the timeout directly.
-        let live_kernel = self.is_live_kernel();
 
         let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
@@ -1784,27 +1887,27 @@ impl DebugEngine {
             self.control
                 .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_ECHO)
         };
-        let waited = if exec.is_ok() {
-            if live_kernel {
-                // A forced break at the bound is a fine outcome for go/step (the target
-                // simply hadn't stopped yet), so ignore the watchdog-fired flag here.
-                self.wait_for_event_bounded(timeout_ms).0
-            } else {
-                unsafe { self.control.WaitForEvent(0, timeout_ms) }
-            }
+        let (waited, by_watchdog) = if exec.is_ok() {
+            self.wait_for_event_bounded(timeout_ms)
         } else {
-            Ok(())
+            (Ok(()), false)
         };
 
         unsafe {
             let _ = self.client.SetOutputCallbacks(None);
         }
 
-        // A break the *host* asked for makes both of these fail, exactly as it does in
+        // A break — either origin's — makes both of these fail, exactly as it does in
         // `execute_command_bounded` — and for the same reason the output must survive it, since a
         // `go` stopped on request has still moved the target and the caller needs to see where to.
-        let on_request = self.interrupt_raised.swap(false, Ordering::SeqCst);
-        if on_request {
+        //
+        // **The origin is decided by the watchdog's own flag, not by `interrupt_raised`**, which
+        // the watchdog sets too (that is what `InterruptHandle::interrupt` does). Reading the
+        // shared flag alone reports this crate's own deadline as "a host asked" — which it did on
+        // the live-kernel path for as long as that path was the only bounded one, and would now
+        // do so on every target.
+        let interrupted = by_watchdog | self.interrupt_raised.swap(false, Ordering::SeqCst);
+        if interrupted {
             // As there: consume anything the engine did not, so the next operation starts clean.
             let _ = self.interrupted();
         } else {
@@ -1814,8 +1917,88 @@ impl DebugEngine {
 
         Ok(CommandRun {
             output: String::from_utf8_lossy(&output_buffer).to_string(),
-            cut_short: on_request.then_some(Interruption::OnRequest),
+            cut_short: match (by_watchdog, interrupted) {
+                (true, _) => Some(Interruption::Deadline {
+                    after_ms: timeout_ms,
+                }),
+                (false, true) => Some(Interruption::OnRequest),
+                (false, false) => None,
+            },
         })
+    }
+
+    /// Whether the engine has been *told to run* and is waiting to be pumped.
+    ///
+    /// This is the state a plain [`Self::execute_command`] leaves behind when the text it was
+    /// given happened to be execution control — `g`, `p`, `t`, a `;` list ending in one, a script
+    /// that reaches one. `Execute` sets the run state and returns; only a `WaitForEvent` moves the
+    /// target. Until one does, the engine answers read-only commands normally and refuses every
+    /// execution-control command with `0x80040205`, which reads as a half-alive session.
+    ///
+    /// Ask the engine rather than reading the command, because no list of command names can be
+    /// exhaustive — the data model, an alias, and `.if` all reach execution without saying so.
+    pub fn is_running(&self) -> Result<bool, DbgEngError> {
+        Ok(is_running_status(self.execution_status()?))
+    }
+
+    /// Pumps the engine to a stop if a command left it running, and reports what happened:
+    /// `Ok(None)` when there was nothing to settle, `Ok(Some(run))` with the output the pump
+    /// captured otherwise — `cut_short` being [`Interruption::Deadline`] when the target had not
+    /// stopped by `timeout_ms` and was broken in at the bound.
+    ///
+    /// This is the recovery for the state [`Self::is_running`] describes, and it is why that state
+    /// need not be prevented by inspecting command text. Calling it after every plain `Execute`
+    /// costs one `GetExecutionStatus` in the ordinary case.
+    ///
+    /// A `timeout_ms` of zero breaks the target in at once rather than disabling the bound — the
+    /// same meaning it has for [`Self::run_to_address`], and the opposite of
+    /// [`Self::execute_command_bounded`]'s. There is no "wait for ever" here on purpose: this runs
+    /// on a path whose caller has already spent most of its budget.
+    pub fn settle(&self, timeout_ms: u32) -> Result<Option<CommandRun>, DbgEngError> {
+        if !self.is_running()? {
+            return Ok(None);
+        }
+        // Whatever was raised before this belongs to the last operation; see
+        // `execute_command_bounded`, which clears it for the same reason.
+        self.interrupt_raised.store(false, Ordering::SeqCst);
+
+        // Captured, because the pump is where the interesting output is: the command that set the
+        // run state printed only its own echo, and the breakpoint banner, module loads and stop
+        // reason all arrive here.
+        let mut output_buffer = Vec::<u8>::with_capacity(4096);
+        let output_callbacks = OutputCallbacks::new(&mut output_buffer);
+        let output_interface: IDebugOutputCallbacks = output_callbacks.into();
+        unsafe {
+            self.client
+                .SetOutputCallbacks(Some(&output_interface))
+                .map_err(DbgEngError::CommandFailed)?;
+        }
+
+        let (waited, by_watchdog) = self.wait_for_event_bounded(timeout_ms);
+
+        unsafe {
+            let _ = self.client.SetOutputCallbacks(None);
+        }
+
+        // The same three-way origin as `execute_and_wait`, for the same reason: the watchdog's own
+        // flag decides, because `interrupt_raised` is set by the watchdog too.
+        let interrupted = by_watchdog | self.interrupt_raised.swap(false, Ordering::SeqCst);
+        if interrupted {
+            let _ = self.interrupted();
+        } else {
+            waited.map_err(DbgEngError::CommandFailed)?;
+        }
+
+        Ok(Some(CommandRun {
+            output: String::from_utf8_lossy(&output_buffer).to_string(),
+            cut_short: match (by_watchdog, interrupted) {
+                (true, _) => Some(Interruption::Deadline {
+                    after_ms: timeout_ms,
+                }),
+                (false, true) => Some(Interruption::OnRequest),
+                (false, false) => None,
+            },
+        }))
     }
 
     /// Runs the target until it reaches `address` and reports a **structured** stop reason
@@ -3407,7 +3590,9 @@ impl<'a> Breakpoint<'a> {
 #[cfg(test)]
 mod tests {
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DEBUG_VALUE_0, DEBUG_VALUE_INVALID, DEBUG_VALUE_TYPES,
+        DEBUG_STATUS_BREAK, DEBUG_STATUS_IGNORE_EVENT, DEBUG_STATUS_NO_CHANGE,
+        DEBUG_STATUS_OUT_OF_SYNC, DEBUG_STATUS_RESTART_REQUESTED, DEBUG_STATUS_TIMEOUT,
+        DEBUG_STATUS_WAIT_INPUT, DEBUG_VALUE_0, DEBUG_VALUE_INVALID, DEBUG_VALUE_TYPES,
     };
 
     use super::*;
@@ -3788,6 +3973,232 @@ mod tests {
             return false;
         }
         read_pseudo_register_opt(e, "$t1") == Some(sentinel)
+    }
+
+    /// Every status the engine can be in while it is waiting to be pumped, and every one it
+    /// cannot — pinned by value, because the whole point of asking the engine instead of reading
+    /// the command is that this predicate is the only thing standing between a half-alive session
+    /// and a settled one.
+    #[test]
+    fn every_go_and_step_status_is_a_running_one_and_nothing_else_is() {
+        for status in [
+            DEBUG_STATUS_GO,
+            DEBUG_STATUS_GO_HANDLED,
+            DEBUG_STATUS_GO_NOT_HANDLED,
+            DEBUG_STATUS_STEP_OVER,
+            DEBUG_STATUS_STEP_INTO,
+            DEBUG_STATUS_STEP_BRANCH,
+            DEBUG_STATUS_REVERSE_GO,
+            DEBUG_STATUS_REVERSE_STEP_BRANCH,
+            DEBUG_STATUS_REVERSE_STEP_OVER,
+            DEBUG_STATUS_REVERSE_STEP_INTO,
+        ] {
+            assert!(
+                is_running_status(status),
+                "status {status} reads as stopped"
+            );
+        }
+        for status in [
+            DEBUG_STATUS_NO_CHANGE,
+            DEBUG_STATUS_BREAK,
+            DEBUG_STATUS_NO_DEBUGGEE,
+            DEBUG_STATUS_IGNORE_EVENT,
+            DEBUG_STATUS_RESTART_REQUESTED,
+            DEBUG_STATUS_OUT_OF_SYNC,
+            DEBUG_STATUS_WAIT_INPUT,
+            DEBUG_STATUS_TIMEOUT,
+        ] {
+            assert!(
+                !is_running_status(status),
+                "status {status} reads as running"
+            );
+        }
+    }
+
+    /// A watchdog that is disarmed before its deadline returns **at once** and never fires.
+    ///
+    /// The "at once" is the assertion that matters, and it is a regression test rather than a
+    /// tautology: both bounded paths here used to poll a flag on a 200/300ms sleep, so `join` sat
+    /// out the rest of that interval on every call — the tax that made a finite `WaitForEvent`
+    /// look like the cheaper option for user-mode targets, which is the bug this branch exists to
+    /// fix. The bound is deliberately loose (a CI runner is not a bench) and still an order of
+    /// magnitude under the old floor.
+    #[cfg(not(miri))]
+    #[test]
+    fn a_watchdog_disarmed_before_its_deadline_costs_nothing() {
+        let fires = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&fires);
+        let watchdog = Watchdog::arm(Duration::from_secs(30), move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let fired = watchdog.disarm();
+        let took = started.elapsed();
+        assert!(!fired, "a watchdog 30s from its deadline reported firing");
+        assert_eq!(fires.load(Ordering::SeqCst), 0);
+        assert!(
+            took < Duration::from_millis(50),
+            "disarming took {took:?}; it waits for a wake-up, not for a poll interval"
+        );
+    }
+
+    /// Past its deadline a watchdog fires, and keeps firing until it is disarmed.
+    ///
+    /// The repeat is not decoration: one `SetInterrupt` is a request the engine acts on at its
+    /// next poll, and a busy operation can be between polls when it arrives.
+    #[cfg(not(miri))]
+    #[test]
+    fn a_watchdog_past_its_deadline_keeps_raising_the_break() {
+        let fires = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&fires);
+        // Zero means "no time at all", so the first raise is immediate.
+        let watchdog = Watchdog::arm(Duration::ZERO, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        thread::sleep(WATCHDOG_REPEAT * 3);
+        assert!(
+            watchdog.disarm(),
+            "a watchdog past its deadline reported not firing"
+        );
+        let fires = fires.load(Ordering::SeqCst);
+        assert!(
+            fires >= 2,
+            "raised the break {fires} time(s) over three repeat intervals; it must repeat"
+        );
+    }
+
+    /// A `go` that reaches no stop leaves the engine **usable** — the regression this branch is
+    /// named for.
+    ///
+    /// Before it, `execute_and_wait` used a finite `WaitForEvent` for everything that was not a
+    /// live kernel. On expiry that returns `S_FALSE` with the target still running and the engine
+    /// holding no current process/thread, so this test's `command_took_effect` was `false` and
+    /// stayed `false` for the life of the session — while the call itself reported success, which
+    /// is what made it invisible. `run_to_address` has used the bounded wait for every target
+    /// since it was written, and documents exactly this; only this path did not.
+    ///
+    /// Ignored: needs a live target; see the note above these tests.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 a_go_that_never_stops`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn a_go_that_never_stops_is_reported_and_leaves_the_engine_usable() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+
+        // No breakpoints, and a target that runs for half a minute: nothing will stop this.
+        let run = e
+            .execute_and_wait("g", 2_000)
+            .expect("execute_and_wait errored");
+        assert_eq!(
+            run.cut_short,
+            Some(Interruption::Deadline { after_ms: 2_000 }),
+            "a `g` broken in at its own bound must say so rather than pass for a stop: {}",
+            run.output
+        );
+        assert!(
+            command_took_effect(&e, 0x67),
+            "the engine is unusable after a `g` that did not stop — the target was left running \
+             with no current process/thread"
+        );
+        let _ = e.end_session();
+    }
+
+    /// The same for the two step commands, which take the identical path and were identically
+    /// broken. A step on a target that is about to spend thirty seconds inside one `ping` still
+    /// completes, so this asserts the *shape*: the call reports what happened, and the engine is
+    /// usable afterwards either way.
+    ///
+    /// Ignored: needs a live target; see the note above these tests.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 stepping_leaves`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn stepping_leaves_the_engine_usable_whether_or_not_it_reaches_a_stop() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+
+        for command in ["p", "t"] {
+            let run = e
+                .execute_and_wait(command, 2_000)
+                .unwrap_or_else(|why| panic!("`{command}` errored: {why}"));
+            assert!(
+                !matches!(run.cut_short, Some(Interruption::OnRequest)),
+                "`{command}` reported a break somebody asked for; nobody did"
+            );
+            assert!(
+                command_took_effect(&e, 0x68),
+                "the engine is unusable after `{command}`: {}",
+                run.output
+            );
+        }
+        let _ = e.end_session();
+    }
+
+    /// `settle` is the other half, and this is the reported bug end to end: a plain `Execute` of
+    /// execution-control text sets the run state and returns, and until something pumps it the
+    /// session refuses every later `g`/`p`/`t` with `0x80040205` while answering read-only
+    /// commands normally.
+    ///
+    /// All three commands, because all three are doors to the same state and a fix that closed one
+    /// would look identical from the outside. Asserted in the order that makes each step mean
+    /// something: the engine reads as running *only* after the raw command, the pump reports what
+    /// the target did, and execution control works again afterwards — which it does not without
+    /// the settle.
+    ///
+    /// Ignored: needs a live target; see the note above these tests.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 settle`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn settle_pumps_the_run_state_a_raw_command_left_behind() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+
+        assert!(
+            !e.is_running().expect("could not read the execution status"),
+            "a freshly launched target is stopped at its initial breakpoint"
+        );
+        assert!(
+            e.settle(2_000).expect("settle errored").is_none(),
+            "settle pumped a target that was already stopped"
+        );
+
+        for (command, sentinel) in [("g", 0x67u64), ("p", 0x68), ("t", 0x69)] {
+            // The bug, in one call: a plain `Execute` sets the run state and moves nothing.
+            e.execute_command_bounded(command, 0).unwrap_or_else(|why| {
+                panic!("the raw `{command}` itself should succeed — it is the pump that is missing: {why}")
+            });
+            assert!(
+                e.is_running().expect("could not read the execution status"),
+                "a raw `{command}` left the engine reading as stopped, so there is nothing here to settle"
+            );
+
+            let settled = e
+                .settle(2_000)
+                .expect("settle errored")
+                .unwrap_or_else(|| panic!("settle found nothing to pump after a raw `{command}`"));
+            assert!(
+                !e.is_running().expect("could not read the execution status"),
+                "settle returned with the engine still running after `{command}`: {}",
+                settled.output
+            );
+
+            // The property the whole thing is for: execution control works again. Before the
+            // settle this call fails with 0x80040205, and so does every one after it.
+            let run = e.execute_and_wait("g", 2_000).unwrap_or_else(|why| {
+                panic!("execution control is still refused after settling `{command}`: {why}")
+            });
+            assert!(
+                command_took_effect(&e, sentinel),
+                "the engine is unusable after settling `{command}` and running `g`: {}",
+                run.output
+            );
+        }
+        let _ = e.end_session();
     }
 
     // The `#[ignore]`d tests below each drive a real debuggee, and MUST be run with
