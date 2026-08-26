@@ -10,7 +10,7 @@
 //! Run against a launched process:  cargo run --example typed_context
 //! Run against a crash dump:        cargo run --example typed_context -- C:\path\to\dump.dmp
 
-use win_kexp::dbgeng::{DebugEngine, RegisterValue};
+use dbgscope::dbgeng::{DebugEngine, RegisterValue};
 
 fn show(e: &DebugEngine, cmd: &str) {
     match e.execute_command(cmd) {

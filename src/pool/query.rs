@@ -1,7 +1,7 @@
 //! Public, typed queries over the pool walker.
 //!
 //! The walker itself is reached two ways: interactively through the
-//! `!win_kexp.poolmap` extension command, and programmatically through this module
+//! `!dbgscope.poolmap` extension command, and programmatically through this module
 //! by a host that already owns a [`DebugEngine`] (windbg-mcp does exactly that).
 //! Both go through [`prepare_index`], so the validation rules, the layout cache and
 //! the snapshot cache cannot drift apart between the two entry points.
@@ -727,7 +727,7 @@ mod tests {
     /// A VS chunk as `walk_vs` reports one: the physical `_POOL_HEADER` sits a chunk header
     /// into the chunk, and the usable bytes a pool header past that. So the raw chunk start,
     /// `header_address` and `usable_address` are three different addresses — the geometry
-    /// `PoolSpan::allocation` cannot build, and the reason glslang/win-kexp#85 went unnoticed.
+    /// `PoolSpan::allocation` cannot build, and the reason glslang/dbgscope#85 went unnoticed.
     fn vs_allocation(chunk: u64, chunk_size: u64, tag: &[u8; 4], heap_id: u64) -> PoolSpan {
         const VS_HEADER: u64 = 0x10;
         const POOL_HEADER: u64 = 0x10;
@@ -749,7 +749,7 @@ mod tests {
         }
     }
 
-    /// glslang/win-kexp#85: the contiguity check compared `end()` — which lands on the raw
+    /// glslang/dbgscope#85: the contiguity check compared `end()` — which lands on the raw
     /// chunk end — with the next span's `header_address`, which for a VS chunk is a chunk
     /// header *past* its start. The two differ by exactly that header for every genuinely
     /// adjacent pair, so `previous` and `next` came back `None` for every VS allocation there

@@ -2312,7 +2312,7 @@ impl DebugEngine {
     /// exactly where a hand-written restore is forgotten:
     ///
     /// ```no_run
-    /// # use win_kexp::dbgeng::DebugEngine;
+    /// # use dbgscope::dbgeng::DebugEngine;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let engine = DebugEngine::new();
     /// let analysis = {
@@ -3333,7 +3333,7 @@ enum TargetInput {
 /// can commit that bookkeeping here, before a wait that may still fail or time out:
 ///
 /// ```no_run
-/// # use win_kexp::dbgeng::DebugEngine;
+/// # use dbgscope::dbgeng::DebugEngine;
 /// # fn commit(_: &str) {}
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let engine = DebugEngine::new();
@@ -3658,7 +3658,7 @@ mod tests {
         assert_eq!(one_column.text, "???");
     }
 
-    /// glslang/win-kexp#82: a borrowed engine's lifecycle used to die with the wrapper.
+    /// glslang/dbgscope#82: a borrowed engine's lifecycle used to die with the wrapper.
     ///
     /// The identity was the client pointer, so it was stable across the per-command wrappers an
     /// extension builds — which is what it was for — while an `end_session` bumped a field on a
@@ -3862,7 +3862,7 @@ mod tests {
         // DebugEngine's Drop impl will handle cleanup and detach
     }
 
-    /// The half of glslang/win-kexp#82 that a registry alone does not close, and the reason the
+    /// The half of glslang/dbgscope#82 that a registry alone does not close, and the reason the
     /// identity is not a field: two wrappers can be live around one client at once.
     ///
     /// With a copy in each, an `end_session` through one moves that one and the registry and

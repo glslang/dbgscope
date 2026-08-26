@@ -2,14 +2,13 @@
 
 ## Project Structure & Module Organization
 
-This Rust 2024 library targets Windows kernel exploitation research. Public modules live in `src/`: `shellcode.rs`, `process.rs`, `rop.rs`, `pool.rs`, `win32k.rs`, `dbgeng.rs`, and `util.rs`. Assembly payloads live in `src/asm/` and are compiled conditionally by `build.rs`. `examples/kdtest.rs` is a scratch Debug Engine smoke test, not public API. Docs include `README.md`, `CLAUDE.md`, and `TOKEN_STEALING_ARM64.md`.
+This Rust 2024 library gives typed access to a WinDbg/DbgEng debug session, plus allocator walkers built on one. Public modules live in `src/`: `dbgeng.rs` (the session driver), `pool.rs` with `pool/` (kernel pool walking), `heap.rs` (user-mode Segment Heap), and `allocator.rs` (decoding shared by both). `pool_extension.rs` holds the `!dbgscope.poolmap` WinDbg extension exports. `examples/` holds scratch Debug Engine smoke tests, not public API. Docs are `README.md` and `CLAUDE.md`.
 
 The crate is Windows-only in practice: most modules use the `windows` crate directly and are not broadly `cfg`-gated.
 
 ## Build, Test, and Development Commands
 
 - `cargo build --verbose`: build the library for the active Windows target.
-- `WINDOWS_VERSION=23H2 cargo build --target aarch64-pc-windows-msvc`: build ARM64 shellcode. Supported values are `23H2` and `24H2`; default is `24H2`.
 - `cargo fmt --all -- --check`: verify formatting, matching CI.
 - `cargo fmt --all`: apply Rust formatting.
 - `cargo nextest run --verbose`: preferred test runner and CI path.
@@ -17,7 +16,7 @@ The crate is Windows-only in practice: most modules use the `windows` crate dire
 - `cargo miri test --verbose`: nightly/Miri check for unsafe-code issues. CI runs it on merges to `main`, weekly, and on demand — **not on pull requests** (see `.github/workflows/miri.yml`), so run it yourself when a change touches unsafe code.
 - `cargo run --example kdtest -- "<kd connection>"`: run the kernel-debugging smoke test.
 
-Local builds use `ml64` for x86_64 or `armasm64` for ARM64 when available. Without assemblers, `build.rs` enables the shellcode fallback path.
+There is no build script and no assembler step; both left with the exploitation half of this crate.
 
 ## Coding Style & Naming Conventions
 
@@ -27,13 +26,13 @@ Assembly uses MASM syntax for x86_64 and ARMASM syntax for ARM64.
 
 ## Testing Guidelines
 
-Place focused unit tests in the module being tested under `#[cfg(test)]`. Test names use `test_*`, for example `test_find_gadget_offset`. If you change `src/asm/`, update the matching fallback byte array in `src/shellcode.rs`; `test_shellcodes_match_fallback` enforces byte-for-byte equivalence.
+Place focused unit tests in the module being tested under `#[cfg(test)]`. Test names use `test_*`. Pool and heap decoding is the UB-prone code here — it reads kernel structures out of byte slices with no `unsafe` in sight — which is why `miri.yml` exists and why a change there wants a Miri run.
 
 ## Commit & Pull Request Guidelines
 
 Commit subjects use lowercase prefixes seen in history, such as `fix:`, `feat:`, `docs:`, `style:`, `refactor:`, `test:`, `perf:`, and `chore:`. Keep the summary imperative and specific.
 
-Pull requests should describe the behavioral change, call out architecture or shellcode-impacting changes, link related issues when applicable, and include the commands run. Ensure formatting and relevant Windows tests pass before requesting review.
+Pull requests should describe the behavioral change, call out architecture-impacting changes, link related issues when applicable, and include the commands run. Ensure formatting and relevant Windows tests pass before requesting review.
 
 ## Security & Configuration Notes
 

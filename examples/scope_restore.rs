@@ -19,7 +19,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use win_kexp::dbgeng::{DebugEngine, Scope};
+use dbgscope::dbgeng::{DebugEngine, Scope};
 
 /// Commands that move the scope without touching the target. Which of them *can* move it is a
 /// property of the dump, not of the engine: `.frame 3` needs a stack four frames deep, `.ecxr`

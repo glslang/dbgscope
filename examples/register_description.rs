@@ -10,7 +10,7 @@
 //!
 //! Run: cargo run --example register_description -- <dump path>
 
-use win_kexp::dbgeng::DebugEngine;
+use dbgscope::dbgeng::DebugEngine;
 
 /// `DEBUG_VALUE_*`, so the `Type` column reads as something.
 ///

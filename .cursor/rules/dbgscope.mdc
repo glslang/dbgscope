@@ -1,11 +1,11 @@
 ---
-description: Core win-kexp context — Rust, Windows crate, errors, commits
+description: Core dbgscope context — Rust, Windows crate, errors, commits
 alwaysApply: true
 ---
 
-# win-kexp
+# dbgscope
 
-Rust utilities for Windows kernel exploitation: shellcode, process injection, ROP, pool/win32k helpers, debug engine integration. Targets **x86_64** and **ARM64**.
+Typed WinDbg/DbgEng debug sessions, with kernel pool and user-mode heap walkers built on them. Targets **x86_64** and **ARM64**; pool walking itself is x64-only.
 
 For build commands, CI expectations, and module map, see `CLAUDE.md`.
 

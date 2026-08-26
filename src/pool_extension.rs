@@ -30,7 +30,7 @@ struct PoolCommand {
 }
 
 fn usage() -> &'static str {
-    "Usage: !win_kexp.poolmap -tag <1..4 ASCII bytes | 0x + 8 hex digits> [-paged|-nonpaged] [-refresh]\n       !win_kexp.poolmap <address> [-refresh]\n\n       A tag whose bytes do not all print is shown as its raw form (e.g. 0x000180ff);\n       pass that back to -tag. A rendering containing `.` names literal `.` bytes.\n"
+    "Usage: !dbgscope.poolmap -tag <1..4 ASCII bytes | 0x + 8 hex digits> [-paged|-nonpaged] [-refresh]\n       !dbgscope.poolmap <address> [-refresh]\n\n       A tag whose bytes do not all print is shown as its raw form (e.g. 0x000180ff);\n       pass that back to -tag. A rendering containing `.` names literal `.` bytes.\n"
 }
 
 fn parse_address(text: &str) -> Option<u64> {
@@ -198,7 +198,7 @@ fn command_hresult(client: *mut c_void, args: PCSTR, help_command: bool) -> HRES
                 command_poolmap(engine, &args)
             };
             if let Err(message) = &result {
-                let _ = engine.output(&format!("win_kexp: {message}\n{}", usage()));
+                let _ = engine.output(&format!("dbgscope: {message}\n{}", usage()));
             }
             result
         })?

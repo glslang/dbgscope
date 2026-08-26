@@ -1,17 +1,19 @@
 [package]
-name = "win-kexp"
+name = "dbgscope"
 version = "0.1.0"
 edition = "2024"
+description = "Typed WinDbg/DbgEng debug sessions, with kernel pool and user heap walkers built on them."
+repository = "https://github.com/glslang/dbgscope"
+license = "GPL-3.0-only"
+readme = "README.md"
+keywords = ["windbg", "dbgeng", "debugging", "kernel", "windows"]
+categories = ["development-tools::debugging", "os::windows-apis"]
 
 [lib]
+# cdylib is the !poolmap WinDbg extension (src/pool_extension.rs), not a shellcode payload.
 crate-type = ["rlib", "cdylib"]
 
-[features]
-shellcode_fallback = []
-
 [dependencies]
-byte-strings = "0.3.1"
-goblin = "0.10.5"
 hex = "0.4.3"
 thiserror = "2.0.18"
 windows-core = "0.62.2"
@@ -20,19 +22,18 @@ windows-core = "0.62.2"
 version = "0.62.2"
 features = [
     "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Com",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_Debug_Extensions",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    "Win32_System_Pipes",
-    "Win32_System_ProcessStatus",
-    "Win32_System_Ioctl",
-    "Win32_System_IO",
     "Win32_System_SystemInformation",
-    "Win32_System_SystemServices",
-    "Win32_System_Threading",
 ]
+
+# Only `examples/user_heap_smoke.rs` allocates on the host heap it then walks. Cargo unifies
+# this with the normal dependency when building examples and tests, and a downstream consumer
+# of the library still resolves the four features above and no more.
+[dev-dependencies.windows]
+version = "0.62.2"
+features = ["Win32_System_Memory"]
+
+# docs.rs builds on Linux, where this crate does not compile at all.
+[package.metadata.docs.rs]
+targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]

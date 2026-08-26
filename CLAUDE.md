@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`win-kexp` is a Rust library (edition 2024) of utilities for Windows kernel exploitation research. It provides shellcode (token stealing, ACL editing, command spawning), process injection, ROP chain construction, kernel pool/win32k helpers, and Windows Debug Engine integration targeting Windows **x86_64** and **ARM64**.
+`dbgscope` is a Rust library (edition 2024) giving typed access to a WinDbg/DbgEng debug session, and allocator walkers built on one. Two layers: `dbgeng` opens and drives a target (live kernel over KD, local kernel, launched or attached user-mode process, crash dump, TTD trace) and answers in values rather than in `r`/`lm`/`bl` text; `pool` and `heap` walk the kernel pool and the user-mode Segment Heap on top of that session, sharing their page-segment/LFH/VS/backend decoding.
 
-The library is Windows-only by design: `src/lib.rs` exports every module (`dbgeng`, `pool`, `process`, `rop`, `shellcode`, `util`, `win32k`) unconditionally, and most modules call the `windows` crate APIs directly without `#[cfg]` gating. The crate is meant to be built for Windows targets; it is not designed to compile on other platforms. The only significant `#[cfg(target_os = "windows")]`/`target_arch` gating lives in `src/shellcode.rs`, where it selects between the assembled-object and hardcoded-fallback shellcode paths.
+The library is Windows-only by design: `src/lib.rs` exports `allocator`, `dbgeng`, `heap` and `pool` unconditionally, and they call the `windows` crate APIs directly without `#[cfg]` gating. It is not designed to compile on other platforms.
+
+The exploitation half of this crate — shellcode, ROP, process injection, win32k wrappers, pool spraying — left for `win-kexp`. Nothing here depends on it, and nothing here should grow back toward it: this crate reads and drives a debug session, it does not exploit one.
 
 ## Commands
 
@@ -28,44 +30,20 @@ cargo nextest run test_find_gadget_offset
 
 # Standard test runner (alternative)
 cargo test
-
-# Build for ARM64 with specific Windows version (23H2 or 24H2, default 24H2)
-WINDOWS_VERSION=23H2 cargo build --target aarch64-pc-windows-msvc
 ```
 
 ## Architecture
-
-### Shellcode Compilation Pipeline
-
-The most important architectural detail is the **dual-path shellcode system** controlled by `build.rs`:
-
-1. **Primary path**: `build.rs` detects `ml64` (x86_64) or `armasm64` (ARM64) at build time and compiles the `.asm` files in `src/asm/` into `.obj` COFF files placed in `OUT_DIR`. At runtime, `goblin` parses those COFF objects and `extract_shellcode_from_obj` pulls out the executable section bytes.
-2. **Fallback path**: If no assembler is found (or assembly fails, a source file is missing, or an invalid `WINDOWS_VERSION` is requested on ARM64), `build.rs` emits `cargo:rustc-cfg=feature="shellcode_fallback"`, activating the `shellcode_fallback` feature flag. Hardcoded byte arrays are then returned directly.
-
-`src/shellcode.rs` uses `#[cfg]` gates on `feature = "shellcode_fallback"` (and on `target_arch`) throughout. Each public `*_shellcode()` function has a primary and a fallback variant selected by these gates.
-
-The test `test_shellcodes_match_fallback` (in `src/shellcode.rs`) verifies that both paths produce identical bytes — **this is the contract that must be maintained when modifying any assembly file**. If you change an `.asm` file, update the corresponding hardcoded fallback array in `src/shellcode.rs` so the test stays green.
-
-The SMEP/KVAShadow token-stealing variants (`token_stealing_shellcode_smep_no_kvashadow`, `token_stealing_shellcode_smep_no_kvashadow_pte`) are **x86_64-only** — they have no ARM64 equivalent and are `#[cfg(target_arch = "x86_64")]` gated.
-
-### ARM64 Version Targeting
-
-ARM64 shellcode is version-specific. `build.rs` passes `-pd "WINDOWS_VERSION SETS \"<ver>\""` to `armasm64`, making the `WINDOWS_VERSION` preprocessor symbol available inside `.asm` files. Supported values: `23H2`, `24H2` (default `24H2`). An invalid version forces `shellcode_fallback`. See `TOKEN_STEALING_ARM64.md` for the ARM64 token-stealing walkthrough.
 
 ### Module Map
 
 | Module | Purpose |
 |---|---|
 | `src/lib.rs` | Crate root; declares the public modules below |
-| `src/shellcode.rs` | Shellcode loading/extraction; COFF parsing via `goblin`; hardcoded fallback byte arrays; the `test_shellcodes_match_fallback` contract test |
-| `src/process.rs` | Process enumeration (`CreateToolhelp32Snapshot`), remote memory alloc, shellcode injection into a target process via `CreateRemoteThread` (`inject_shellcode_to_target_process`) |
-| `src/rop.rs` | ROP chain macros (`create_rop_chain!`, `create_rop_chain_to_buffer!`, `concat_rop_chain_to_buffer!`); PE section parsing (`get_executable_sections`) and gadget search (`find_gadget_offset`) |
-| `src/pool.rs` | Kernel pool/heap manipulation; `AnonymousPipe` RAII wrapper |
-| `src/win32k.rs` | Win32k/kernel API wrappers: device handles, `IOCTL`/`CTL_CODE` macros, `io_device_control`, driver/`ntoskrnl` base resolution (`KernelError`), memory alloc/lock, function-address lookup |
 | `src/dbgeng.rs` | Windows Debug Engine (DbgEng) integration — see below |
-| `src/util.rs` | Misc helpers: `pause`, `debug_break`, `bytes_to_hex_string` |
-| `src/asm/` | MASM (x86_64) and ARMASM (ARM64) shellcode source |
-| `build.rs` | Conditional assembly compilation; assembler detection; fallback activation |
+| `src/pool.rs`, `src/pool/` | Kernel pool walking: decode, index, layout, query, render, snapshot |
+| `src/heap.rs` | Version-aware queries over user-mode Segment Heaps |
+| `src/allocator.rs` | Layout provenance and VS semantic families shared by both walkers |
+| `src/pool_extension.rs` | The `!dbgscope.poolmap` WinDbg extension exports; this is what `crate-type = ["cdylib"]` is for |
 
 ### Debug Engine (`src/dbgeng.rs`)
 
@@ -85,19 +63,13 @@ When touching this module, mind the `owns_session` invariant, the stdout-isolati
 
 ## Conventions
 
-### Assembly
-
-- x86_64: MASM syntax (`ml64`)
-- ARM64: ARMASM syntax (`armasm64`) with the `WINDOWS_VERSION` preprocessor variable
-- Changing an `.asm` file requires updating the matching fallback array in `src/shellcode.rs` (see the contract test above)
-
 ### Rust
 
 - `snake_case` for functions/variables, `PascalCase` for types/structs
 - Custom error types use `thiserror`; prefer `Result`/`Option` over panics in library code
 - Windows API via the `windows` crate (currently `0.62.2`); add required feature flags in `Cargo.toml` under `[dependencies.windows]`
 - `unsafe` is expected at Windows FFI boundaries; keep unsafe blocks minimal and localized
-- Key dependencies: `windows`/`windows-core` (FFI), `goblin` (COFF/PE parsing), `thiserror` (errors), `byte-strings` (NUL-terminated literals), `hex`
+- Key dependencies: `windows`/`windows-core` (FFI), `thiserror` (errors), `hex`
 
 ### Git Commit Prefixes
 
@@ -110,10 +82,9 @@ Three workflows run on **Windows runners only**:
 - **coverage.yml**: grcov + LLVM instrumentation → Codecov upload
 - **miri.yml**: `cargo miri nextest run` on nightly with `MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks"`, plus a `cargo miri test --doc` step for the doctests nextest cannot run. **It does not run on pull requests** — it is the longest job here by a wide margin (9 minutes median against ci.yml's 1) and had never failed in a hundred runs, so it runs on the merge to `main`, weekly for toolchain drift, and on `workflow_dispatch` for a branch worth checking before it lands. A green PR therefore says nothing about Miri; run it by hand when a change is one Miri would have something to say about. The workflow's own header records why a path filter was measured and rejected
 
-CI installs MASM/ARMASM tooling via `glslang/setup-masm@v1.4` in all three workflows, so assemblers are always available there. Local builds without assemblers silently activate `shellcode_fallback`.
+There is no build script and no assembler step: both left with the exploitation half.
 
 ## Related Docs
 
-- `README.md` — user-facing overview, feature list, and shellcode reference
-- `TOKEN_STEALING_ARM64.md` — ARM64 token-stealing shellcode walkthrough
+- `README.md` — user-facing overview, the `!dbgscope.poolmap` extension, and usage sketches
 - `.cursor/rules/*.mdc` — Cursor editor rules; they defer to this file for build commands and the module map

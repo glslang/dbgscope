@@ -82,7 +82,7 @@ fn cell(span: &PoolSpan, selected: bool, dml: bool) -> String {
     if !dml {
         return glyph.to_string();
     }
-    let command = format!("!win_kexp.poolmap {:#x}", span.usable_address);
+    let command = format!("!dbgscope.poolmap {:#x}", span.usable_address);
     format!(
         "<link cmd=\"{}\"><col fg=\"{color}\">{glyph}</col></link>",
         escape_dml(&command)

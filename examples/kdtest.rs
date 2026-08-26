@@ -31,7 +31,7 @@
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use win_kexp::dbgeng::{DbgEngError, DebugEngine, PendingTarget, RunToOutcome};
+use dbgscope::dbgeng::{DbgEngError, DebugEngine, PendingTarget, RunToOutcome};
 
 /// A connection nothing will ever answer: the debugger listens, the target never dials.
 /// Used only by [`timeout_probe`].
