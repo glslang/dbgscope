@@ -415,9 +415,16 @@ pub struct CommandRun {
     /// should report the ending and retire the session; nothing will run against this engine
     /// again.
     ///
-    /// Always `false` from [`DebugEngine::execute_command`] and
-    /// [`DebugEngine::execute_command_bounded`], which refuse to start without a debuggee and so
-    /// can never watch one leave.
+    /// It is not only the pumping paths that report it. A command can take the target away
+    /// *itself* — measured, `.detach` leaves `DEBUG_STATUS_NO_DEBUGGEE` the moment it returns,
+    /// with nothing left to pump and so nothing for [`DebugEngine::settle`] to report — so
+    /// [`DebugEngine::execute_command_bounded`] answers the same question after its command.
+    /// One field, whichever way the target went.
+    ///
+    /// (`.kill` is not one of them, which is worth knowing before pattern-matching on command
+    /// names instead: it leaves the engine at `DEBUG_STATUS_BREAK` with a readable stack in
+    /// `ntdll!LdrShutdownProcess`, and the target goes away on the *next* resume, which is where
+    /// the pump reports it.)
     pub target_gone: bool,
 }
 
@@ -1797,8 +1804,9 @@ impl DebugEngine {
     ///
     /// Refuses with [`DbgEngError::NoDebuggee`] when the engine holds no target — the same guard
     /// [`Self::execute_and_wait`] has, and for a hazard that is not confined to execution control:
-    /// see [`Self::refuse_without_a_debuggee`]. It is why [`CommandRun::target_gone`] is always
-    /// `false` here.
+    /// see [`Self::refuse_without_a_debuggee`]. That guard is also what lets
+    /// [`CommandRun::target_gone`] be reported here at all: with one refused at the door, a
+    /// missing debuggee afterwards means *this* command took the target away.
     ///
     /// **Both facts, or neither is usable.** Returning the text alone makes an aborted command
     /// indistinguishable from one that ran, so every caller downstream has to be told through some
@@ -1895,9 +1903,11 @@ impl DebugEngine {
                 (false, true) => Some(Interruption::OnRequest),
                 (false, false) => None,
             },
-            // Nothing here pumps, so nothing here can watch a target leave — and the guard at
-            // the top refused the case where one already had.
-            target_gone: false,
+            // Nothing here pumps, but a command can still take the target away by itself:
+            // `.detach`, `q` and `qd` return with the engine already holding nothing, and no
+            // later pump will ever mention it. The guard at the top is what makes this mean
+            // "this command did it" rather than "there was never anything here".
+            target_gone: self.lost_its_target(),
         })
     }
 
@@ -2057,7 +2067,7 @@ impl DebugEngine {
         Ok(is_running_status(self.execution_status()?))
     }
 
-    /// Whether the engine is holding a debuggee at all.
+    /// Whether the engine is holding a target at all.
     ///
     /// One status value answers it, and it is the same value whether the engine has never had a
     /// target or has just lost one. Measured on dbgeng 10.0.26100.1 (ARM64): a debuggee that
@@ -2066,10 +2076,13 @@ impl DebugEngine {
     /// `E_UNEXPECTED` beside it and `.lastevent` answering `<no event>` — so the status is the
     /// only one of them that says anything, and what it says is reliable.
     ///
-    /// An unreadable status is not an answer, and this does not collapse one into `false`: what
-    /// to do when the engine cannot be asked differs by caller, and each one below decides.
-    fn no_debuggee(&self) -> Result<bool, DbgEngError> {
-        Ok(self.execution_status()? == DEBUG_STATUS_NO_DEBUGGEE)
+    /// An unreadable status is not an answer, and this does not collapse one into `true`: what to
+    /// do when the engine cannot be asked differs by caller, and each one below decides.
+    ///
+    /// Public because a caller holding a session needs it for the same reason this crate does —
+    /// once the answer is `false`, nothing but teardown will work, and every road in refuses.
+    pub fn has_target(&self) -> Result<bool, DbgEngError> {
+        Ok(self.execution_status()? != DEBUG_STATUS_NO_DEBUGGEE)
     }
 
     /// Refuses an operation that would drive DbgEng with nothing behind it.
@@ -2094,25 +2107,25 @@ impl DebugEngine {
     /// [`Self::launch_process`] and [`Self::attach_process`] on the machine. The guard is about
     /// text a *caller* supplied; a literal written here is not that.
     fn refuse_without_a_debuggee(&self) -> Result<(), DbgEngError> {
-        match self.no_debuggee()? {
-            true => Err(DbgEngError::NoDebuggee),
-            false => Ok(()),
+        match self.has_target()? {
+            true => Ok(()),
+            false => Err(DbgEngError::NoDebuggee),
         }
     }
 
-    /// Whether a pump ended because the engine lost its target, for the three functions that
-    /// wait.
+    /// Whether the engine has lost its target, asked after an operation that could have taken it.
     ///
-    /// Asked of the engine afterwards rather than read off the `WaitForEvent` result, because
-    /// that result is `E_UNEXPECTED` — "Catastrophic failure", which names nothing and is also
-    /// what a genuinely broken engine answers. Every caller refuses to *start* without a
-    /// debuggee, so a missing one here means the target left during this call.
+    /// Asked of the engine rather than read off a `WaitForEvent` result, because that result is
+    /// `E_UNEXPECTED` — "Catastrophic failure", which names nothing and is also what a genuinely
+    /// broken engine answers — and because two of the four callers do not wait at all. Every one
+    /// of them refuses to *start* without a debuggee, so a missing one here means the target left
+    /// during this call.
     ///
     /// An unreadable status answers `false`. This decides whether to **suppress** the wait's
     /// error, and suppressing one on a guess would report a broken engine as a program that
     /// finished.
     fn lost_its_target(&self) -> bool {
-        self.no_debuggee().unwrap_or(false)
+        !self.has_target().unwrap_or(true)
     }
 
     /// Pumps the engine to a stop if a command left it running, and reports what happened:
@@ -5020,6 +5033,71 @@ mod tests {
             .expect("end_session failed after the ending");
     }
 
+    /// A command can take the target away *itself*, and the two that do it differ in a way worth
+    /// pinning: `.detach` leaves nothing behind at once, while `.kill` leaves a target that is
+    /// still readable and goes away on the **next** resume.
+    ///
+    /// Both measured on dbgeng 10.0.26100.1 (ARM64), and the asymmetry is the reason
+    /// [`CommandRun::target_gone`] is answered from the engine's state after every command rather
+    /// than from a list of command names: a list would have to put `.detach` and `q` on it and
+    /// leave `.kill` off, and be re-derived for every engine version.
+    #[test]
+    #[cfg(not(miri))]
+    fn a_command_that_takes_the_target_away_says_so_and_kill_is_not_one_of_them() {
+        let _debuggee = one_debuggee();
+
+        // `.kill`: the target is terminated but the exit events have not been pumped, so the
+        // engine still holds it and a stack still reads.
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+        let killed = e
+            .execute_command_bounded(".kill", 10_000)
+            .expect("`.kill` failed");
+        assert!(
+            !killed.target_gone,
+            "`.kill` reported the target gone, but the exit events have not been pumped yet: \
+             {killed:?}"
+        );
+        assert!(
+            e.execute_command_bounded("k 3", 5_000).is_ok(),
+            "the target should still be readable after `.kill`"
+        );
+        let resumed = e
+            .execute_and_wait("g", 30_000)
+            .expect("the resume after `.kill` was reported as a failure");
+        assert!(
+            resumed.target_gone,
+            "the resume after `.kill` is where the target goes away: {resumed:?}"
+        );
+        e.end_session().expect("end_session failed after `.kill`");
+
+        // `.detach`: gone the moment the command returns, with nothing left to pump — so if this
+        // were left to `settle` it would be reported by nobody.
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+        let detached = e
+            .execute_command_bounded(".detach", 10_000)
+            .expect("`.detach` failed");
+        assert!(
+            detached.target_gone,
+            "`.detach` did not report that it took the target away: {detached:?}"
+        );
+        assert!(
+            e.settle(5_000).expect("settle errored").is_none(),
+            "there is nothing to pump after a detach"
+        );
+        assert!(
+            matches!(
+                e.execute_command_bounded("k 3", 5_000),
+                Err(DbgEngError::NoDebuggee)
+            ),
+            "a command after a detach was not refused"
+        );
+        e.end_session().expect("end_session failed after `.detach`");
+    }
+
     /// Execution control with no debuggee is **refused**, because letting it reach DbgEng takes
     /// the process down.
     ///
@@ -5039,7 +5117,7 @@ mod tests {
         let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         assert!(
-            matches!(e.no_debuggee(), Ok(true)),
+            matches!(e.has_target(), Ok(false)),
             "a fresh engine is supposed to be holding no target"
         );
 
