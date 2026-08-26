@@ -1,4 +1,4 @@
-# dbgscope ![Build Status](https://github.com/glslang/dbgscope/actions/workflows/ci.yml/badge.svg) [![codecov](https://codecov.io/gh/glslang/dbgscope/branch/main/graph/badge.svg)](https://codecov.io/gh/glslang/dbgscope) [![Dependency status](https://deps.rs/repo/github/glslang/dbgscope/status.svg)](https://deps.rs/repo/github/glslang/dbgscope)
+# dbgscope ![Build Status](https://github.com/glslang/dbgscope/actions/workflows/ci.yml/badge.svg) [![codecov](https://codecov.io/gh/glslang/dbgscope/branch/main/graph/badge.svg)](https://codecov.io/gh/glslang/dbgscope) [![Dependency status](https://deps.rs/repo/github/glslang/dbgscope/status.svg)](https://deps.rs/repo/github/glslang/dbgscope) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 `dbgscope` is a Rust 2024 library giving typed access to a WinDbg/DbgEng debug session, and
 allocator walkers built on top of one. It is two layers, and the split is worth knowing before
@@ -195,3 +195,7 @@ The repository uses Windows-only GitHub Actions workflows:
 ## Contributing
 
 Use `rustfmt` defaults and keep unsafe Windows FFI blocks small. Add focused unit tests next to the code under `#[cfg(test)]`; existing test names use `test_*`. Commit subjects use lowercase prefixes such as `fix:`, `feat:`, `docs:`, `style:`, `refactor:`, `test:`, `perf:`, and `chore:`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
