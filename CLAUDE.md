@@ -88,5 +88,6 @@ There is no build script and no assembler step: both left with the exploitation 
 
 ## Related Docs
 
+- `examples/session_fuzz.rs` — randomised command sequences against a live session, checking after every step that the engine either still holds a target and answers or says it holds none. Seeded, so a failing sequence replays. Run it after touching anything in the wait/settle/guard seam: at seed 1 it finds the pre-fix half-dead session in 4 rounds of 8, and 150 rounds of 14 steps are clean on the fix
 - `README.md` — user-facing overview, the `!dbgscope.poolmap` extension, and usage sketches
 - `.cursor/rules/*.mdc` — Cursor editor rules; they defer to this file for build commands and the module map
