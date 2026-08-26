@@ -142,6 +142,11 @@ fn check_break_in_bookkeeping(e: &DebugEngine) {
              is indistinguishable from the artifact. Re-run against a target that reaches \
              nt!NtCreateFile (any file I/O on the guest will do)."
         ),
+        // On a live kernel this is the link going away rather than a program ending, and it
+        // says nothing about the bookkeeping this probe is here to check.
+        RunToOutcome::TargetGone => println!(
+            "[??] inconclusive — the engine lost the target during the run; the session is over."
+        ),
     }
 }
 

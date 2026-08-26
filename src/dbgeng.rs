@@ -365,6 +365,10 @@ pub enum RunToOutcome {
     /// The target did not stop within the timeout — the address was not reached with the
     /// current input/state.
     Timeout,
+    /// The target went away before it reached anything: it ran to completion, or its session was
+    /// torn down. Terminal, and the same ending [`CommandRun::target_gone`] reports — nothing
+    /// will run against this engine again. Says nothing about whether `address` was reachable.
+    TargetGone,
 }
 
 /// Result of [`DebugEngine::run_to_address`]: the structured [`RunToOutcome`] plus the
@@ -399,6 +403,22 @@ pub struct CommandRun {
     pub output: String,
     /// `None` when the command ran to completion.
     pub cut_short: Option<Interruption>,
+    /// The engine held no debuggee once this run ended: the target exited, or the session was
+    /// otherwise torn down under the pump.
+    ///
+    /// **Terminal, and not a failure.** A program running to completion is the ordinary end of a
+    /// `go`, and it is the one ending that leaves the engine unable to answer about a target ever
+    /// again — every later command fails, and execution control *faults the process*
+    /// ([`DebugEngine::execute_command_bounded`]). It is reported here rather than as an `Err`
+    /// because the output above it is real and this is the only copy of it: the module loads, a
+    /// breakpoint banner, whatever an embedded script printed before the target ran out. A caller
+    /// should report the ending and retire the session; nothing will run against this engine
+    /// again.
+    ///
+    /// Always `false` from [`DebugEngine::execute_command`] and
+    /// [`DebugEngine::execute_command_bounded`], which refuse to start without a debuggee and so
+    /// can never watch one leave.
+    pub target_gone: bool,
 }
 
 impl CommandRun {
@@ -1706,7 +1726,28 @@ impl DebugEngine {
     }
 
     /// Executes a debug command and returns its full textual output.
+    ///
+    /// Refuses with [`DbgEngError::NoDebuggee`] when the engine holds no target: arbitrary text
+    /// reaching an engine in that state can fault the process, and this cannot tell which text
+    /// would. See [`Self::refuse_without_a_debuggee`].
     pub fn execute_command(&self, command: &str) -> Result<String, DbgEngError> {
+        self.refuse_without_a_debuggee()?;
+        self.execute_fixed_command(command)
+    }
+
+    /// [`Self::execute_command`] without the no-debuggee guard, for this crate's own command
+    /// literals.
+    ///
+    /// The guard refuses everything because it cannot tell caller text that reaches execution
+    /// from text that does not. A literal written *here* is known text, and one of them has to
+    /// run before a target exists: `sxe ibp` is how [`Self::launch_process_begin`] and
+    /// [`Self::attach_process_begin`] arm the initial break, on an engine that is holding
+    /// nothing at the time.
+    ///
+    /// **Nothing that can reach execution may be passed here**, and nothing a caller supplied.
+    /// The fault the guard prevents is a `STATUS_ACCESS_VIOLATION` inside DbgEng, which no
+    /// `catch_unwind` traps.
+    fn execute_fixed_command(&self, command: &str) -> Result<String, DbgEngError> {
         // DbgEng reads a NUL-terminated C string; a `&str` is not NUL-terminated,
         // so build a `CString` and keep it alive for the duration of `Execute`.
         let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
@@ -1754,6 +1795,11 @@ impl DebugEngine {
     /// error it provokes is not surfaced. `timeout_ms == 0` disables the watchdog (equivalent to
     /// [`Self::execute_command`], plus the reporting).
     ///
+    /// Refuses with [`DbgEngError::NoDebuggee`] when the engine holds no target — the same guard
+    /// [`Self::execute_and_wait`] has, and for a hazard that is not confined to execution control:
+    /// see [`Self::refuse_without_a_debuggee`]. It is why [`CommandRun::target_gone`] is always
+    /// `false` here.
+    ///
     /// **Both facts, or neither is usable.** Returning the text alone makes an aborted command
     /// indistinguishable from one that ran, so every caller downstream has to be told through some
     /// side channel — and each place that is forgotten reports a break as a fact about the target.
@@ -1766,6 +1812,7 @@ impl DebugEngine {
         command: &str,
         timeout_ms: u32,
     ) -> Result<CommandRun, DbgEngError> {
+        self.refuse_without_a_debuggee()?;
         let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
 
@@ -1848,6 +1895,9 @@ impl DebugEngine {
                 (false, true) => Some(Interruption::OnRequest),
                 (false, false) => None,
             },
+            // Nothing here pumps, so nothing here can watch a target leave — and the guard at
+            // the top refused the case where one already had.
+            target_gone: false,
         })
     }
 
@@ -1923,15 +1973,11 @@ impl DebugEngine {
         // Whatever was raised before this belongs to the last operation; see
         // `execute_command_bounded`, which clears it for the same reason.
         self.interrupt_raised.store(false, Ordering::SeqCst);
-        // Driving execution control (`g`/`t`/`p`/…) into an engine with no live
-        // debuggee can push DbgEng into an access violation — a structured exception
-        // that Rust's `catch_unwind` cannot trap, which tears down the whole process.
-        // Refuse up front when there is nothing to run, returning a clean error.
-        let status =
-            unsafe { self.control.GetExecutionStatus() }.map_err(DbgEngError::CommandFailed)?;
-        if status == DEBUG_STATUS_NO_DEBUGGEE {
-            return Err(DbgEngError::NoDebuggee);
-        }
+        // Nothing to run against is refused up front rather than driven into DbgEng, which
+        // faults the process on it — see `refuse_without_a_debuggee`. It is also what makes the
+        // check *after* the wait mean what it says: a debuggee missing there left during this
+        // call.
+        self.refuse_without_a_debuggee()?;
 
         let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
@@ -1971,10 +2017,15 @@ impl DebugEngine {
         // the live-kernel path for as long as that path was the only bounded one, and would now
         // do so on every target.
         let interrupted = by_watchdog | self.interrupt_raised.swap(false, Ordering::SeqCst);
+        // Asked before either error is propagated, because the target running out is what makes
+        // both of them fail: a debuggee that exits during the wait leaves `WaitForEvent`
+        // answering `E_UNEXPECTED`, and reporting that is reporting a program's ordinary ending
+        // as a catastrophe — while discarding the output the run had already captured.
+        let target_gone = self.lost_its_target();
         if interrupted {
             // As there: consume anything the engine did not, so the next operation starts clean.
             let _ = self.interrupted();
-        } else {
+        } else if !target_gone {
             exec.map_err(DbgEngError::CommandFailed)?;
             waited.map_err(DbgEngError::CommandFailed)?;
         }
@@ -1988,6 +2039,7 @@ impl DebugEngine {
                 (false, true) => Some(Interruption::OnRequest),
                 (false, false) => None,
             },
+            target_gone,
         })
     }
 
@@ -2005,10 +2057,73 @@ impl DebugEngine {
         Ok(is_running_status(self.execution_status()?))
     }
 
+    /// Whether the engine is holding a debuggee at all.
+    ///
+    /// One status value answers it, and it is the same value whether the engine has never had a
+    /// target or has just lost one. Measured on dbgeng 10.0.26100.1 (ARM64): a debuggee that
+    /// exits during a wait leaves `GetExecutionStatus` reading `DEBUG_STATUS_NO_DEBUGGEE`, with
+    /// `GetNumberProcesses`, `GetCurrentProcessSystemId` and `GetExitCode` all failing
+    /// `E_UNEXPECTED` beside it and `.lastevent` answering `<no event>` — so the status is the
+    /// only one of them that says anything, and what it says is reliable.
+    ///
+    /// An unreadable status is not an answer, and this does not collapse one into `false`: what
+    /// to do when the engine cannot be asked differs by caller, and each one below decides.
+    fn no_debuggee(&self) -> Result<bool, DbgEngError> {
+        Ok(self.execution_status()? == DEBUG_STATUS_NO_DEBUGGEE)
+    }
+
+    /// Refuses an operation that would drive DbgEng with nothing behind it.
+    ///
+    /// **This is what stands between a caller's text and an access violation**, not a tidiness
+    /// check. Execution control reaching an engine that holds no debuggee faults *inside* DbgEng
+    /// — a structured exception, which `catch_unwind` cannot trap, so it takes the whole process
+    /// down instead of failing the call. Measured twice on dbgeng 10.0.26100.1 (ARM64), each
+    /// time a `STATUS_ACCESS_VIOLATION` exit: once on an engine whose debuggee had just exited,
+    /// and once on a **fresh** engine that never had one. The second is what says the trigger is
+    /// the missing debuggee rather than the departure.
+    ///
+    /// So it cannot be narrowed to text that looks like execution control: `g`, an alias, a
+    /// `.if` branch and `dx …ExecuteCommand("g")` all reach it, and the list that would catch
+    /// them cannot be finished — the same reason [`Self::settle`] asks the engine instead of
+    /// reading the command. What the breadth costs is the few engine-level commands that do work
+    /// without a target (`version`, `.echo`, `.sympath`), which are refused too.
+    ///
+    /// **And one of this crate's own openers is in that group**, which is not obvious and is why
+    /// [`Self::execute_fixed_command`] exists: arming the initial break runs `sxe ibp` on an
+    /// engine that by definition holds nothing yet, so guarding it refuses every
+    /// [`Self::launch_process`] and [`Self::attach_process`] on the machine. The guard is about
+    /// text a *caller* supplied; a literal written here is not that.
+    fn refuse_without_a_debuggee(&self) -> Result<(), DbgEngError> {
+        match self.no_debuggee()? {
+            true => Err(DbgEngError::NoDebuggee),
+            false => Ok(()),
+        }
+    }
+
+    /// Whether a pump ended because the engine lost its target, for the three functions that
+    /// wait.
+    ///
+    /// Asked of the engine afterwards rather than read off the `WaitForEvent` result, because
+    /// that result is `E_UNEXPECTED` — "Catastrophic failure", which names nothing and is also
+    /// what a genuinely broken engine answers. Every caller refuses to *start* without a
+    /// debuggee, so a missing one here means the target left during this call.
+    ///
+    /// An unreadable status answers `false`. This decides whether to **suppress** the wait's
+    /// error, and suppressing one on a guess would report a broken engine as a program that
+    /// finished.
+    fn lost_its_target(&self) -> bool {
+        self.no_debuggee().unwrap_or(false)
+    }
+
     /// Pumps the engine to a stop if a command left it running, and reports what happened:
     /// `Ok(None)` when there was nothing to settle, `Ok(Some(run))` with the output the pump
     /// captured otherwise — `cut_short` being [`Interruption::Deadline`] when the target had not
-    /// stopped by `timeout_ms` and was broken in at the bound.
+    /// stopped by `timeout_ms` and was broken in at the bound, and [`CommandRun::target_gone`]
+    /// when the pump ended because the target *left* rather than stopped.
+    ///
+    /// That third answer is not a failure and must not be reported as one: running a program to
+    /// completion is what a `g` is for, and it is the case where the pump's own output is the
+    /// only copy there will ever be.
     ///
     /// This is the recovery for the state [`Self::is_running`] describes, and it is why that state
     /// need not be prevented by inspecting command text. Calling it after every plain `Execute`
@@ -2047,9 +2162,15 @@ impl DebugEngine {
         // The same three-way origin as `execute_and_wait`, for the same reason: the watchdog's own
         // flag decides, because `interrupt_raised` is set by the watchdog too.
         let interrupted = by_watchdog | self.interrupt_raised.swap(false, Ordering::SeqCst);
+        // And the same question after the wait, for the same reason — with more riding on it
+        // here, because the pump is where the output is. A target that runs out mid-pump fails
+        // the wait with `E_UNEXPECTED`, and propagating that threw away the breakpoint banner,
+        // the module loads and anything an embedded script printed, precisely on the run that
+        // has no successor to print them again.
+        let target_gone = self.lost_its_target();
         if interrupted {
             let _ = self.interrupted();
-        } else {
+        } else if !target_gone {
             waited.map_err(DbgEngError::CommandFailed)?;
         }
 
@@ -2062,6 +2183,7 @@ impl DebugEngine {
                 (false, true) => Some(Interruption::OnRequest),
                 (false, false) => None,
             },
+            target_gone,
         }))
     }
 
@@ -2101,13 +2223,9 @@ impl DebugEngine {
         address: u64,
         timeout_ms: u32,
     ) -> Result<RunToResult, DbgEngError> {
-        // Refuse when there's nothing to run (driving `g` with no debuggee can fault
-        // DbgEng in a way `catch_unwind` can't trap — see `execute_and_wait`).
-        let status =
-            unsafe { self.control.GetExecutionStatus() }.map_err(DbgEngError::CommandFailed)?;
-        if status == DEBUG_STATUS_NO_DEBUGGEE {
-            return Err(DbgEngError::NoDebuggee);
-        }
+        // Refuse when there's nothing to run: driving `g` with no debuggee faults DbgEng in a
+        // way `catch_unwind` cannot trap — see `refuse_without_a_debuggee`.
+        self.refuse_without_a_debuggee()?;
         // An explicitly managed breakpoint, not `g <addr>`. WinDbg's one-shot form auto-clears
         // only when *hit* and hands back no handle, so every other exit — stopped elsewhere,
         // timed out, errored — left it armed with no way to remove it, and a later unrelated
@@ -2152,10 +2270,21 @@ impl DebugEngine {
         unsafe {
             let _ = self.client.SetOutputCallbacks(None);
         }
-        exec.map_err(DbgEngError::CommandFailed)?;
-        waited?;
 
         let output = String::from_utf8_lossy(&output_buffer).to_string();
+
+        // Read before the two errors below, which is what an exit makes of them: a target can
+        // run out on the way to `address` as readily as during a plain `go`, and the same
+        // `E_UNEXPECTED` comes back. Reported as an outcome with its output rather than as a
+        // failure — see `RunToOutcome::TargetGone`.
+        if self.lost_its_target() {
+            return Ok(RunToResult {
+                outcome: RunToOutcome::TargetGone,
+                output,
+            });
+        }
+        exec.map_err(DbgEngError::CommandFailed)?;
+        waited?;
 
         if expired {
             // The watchdog has already broken the target in, so the caller is not left with a
@@ -3188,7 +3317,9 @@ impl DebugEngine {
     /// launched/attached target would run free and the engine would never establish a
     /// current process/thread (register/stack commands then fail with `0x80040205`).
     fn enable_initial_break(&self) -> Result<(), DbgEngError> {
-        self.execute_command("sxe ibp").map(|_| ())
+        // Unguarded on purpose: this runs *before* the target exists, which is exactly the state
+        // `refuse_without_a_debuggee` refuses. See [`Self::execute_fixed_command`].
+        self.execute_fixed_command("sxe ibp").map(|_| ())
     }
 
     /// Launches a new user-mode process under the debugger and waits for it to stop at
@@ -4785,6 +4916,163 @@ mod tests {
         e.set_scope(&fresh)
             .expect("set_scope failed on a fresh scope");
         let _ = e.end_session();
+    }
+
+    /// A debuggee that runs to completion during a `go` is an **ending**, not a catastrophe —
+    /// and what the run captured on the way survives it.
+    ///
+    /// Before this, the `E_UNEXPECTED` `WaitForEvent` answers once the target is gone was
+    /// propagated verbatim: `Debug command failed: Catastrophic failure (0x8000FFFF)` for a
+    /// program exiting normally, the captured output discarded with it, and the *next* call
+    /// saying "No active debuggee" — the accurate half, one call late.
+    ///
+    /// The tail is the chain that made the session read as wedged rather than finished: `k`
+    /// answering a bare `0x80040205` while `.echo` still worked.
+    #[test]
+    #[cfg(not(miri))]
+    fn a_target_that_exits_during_a_go_is_an_ending_rather_than_a_catastrophe() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c exit").expect("launch failed");
+
+        let run = e
+            .execute_and_wait("g", 30_000)
+            .expect("a target running to completion was reported as a failure");
+        assert!(
+            run.target_gone,
+            "the target is gone and the run does not say so: {run:?}"
+        );
+        assert!(
+            run.cut_short.is_none(),
+            "nothing interrupted this run — the target simply ended: {run:?}"
+        );
+        // What the `Err` path used to throw away. *That* it arrived, not which lines it holds:
+        // which modules a `cmd.exe` loads on its way out is the host's business, while the echo
+        // `DEBUG_EXECUTE_ECHO` puts at the front is always there.
+        assert!(
+            !run.output.is_empty(),
+            "the run captured nothing, so the ending discarded it after all"
+        );
+        println!("captured across the ending: {:?}", run.output);
+
+        // The chain, now that the engine holds nothing: one error naming the state, on every
+        // road in, instead of `0x80040205` from the commands that need a thread and success
+        // from the ones that do not.
+        for command in ["k 3", "r", "lm", ".echo alive"] {
+            assert!(
+                matches!(
+                    e.execute_command_bounded(command, 5_000),
+                    Err(DbgEngError::NoDebuggee)
+                ),
+                "`{command}` did not answer that there is no debuggee"
+            );
+        }
+        assert!(
+            matches!(e.execute_and_wait("g", 5_000), Err(DbgEngError::NoDebuggee)),
+            "a second resume was not refused"
+        );
+        // And the session is still the caller's to end, which is the only thing left to do.
+        e.end_session()
+            .expect("end_session failed after the ending");
+    }
+
+    /// The same ending reached through [`DebugEngine::settle`], which is the corner
+    /// [windbg-mcp#226]'s fix left open: a raw `Execute` sets the run state, and the pump that
+    /// recovers it is where the target runs out.
+    ///
+    /// The pump's buffer is the whole of what is at stake here — the command itself printed only
+    /// its own echo, and everything the run produced (module loads, a breakpoint banner, an
+    /// embedded script's prints) arrives during the wait this used to fail. It is printed rather
+    /// than asserted on: what a `cmd.exe` prints on its way out belongs to the host, while the
+    /// answer being `Ok(Some(_))` at all is the fix.
+    ///
+    /// [windbg-mcp#226]: https://github.com/glslang/windbg-mcp/issues/226
+    #[test]
+    #[cfg(not(miri))]
+    fn a_target_that_exits_during_the_settle_pump_reports_the_ending_with_its_output() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c exit").expect("launch failed");
+
+        e.execute_command_bounded("g", 0)
+            .expect("the raw `g` itself should succeed — it is the pump that follows it");
+        assert!(
+            e.is_running().expect("could not read the execution status"),
+            "a raw `g` left the engine reading as stopped, so there is nothing here to settle"
+        );
+
+        let settled = e
+            .settle(30_000)
+            .expect("the pump reported the target's ending as a failure")
+            .expect("settle found nothing to pump after a raw `g`");
+        assert!(
+            settled.target_gone,
+            "the pump ended because the target did, and did not say so: {settled:?}"
+        );
+        println!("captured by the pump: {:?}", settled.output);
+
+        // Settling again finds nothing rather than pumping a target that is not there.
+        assert!(
+            e.settle(5_000).expect("a second settle errored").is_none(),
+            "settle pumped an engine that holds no target"
+        );
+        e.end_session()
+            .expect("end_session failed after the ending");
+    }
+
+    /// Execution control with no debuggee is **refused**, because letting it reach DbgEng takes
+    /// the process down.
+    ///
+    /// Measured before this guard existed, on dbgeng 10.0.26100.1 (ARM64): a raw `g` through
+    /// `execute_command_bounded` exits the process with `STATUS_ACCESS_VIOLATION` — both on an
+    /// engine whose debuggee had just exited *and* on this one, which has never held a target.
+    /// The second case is why the guard is keyed on the missing debuggee rather than on the
+    /// departure, and why it sits in the primitive rather than in the caller that met it first.
+    ///
+    /// A structured exception is not a panic, so there is no `#[should_panic]` shape for the
+    /// regression: what this test asserts by *returning at all* is that the fault is gone. Under
+    /// `cargo nextest`, which gives each test its own process, a regression takes this one down
+    /// and nothing else.
+    #[test]
+    #[cfg(not(miri))]
+    fn execution_control_with_no_debuggee_is_refused_rather_than_faulting_the_process() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        assert!(
+            matches!(e.no_debuggee(), Ok(true)),
+            "a fresh engine is supposed to be holding no target"
+        );
+
+        // Four spellings of one thing, and the point is that the guard reads none of them: an
+        // alias and a `.if` branch reach execution without saying so, which is why the check is
+        // on the engine's state rather than on the text.
+        for command in ["g", "p", "t", ".if (1) { g }"] {
+            assert!(
+                matches!(
+                    e.execute_command_bounded(command, 5_000),
+                    Err(DbgEngError::NoDebuggee)
+                ),
+                "`{command}` was not refused on the bounded path"
+            );
+            assert!(
+                matches!(e.execute_command(command), Err(DbgEngError::NoDebuggee)),
+                "`{command}` was not refused on the unbounded path"
+            );
+        }
+
+        // The two typed paths, one of which had the guard already. Named here so all three ways
+        // in are pinned in one place rather than one of them being covered by a target's exit.
+        assert!(
+            matches!(e.execute_and_wait("g", 5_000), Err(DbgEngError::NoDebuggee)),
+            "execute_and_wait was not refused"
+        );
+        assert!(
+            matches!(
+                e.run_to_address(0x1000, 5_000),
+                Err(DbgEngError::NoDebuggee)
+            ),
+            "run_to_address was not refused"
+        );
     }
 }
 
