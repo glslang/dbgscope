@@ -35,7 +35,7 @@ pub(crate) const DESCRIPTOR_FLAG_SUBSEGMENT: u8 = 0x08;
 /// allocated range look like an LFH subsegment: VS subsegments (`0x0f`), page-range and large
 /// allocations (`0x03`) and Verifier special pool (`0x03`) all have it set. Their contents
 /// then fail to decode as a subsegment header and the whole range is dropped, which is the
-/// silent coverage loss behind glslang/win-kexp#90.
+/// silent coverage loss behind glslang/dbgscope#90.
 pub(crate) fn descriptor_backend(flags: u8) -> PoolBackend {
     if flags & DESCRIPTOR_FLAG_SUBSEGMENT == 0 {
         PoolBackend::Segment
@@ -688,7 +688,7 @@ pub fn raw_tag_hex(tag: u32) -> String {
 /// Two separate ways it cannot, and collapsing them would get the reason wrong:
 ///
 /// * it does not identify the tag at all — [`display_is_ambiguous`];
-/// * it identifies it but cannot survive the trip. `!win_kexp.poolmap` splits its arguments on
+/// * it identifies it but cannot survive the trip. `!dbgscope.poolmap` splits its arguments on
 ///   whitespace, so a tag with a leading or embedded space — raw bytes `A BC` — comes back as the
 ///   tag `A` with `BC` left over as a stray argument, and an all-space tag comes back as no
 ///   argument at all. Only a nonempty run of non-space bytes followed by nothing but spaces
@@ -899,7 +899,7 @@ mod tests {
     /// Every rejection has to name the check it failed and carry the values that failed it.
     /// A walk against a live 26100 kernel rejected 5.5k subsegments as one undifferentiated
     /// "implausible", which cannot distinguish a header rewritten under us from a field we
-    /// decode wrongly — the whole point of glslang/win-kexp#90.
+    /// decode wrongly — the whole point of glslang/dbgscope#90.
     #[test]
     fn test_lfh_rejections_name_their_predicate_and_carry_their_values() {
         let subsegment = 0xffff_8c8f_0d60_2000;

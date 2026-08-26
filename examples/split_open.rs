@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
 
-use win_kexp::dbgeng::DebugEngine;
+use dbgscope::dbgeng::DebugEngine;
 
 /// A command line long enough that a freed buffer is likely to read as garbage rather
 /// than happening to survive in place, and distinctive enough to recognize in `|` output.

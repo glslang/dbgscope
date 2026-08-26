@@ -1213,7 +1213,7 @@ fn discover_segment_context(
                 // plus `first`, is 0x10000. One spare page, every time, at both 0x10000 and
                 // 0x20000 subsegment sizes.
                 //
-                // Bounding by the range is what raised glslang/win-kexp#103: where that spare
+                // Bounding by the range is what raised glslang/dbgscope#103: where that spare
                 // page happened to be committed, the walk decoded it, and since nothing there is
                 // a chunk it refused a header every sixteen bytes to the end — 0x1000/16 = 256
                 // per subsegment, against 248 measured. The remaining refusals on a live walk
@@ -1666,7 +1666,7 @@ pub(crate) struct PoolSnapshot {
     /// A count, because the diagnostic that names them cannot be one. `PoolDiagnostics`
     /// collapses messages by shape, and a refusal is reported once per extent — so the figure
     /// beside that line counts *extents that contained a refusal*, which reads like a chunk
-    /// count and is not one. On the walk that raised glslang/win-kexp#93 the difference was
+    /// count and is not one. On the walk that raised glslang/dbgscope#93 the difference was
     /// between "884" and a number nothing recorded.
     ///
     /// Only `walk_vs` feeds it today; LFH subsegments are refused during discovery, one per
@@ -1698,7 +1698,7 @@ pub(crate) struct PoolSnapshot {
 /// reported as nothing at all.
 ///
 /// **On live 26100 it has measured zero** — 1,619 stalls, 6,627,520 bytes stepped over, nothing
-/// read behind any of them (glslang/win-kexp#104). That is the number saying what it says, not a
+/// read behind any of them (glslang/dbgscope#104). That is the number saying what it says, not a
 /// counter that was never wired up: `stalled_here` latches for the rest of the region and any
 /// later extent adds to `recovered_bytes`, which
 /// [`SnapshotWalker::walk_region`]'s own test pins at two pages. So on that target every stall
@@ -2027,7 +2027,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 // reported on every byte from here to `requested_end`, so stepping a page and
                 // asking again asks a question that has been answered.
                 //
-                // Measured on live 26100 (glslang/win-kexp#104): every stall sample carried
+                // Measured on live 26100 (glslang/dbgscope#104): every stall sample carried
                 // `0x0+0x0`, eight of them consecutive — one dead region stepping itself into the
                 // give-up bound, eight KD round trips to learn what the first answer said. Across
                 // the walk that was ~1,100 stalled pages, and `recovered_bytes` was zero on four
@@ -2404,7 +2404,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     ///
     /// Starting each extent at its own first sixteen-byte boundary — which is what this did — is
     /// therefore a guess on every extent after a hole, and one of the two sources of
-    /// glslang/win-kexp#103's 106,516 refusals: one per sixteen bytes, until the scan wandered
+    /// glslang/dbgscope#103's 106,516 refusals: one per sixteen bytes, until the scan wandered
     /// onto a word that decoded plausibly. The refusals were the harmless half. Whatever the
     /// scan wandered onto was pushed into `spans` as an allocation, tag and all.
     ///
@@ -3168,7 +3168,7 @@ mod tests {
         );
     }
 
-    /// The bug behind glslang/win-kexp#83, and the reason the size is no longer read as
+    /// The bug behind glslang/dbgscope#83, and the reason the size is no longer read as
     /// `_POOL_HEADER.PreviousSize`: eight bits cannot hold 0x140, so that allocation used to
     /// present as a 0x40 one — a value that fits the page perfectly well and that no range
     /// check could tell from a genuine 0x40. Thirteen bits hold anything a page can, so the
@@ -3375,7 +3375,7 @@ mod tests {
         snapshot
     }
 
-    /// glslang/win-kexp#93: "884x rejecting implausible VS chunk size # at #" counted the
+    /// glslang/dbgscope#93: "884x rejecting implausible VS chunk size # at #" counted the
     /// *extents* that contained a refusal, because the message was latched behind a bool. How
     /// many chunks were refused was reported nowhere — and a refusal is not free, since the
     /// walk then advances sixteen bytes at a time and decodes every later header in the extent
@@ -3597,7 +3597,7 @@ mod tests {
         snapshot
     }
 
-    /// glslang/win-kexp#94. One page the query cannot advance over used to cost every
+    /// glslang/dbgscope#94. One page the query cannot advance over used to cost every
     /// committed page behind it: the walk filed the rest of the region as unreadable and
     /// `break`ed, while the sibling case one branch above — a query reporting a *gap* —
     /// recorded the hole and carried on. The samples show these firing part-way through
@@ -3692,7 +3692,7 @@ mod tests {
         walk_holey(&memory, &region)
     }
 
-    /// glslang/win-kexp#103: 106,516 VS chunk headers refused on one live 26100 walk, ~196 per
+    /// glslang/dbgscope#103: 106,516 VS chunk headers refused on one live 26100 walk, ~196 per
     /// extent, every one of them failing the same subsegment-bound check — which read as a bound
     /// that was wrong. It was not. Nothing was wrong with any of the three predicates: the walk
     /// was handing them a *guess*, because it started every committed extent at that extent's own
@@ -3802,7 +3802,7 @@ mod tests {
         );
     }
 
-    /// glslang/win-kexp#104, settled on live 26100: every stall the walk met answered `0x0+0x0`,
+    /// glslang/dbgscope#104, settled on live 26100: every stall the walk met answered `0x0+0x0`,
     /// and the eight verbatim samples were eight *consecutive* pages — one dead region stepping
     /// itself into the give-up bound, paying eight KD round trips to be told eight times what the
     /// first answer already said. `0x0+0x0` is not a region at zero; it is the engine reporting
@@ -3931,7 +3931,7 @@ mod tests {
     }
 
     /// Special pool is page-granular, so one page that does not decode says nothing about the
-    /// next. Abandoning the region there — which is what this did before glslang/win-kexp#86 —
+    /// next. Abandoning the region there — which is what this did before glslang/dbgscope#86 —
     /// dropped every later allocation *and* left `complete` set, so the truncated snapshot was
     /// the one cached and re-served.
     #[test]
@@ -4584,7 +4584,7 @@ mod tests {
         }
     }
 
-    /// glslang/win-kexp#103, settled on a live 26100 kernel: the page range holding a VS
+    /// glslang/dbgscope#103, settled on a live 26100 kernel: the page range holding a VS
     /// subsegment is **larger than the subsegment**, by one unit every time, so a walk bounded by
     /// the descriptor decodes a page that holds no chunks and refuses a header every sixteen
     /// bytes across it. The subsegment's own `Size` is the chunk area, and it is only reachable
@@ -4965,7 +4965,7 @@ mod tests {
 
     /// A page range that is not a subsegment must be walked as page ranges, not rejected.
     ///
-    /// This is glslang/win-kexp#90 at the smallest scale that shows it. Every allocated range
+    /// This is glslang/dbgscope#90 at the smallest scale that shows it. Every allocated range
     /// carries `RangeFlags` bit `0x01`, so reading that bit as "this is an LFH subsegment"
     /// sends plain page-range allocations, VS subsegments and Verifier special pool alike
     /// through the LFH decoder, which refuses the result and drops the range — silently, and

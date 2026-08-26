@@ -11,8 +11,8 @@ use std::ffi::CString;
 use std::hint::black_box;
 use std::time::Duration;
 
-use win_kexp::dbgeng::DebugEngine;
-use win_kexp::heap::{self, HeapAllocation, HeapBackend, HeapKind, HeapWalk};
+use dbgscope::dbgeng::DebugEngine;
+use dbgscope::heap::{self, HeapAllocation, HeapBackend, HeapKind, HeapWalk};
 use windows::Win32::System::Diagnostics::Debug::{DebugBreak, OutputDebugStringA};
 use windows::Win32::System::Memory::{HEAP_FLAGS, HeapAlloc, HeapCreate};
 use windows::core::PCSTR;
@@ -143,7 +143,7 @@ fn controller() -> Result<(), Box<dyn std::error::Error>> {
         allocations.layout.semantic_family.as_str()
     );
 
-    let dump = std::env::temp_dir().join(format!("win-kexp-user-heap-{}.dmp", std::process::id()));
+    let dump = std::env::temp_dir().join(format!("dbgscope-user-heap-{}.dmp", std::process::id()));
     engine.execute_command(&format!(".dump /ma \"{}\"", dump.display()))?;
     engine.end_session()?;
     heap::invalidate_caches();

@@ -37,7 +37,7 @@ pub(crate) struct TypeLayout {
 ///
 /// Deliberately not a whole [`SessionKey`]. A layout describes the *image*, not which target
 /// instance happens to be loaded, and keying it on the target inserted an entry per engine and
-/// per `end_session` that nothing ever pruned (glslang/win-kexp#84). Deriving the key here
+/// per `end_session` that nothing ever pruned (glslang/dbgscope#84). Deriving the key here
 /// rather than asking each caller to blank a field is what keeps that from being one call
 /// site's discipline — there is no key a caller can hand this cache that reintroduces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -793,7 +793,7 @@ mod tests {
         }
     }
 
-    /// glslang/win-kexp#84 and #87 are the two ways one key can be wrong, and the image
+    /// glslang/dbgscope#84 and #87 are the two ways one key can be wrong, and the image
     /// answers both. Keyed on the target, the cache grew an entry per engine and per
     /// `end_session` that nothing ever pruned. Keyed on the base alone — which is what fixing
     /// that left — two Windows builds whose kernels load at the same address share a layout,
