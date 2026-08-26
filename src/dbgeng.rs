@@ -4943,7 +4943,7 @@ mod tests {
     /// answering a bare `0x80040205` while `.echo` still worked.
     #[test]
     #[cfg(not(miri))]
-    fn a_target_that_exits_during_a_go_is_an_ending_rather_than_a_catastrophe() {
+    fn test_a_target_that_exits_during_a_go_is_an_ending_rather_than_a_catastrophe() {
         let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         e.launch_process("cmd.exe /c exit").expect("launch failed");
@@ -5002,7 +5002,7 @@ mod tests {
     /// [windbg-mcp#226]: https://github.com/glslang/windbg-mcp/issues/226
     #[test]
     #[cfg(not(miri))]
-    fn a_target_that_exits_during_the_settle_pump_reports_the_ending_with_its_output() {
+    fn test_a_target_that_exits_during_the_settle_pump_reports_the_ending_with_its_output() {
         let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         e.launch_process("cmd.exe /c exit").expect("launch failed");
@@ -5043,7 +5043,7 @@ mod tests {
     /// leave `.kill` off, and be re-derived for every engine version.
     #[test]
     #[cfg(not(miri))]
-    fn a_command_that_takes_the_target_away_says_so_and_kill_is_not_one_of_them() {
+    fn test_a_command_that_takes_the_target_away_says_so_and_kill_is_not_one_of_them() {
         let _debuggee = one_debuggee();
 
         // `.kill`: the target is terminated but the exit events have not been pumped, so the
@@ -5113,7 +5113,7 @@ mod tests {
     /// and nothing else.
     #[test]
     #[cfg(not(miri))]
-    fn execution_control_with_no_debuggee_is_refused_rather_than_faulting_the_process() {
+    fn test_execution_control_with_no_debuggee_is_refused_rather_than_faulting_the_process() {
         let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         assert!(
