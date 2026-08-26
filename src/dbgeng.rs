@@ -26,8 +26,8 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_FLOAT32,
     DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82, DEBUG_VALUE_FLOAT128,
     DEBUG_VALUE_INT8, DEBUG_VALUE_INT16, DEBUG_VALUE_INT32, DEBUG_VALUE_INT64,
-    DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128, IDebugAdvanced2, IDebugBreakpoint,
-    IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
+    DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128, DebugConnectWide, IDebugAdvanced2,
+    IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
     IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
     IDebugSystemObjects,
 };
@@ -1034,6 +1034,70 @@ impl DebugEngine {
         // what makes a recycled pointer harmless for the case we control.
         reissue_identity(&engine.client);
         engine
+    }
+
+    /// Connects to a debugging **server** — an engine running in another process — and drives
+    /// its session over DbgEng's remote transport.
+    ///
+    /// `remote_options` is the connection string `cdb -remote` takes:
+    /// `npipe:pipe=<name>,server=<host>` or `tcp:port=<n>,server=<host>`. The server side is
+    /// any engine host started with the matching `-server` option.
+    ///
+    /// The reason to reach for this over [`Self::new`] is that **an extension loads in the
+    /// server**, where it meets the target, rather than in this process. So an engine host of a
+    /// different architecture can run one this process could never load — a 32-bit `sos.dll`
+    /// against a 32-bit CLR, driven from an x64 caller, which no in-process arrangement can do
+    /// because the CLR data access DLL is architecture-paired to the target as well as the host.
+    ///
+    /// **The session belongs to the server, so this engine is a borrowed one**
+    /// (`owns_session` stays false, via [`Self::try_from_client_interface`]): dropping it
+    /// disconnects this client and leaves the server's target alone. Ending that target is the
+    /// business of whoever started the host — and on a remote client `EndSession` would reach
+    /// across and tear down a session this process never opened.
+    ///
+    /// Two measured properties of the remote transport, both surprising enough to state here:
+    ///
+    /// - **A remote client refuses `QueryInterface` for `IUnknown`** (`0x80010103`), so
+    ///   [`Self::try_from_windbg_client`] — which takes an `&IUnknown` — cannot be used to wrap
+    ///   one. That is why this goes through the typed constructor. `IDebugControl4`,
+    ///   `IDebugDataSpaces4`, `IDebugSymbols3` and `IDebugAdvanced2` are all present.
+    /// - **`IDebugAdvanced2::GetSymbolInformation` does not cross the transport**, so
+    ///   [`Self::module_pdb`] fails with `E_INVALIDARG` against any remote session. Measured
+    ///   with the client and server on the *same* architecture as well as across x86/x64, and
+    ///   against an in-process engine on the same target where it succeeds — so it is the
+    ///   transport rather than a struct whose size the two ends disagree about. Everything else
+    ///   this type offers was exercised over a remote session and works.
+    ///
+    /// A version skew between the two engines is reported as `0x8007053D`, *"The server is
+    /// currently disabled"*, which names neither end: a client whose `dbgeng.dll` is older than
+    /// the server's is refused. Load both from the same debugger package.
+    pub fn connect(remote_options: &str) -> Result<Self, DbgEngError> {
+        let wide: Vec<u16> = remote_options
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated and outlives the call, and `raw` receives an owned
+        // interface pointer on success — taken over by the `from_raw` below.
+        unsafe {
+            DebugConnectWide(
+                PCWSTR::from_raw(wide.as_ptr()),
+                &IDebugClient6::IID,
+                &raw mut raw,
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: format!("connecting to the debugging server at `{remote_options}`"),
+            source,
+        })?;
+        // SAFETY: the call above returned success, so `raw` is an owned `IDebugClient6`.
+        let client: IDebugClient6 = unsafe { IDebugClient6::from_raw(raw) };
+        let engine = Self::try_from_client_interface(client)?;
+        // A client this new cannot be one anything holds a cached view of, whatever address it
+        // landed on — the same reasoning as [`Self::new`], and it applies here for the same
+        // reason: this call, not the caller, is what created the pointer.
+        reissue_identity(&engine.client);
+        Ok(engine)
     }
 
     pub fn from_windbg_client(client: &IUnknown) -> Self {
@@ -3846,6 +3910,31 @@ mod tests {
         assert_eq!(nul_terminated(b"nt\0junkjunk"), "nt");
         assert_eq!(nul_terminated(b"\0"), "");
         assert_eq!(nul_terminated(b"no terminator"), "no terminator");
+    }
+
+    /// Connecting to a server that is not there is an **error**, not a panic and not a wait.
+    ///
+    /// Worth pinning because [`DebugEngine::connect`] is the one constructor whose failure comes
+    /// from outside this process — the host may be absent, refusing, or running an engine the
+    /// local one will not talk to — where the constructors beside it (`new`,
+    /// `from_windbg_client`) answer that class of problem with `expect`. A caller that gets a
+    /// panic here cannot report which server it failed to reach, and one that blocks cannot
+    /// report anything at all.
+    #[cfg(not(miri))]
+    #[test]
+    fn test_connecting_to_a_server_that_is_not_there_is_an_error() {
+        // A pipe nothing publishes. This path creates no session — the connection fails before
+        // there is one — so unlike the engine tests below it needs no serialization against the
+        // process-wide debuggee.
+        let options = "npipe:pipe=dbgscope-no-such-server-2f9c41d8,server=localhost";
+        // `let else` rather than `expect_err`, which would want `DebugEngine: Debug`.
+        let Err(err) = DebugEngine::connect(options) else {
+            panic!("nothing is serving `{options}`, so connecting to it must fail");
+        };
+        // The connection string travels in the message. This is the one error whose cause is a
+        // thing the caller named, and a log line that omits it says only that *a* server was
+        // unreachable.
+        assert!(err.to_string().contains(options), "{err}");
     }
 
     #[cfg(not(miri))]
