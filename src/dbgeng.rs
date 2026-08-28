@@ -1054,6 +1054,16 @@ pub struct DebugEngine {
     /// API does not expose it (`GetDebuggeeType` answers `DEBUG_CLASS_USER_WINDOWS` /
     /// `DEBUG_USER_WINDOWS_PROCESS` for a launch and an attach alike), and parsing a debugger's
     /// human output to decide whether to kill somebody's process is not a thing to build.
+    ///
+    /// **Per wrapper, not per client**, which is a deliberate difference from the target identity
+    /// beside it and was raised in review as a defect. Two wrappers around one `IDebugClient6`
+    /// would not see each other's attachments — true, and it is the same for `deferred_inputs`,
+    /// because a session belongs to the wrapper that opened it. The identity registry is keyed by
+    /// client for a reason that does not transfer: it is a **cache tag**, so losing one costs a
+    /// re-read, and that is what lets it have a cap and evict. Losing an attachment kills
+    /// somebody's process. Sharing this the same way would put the crate's most consequential
+    /// decision behind an eviction policy, to serve an arrangement nothing here makes — the
+    /// extension's borrowed wrapper never attaches and never ends a session.
     attached_processes: Mutex<std::collections::HashSet<u32>>,
 }
 
@@ -3378,6 +3388,9 @@ impl DebugEngine {
         &self,
         command_line: &str,
     ) -> Result<PendingTarget<'_>, DbgEngError> {
+        // Before the spawn, so a pid the operating system is about to hand this process cannot
+        // still be sitting in the record from an attach that ended. See `prune_dead_attachments`.
+        self.prune_dead_attachments();
         self.enable_initial_break()?;
         let mut wide = to_wide(command_line);
         unsafe {
@@ -3419,6 +3432,7 @@ impl DebugEngine {
         // this returns a guard: from here on the process is ours to let go of properly, whether
         // or not the break-in wait below ever succeeds. A wait that fails still leaves a debugger
         // attached to somebody else's process.
+        self.prune_dead_attachments();
         self.claim_attached(pid);
         // The attach completes during `WaitForEvent`, which breaks the target in.
         Ok(PendingTarget::new(self, WaitKind::Live))
@@ -3467,6 +3481,28 @@ impl DebugEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(pid);
+    }
+
+    /// Forgets recorded attachments this session no longer holds.
+    ///
+    /// **Called by the openers, and it is about pid reuse rather than tidiness.** A pid outlives
+    /// the process it named, so an attached process that exits leaves a record that matches
+    /// nothing — harmless, since the teardown walks the session and a pid it does not hold cannot
+    /// match — right up until the operating system hands that number to a process this engine then
+    /// **launches**. That process would be detached and left running by a session that is supposed
+    /// to take it. Pruning at the opener is what closes it, and it has to prune rather than clear:
+    /// a session can hold an attached process *and* be about to launch one, and clearing would
+    /// forget the live attachment and kill somebody else's process to prevent an unlikely one.
+    ///
+    /// A session with no target holds nothing, so this correctly forgets everything there.
+    fn prune_dead_attachments(&self) {
+        let Ok(held) = self.session_processes() else {
+            return;
+        };
+        self.attached_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|pid| held.iter().any(|(_, held)| held == pid));
     }
 
     /// Forgets every recorded attach.
@@ -5456,11 +5492,22 @@ mod tests {
 
         e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
             .expect("launch after a lost attach failed");
-        // Answered from the session rather than from the record, which is what makes it false
-        // here: the pid is still recorded, and the process it names is not in this session.
         assert!(
             !e.attached_to_a_live_process(),
             "the engine still believes it holds an attached process after launching one"
+        );
+        // **And the record itself was pruned**, which the assertion above cannot see — it asks the
+        // session, so a stale pid naming nothing reads as "no attachment" either way. What the
+        // pruning is for is the coincidence that cannot be staged in a test: Windows handing the
+        // dead process's number to the one this engine just launched, which would then be detached
+        // and left running. Reading the field directly is the only way to say the record is clean
+        // rather than merely unmatched.
+        assert!(
+            e.attached_processes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "the launch left a dead process's pid in the record, where a reused pid can alias it"
         );
         let launched = eval_expression(&e, "@$tpid").expect("could not read the launched pid");
 
