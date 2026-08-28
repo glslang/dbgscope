@@ -3495,6 +3495,18 @@ impl DebugEngine {
     /// forget the live attachment and kill somebody else's process to prevent an unlikely one.
     ///
     /// A session with no target holds nothing, so this correctly forgets everything there.
+    ///
+    /// **It narrows the window rather than closing it, which review asked about and which is
+    /// declined on purpose.** `CreateProcessWide` is deferred, so the launched process gets its
+    /// pid at the next `WaitForEvent`: an attached process that exits *after* this prune and
+    /// whose number is then handed to that launch is still misread. Closing it needs something
+    /// identifying the process **instance** rather than its number, and the one that would work is
+    /// a retained handle — which also stops Windows reusing the pid at all, so it is the real
+    /// answer if this is ever worth closing. It is not yet: reaching it needs an exit inside a
+    /// window of milliseconds *and* an immediate reuse of that exact number, and what it costs is
+    /// a launched process outliving its session — a stray process, where the bug this whole path
+    /// exists for was killing somebody else's. Handle lifetimes across four teardown paths are a
+    /// worse risk than that.
     fn prune_dead_attachments(&self) {
         let Ok(held) = self.session_processes() else {
             return;
