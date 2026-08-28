@@ -32,7 +32,7 @@ features = [
 # of the library still resolves the four features above and no more.
 [dev-dependencies.windows]
 version = "0.62.2"
-features = ["Win32_System_Memory"]
+features = ["Win32_System_Memory", "Win32_System_Threading"]
 
 # docs.rs builds on Linux, where this crate does not compile at all.
 [package.metadata.docs.rs]
