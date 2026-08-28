@@ -1034,8 +1034,8 @@ pub struct DebugEngine {
     /// Whether an interrupt has been raised on this engine and not yet accounted for. Shared with
     /// every [`InterruptHandle`] this engine hands out; see there for what it buys.
     interrupt_raised: Arc<AtomicBool>,
-    /// Whether this engine's target is a live user-mode process it **attached** to rather than
-    /// created — the one case where ending the session must not take the target with it.
+    /// The system pids of live user-mode processes this engine **attached** to rather than
+    /// created — the ones ending the session must let go of rather than take with it.
     ///
     /// Read by [`Self::end_session`] and by `Drop`, which is why it lives here rather than being
     /// passed in at teardown: a caller can end a session explicitly, but nothing gets to say
@@ -1043,11 +1043,18 @@ pub struct DebugEngine {
     /// survive either ending. It is the same asymmetry [`Self::resume_and_detach_live_kernel`]
     /// exists for, on the target type that had never been given it.
     ///
-    /// **Set from the opener rather than asked of DbgEng**, because DbgEng cannot answer it:
-    /// `GetDebuggeeType` reports `DEBUG_CLASS_USER_WINDOWS` / `DEBUG_USER_WINDOWS_PROCESS` for a
-    /// launch and an attach alike, and how the target was obtained is not otherwise exposed. So
-    /// the fact has to be recorded by whoever obtained it, which is [`Self::attach_process_begin`].
-    attached_live_process: AtomicBool,
+    /// **A set of pids rather than a flag about the session**, which two rounds of review argued
+    /// its way to and is worth keeping in one piece. DbgEng holds **several** user-mode processes
+    /// in one session — `|` lists them, and says `attach` or `create` against each — so an engine
+    /// can be attached to somebody's service *and* have launched a program of its own, and a
+    /// session-wide answer is wrong for one of them whichever way it goes. Provenance is per
+    /// process because the fact is.
+    ///
+    /// **Recorded by the opener rather than asked of DbgEng.** `|` knows, but that is text; the
+    /// API does not expose it (`GetDebuggeeType` answers `DEBUG_CLASS_USER_WINDOWS` /
+    /// `DEBUG_USER_WINDOWS_PROCESS` for a launch and an attach alike), and parsing a debugger's
+    /// human output to decide whether to kill somebody's process is not a thing to build.
+    attached_processes: Mutex<std::collections::HashSet<u32>>,
 }
 
 impl Default for DebugEngine {
@@ -1197,7 +1204,7 @@ impl DebugEngine {
             owns_session: false,
             deferred_inputs: Mutex::new(Vec::new()),
             interrupt_raised: Arc::new(AtomicBool::new(false)),
-            attached_live_process: AtomicBool::new(false),
+            attached_processes: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1229,7 +1236,7 @@ impl DebugEngine {
             owns_session: false,
             deferred_inputs: Mutex::new(Vec::new()),
             interrupt_raised: Arc::new(AtomicBool::new(false)),
-            attached_live_process: AtomicBool::new(false),
+            attached_processes: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -1634,6 +1641,7 @@ impl DebugEngine {
         // A live kernel needs an INFINITE WaitForEvent (a finite timeout returns
         // E_NOTIMPL); INITIAL_BREAK makes it stop at the first event. `wait()` bounds it
         // so an unresponsive target can't hang the engine thread forever.
+        self.forget_attachments();
         Ok(PendingTarget::new(self, WaitKind::KernelBreakIn))
     }
 
@@ -1693,6 +1701,7 @@ impl DebugEngine {
         // it so an unreachable target can't hang the engine thread forever. The connection
         // string rides along because that link is only established during the wait.
         self.retain_deferred_input(TargetInput::Ansi(connection));
+        self.forget_attachments();
         Ok(PendingTarget::new(self, WaitKind::KernelBreakIn))
     }
 
@@ -3410,7 +3419,7 @@ impl DebugEngine {
         // this returns a guard: from here on the process is ours to let go of properly, whether
         // or not the break-in wait below ever succeeds. A wait that fails still leaves a debugger
         // attached to somebody else's process.
-        self.attached_live_process.store(true, Ordering::SeqCst);
+        self.claim_attached(pid);
         // The attach completes during `WaitForEvent`, which breaks the target in.
         Ok(PendingTarget::new(self, WaitKind::Live))
     }
@@ -3423,7 +3432,9 @@ impl DebugEngine {
             self.client
                 .OpenDumpFileWide(PCWSTR::from_raw(wide.as_ptr()), 0)
         }
-        .map_err(DbgEngError::OperationFailed)
+        .map_err(DbgEngError::OperationFailed)?;
+        self.forget_attachments();
+        Ok(())
     }
 
     /// Opens a TTD trace (`.run`); alias for [`Self::open_dump`].
@@ -3449,47 +3460,85 @@ impl DebugEngine {
             .clear();
     }
 
-    /// Whether this engine's target is a live user-mode process it **attached** to rather than
-    /// launched — the case [`Self::end_session`] detaches from instead of ending passively, so
-    /// the process outlives the session.
+    /// Records that `pid` is a process this engine attached to, so the teardown detaches from it
+    /// instead of taking it.
+    fn claim_attached(&self, pid: u32) {
+        self.attached_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid);
+    }
+
+    /// Forgets every recorded attach.
     ///
-    /// Exposed so a caller can *say* what its teardown did. The teardown itself needs no help:
-    /// `end_session` reads this on its own, and so does `Drop`.
+    /// Called when the session ends, and by the openers that **create** a target — a dump, a
+    /// trace, a kernel connection. Those replace the session outright, so a pid recorded against
+    /// the previous one is stale, and the one way a stale pid could matter is the one that would
+    /// hurt: the operating system reusing it for a process this engine went on to launch, which
+    /// would then be detached from and survive a session that is supposed to take it.
+    fn forget_attachments(&self) {
+        self.attached_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Whether this engine holds a live user-mode process it **attached** to rather than
+    /// launched — one [`Self::end_session`] will detach from and leave running.
+    ///
+    /// Exposed so a caller can *say* what its teardown is about to do. The teardown itself needs
+    /// no help: `end_session` decides for itself, and so does `Drop`.
+    ///
+    /// **Asked of the session, not of the record**, and the difference is a wrong sentence rather
+    /// than a wrong teardown: an attached process can leave on its own, so a pid recorded here is
+    /// not proof the engine still holds it, and a caller reading this to describe what it did
+    /// would say "detached and left running" about a session that launched and killed one.
     pub fn attached_to_a_live_process(&self) -> bool {
-        self.attached_live_process.load(Ordering::SeqCst)
+        let attached = self
+            .attached_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        !attached.is_empty()
+            && self
+                .session_processes()
+                .is_ok_and(|held| held.iter().any(|(_, pid)| attached.contains(pid)))
     }
 
     /// Ends the current debug session without destroying the client, so it can be
     /// reused for another target.
     ///
-    /// **What "ending" does to the target depends on where the target came from**, and the two
+    /// **What "ending" does to a target depends on where that target came from**, and the two
     /// exceptions are both about not destroying something this engine did not create:
     ///
     /// - a **live kernel** is resumed and actively detached, or it stays frozen at its last break;
-    /// - a process this engine **attached** to is actively detached and left running, because a
-    ///   passive end leaves it marked as being debugged and the kernel then kills it when the
-    ///   debugger exits (`DebugSetProcessKillOnExit` defaults to true);
-    /// - everything else — a dump, a trace, a kernel dump, and a process this engine *launched* —
-    ///   ends passively, which for the launch means the debuggee goes with it.
+    /// - every user-mode process this engine **attached** to is detached first and left running,
+    ///   because a passive end destroys the debug port and the kernel then kills the debuggees
+    ///   hanging off it (`DebugSetProcessKillOnExit` defaults to true);
+    /// - everything else — a dump, a trace, a kernel dump, and any process this engine *launched*
+    ///   — goes with the session.
+    ///
+    /// The first two are **per process**, not per session: DbgEng holds several user-mode targets
+    /// at once (`|` lists them), so an engine can hold a service somebody else is running beside a
+    /// program it launched itself, and each is let go of on its own terms.
     pub fn end_session(&self) -> Result<(), DbgEngError> {
         // The target is going away, so anything cached against it must not be reused for
         // whatever this engine holds next — nor by any other wrapper around this same client,
         // which is why the identity is recorded against the client rather than in this engine.
         reissue_identity(&self.client);
-        // Taken rather than read: if the detach below fails it has already fallen back to the
-        // passive end, so a caller that tries again has nothing left to detach from — and an
-        // engine reused for a *dump* after a failed detach must not try to detach that.
-        let attached = self.attached_live_process.swap(false, Ordering::SeqCst);
         // A live kernel left halted (at a break) and detached *passively* stays FROZEN —
         // one CPU halted, the rest spinning — because a passive detach never tells the
         // target to run. Resume it and actively detach instead, leaving it running.
         let ended = if self.is_live_kernel() {
             self.resume_and_detach_live_kernel()
-        } else if attached {
-            self.detach_live_process()
         } else {
+            // Detached one by one *before* the session ends, which is what makes a mixed session
+            // come apart correctly: `EndSession` takes one flag for the whole session, so no
+            // choice of flag can both keep an attached process and take a launched one. Anything
+            // still in the session when the passive end runs is a target this engine created.
+            let detached = self.detach_attached_processes();
             unsafe { self.client.EndSession(DEBUG_END_PASSIVE) }
                 .map_err(DbgEngError::OperationFailed)
+                .and(detached)
         };
         // Released only once the session is *confirmed* torn down: an outstanding deferred
         // spawn or dial dies with it, so nothing can read these buffers afterwards. A failed
@@ -3514,35 +3563,99 @@ impl DebugEngine {
         .map_err(DbgEngError::OperationFailed)
     }
 
-    /// Detaches from a live user-mode process this engine attached to, leaving it **running**.
+    /// Detaches from every user-mode process this engine **attached** to, leaving each running,
+    /// and forgets them. Processes this engine created are left in the session for the passive
+    /// end to take.
     ///
     /// `bc *` first, for a sharper version of the kernel reason: an `int3` this engine patched in
     /// stays patched in a process that goes on running, and the first thread to reach it takes an
     /// exception with no debugger left to handle it. A target that dies minutes after the session
-    /// ended is worse than one that never survived it, because nothing connects the two.
+    /// ended is worse than one that never survived it, because nothing connects the two. It is
+    /// session-wide, so it also clears breakpoints in a process about to be taken — which costs
+    /// nothing, since that process is about to be taken.
     ///
-    /// No `SetExecutionStatus` beside it, which is the one step the kernel path has and this does
-    /// not: the kernel needs telling to run because the detach only disconnects, while for a
-    /// user-mode process the kernel's own `DebugActiveProcessStop` resumes the threads the debug
-    /// port suspended. Setting the run state here would ask DbgEng to move a target that is about
-    /// to stop being its target.
+    /// No resume beside it, which is the one step the kernel path has and this does not: the
+    /// kernel needs telling to run because its detach only disconnects, while
+    /// `DetachCurrentProcess` resumes the threads the debug port suspended.
     ///
-    /// **Falls back to the passive end**, which is what this path did before it existed. An active
-    /// detach talks to the target and so has failure modes a passive one has not — a process that
-    /// exited under us being the ordinary one — and this sits on a teardown that a client
-    /// disconnect and a lease expiry both run. Failing to end the session outright would trade a
-    /// killed debuggee for a session that will not close, which is the worse of the two.
-    ///
-    /// It still **reports** the failure, and reports the detach's error rather than the fallback's:
-    /// the fallback is how far this got, not what went wrong, and a caller told "released" would
-    /// have no reason to go and look at a process that has just been killed.
-    fn detach_live_process(&self) -> Result<(), DbgEngError> {
-        let _ = self.execute_command("bc *");
-        if let Err(detach) = unsafe { self.client.EndSession(DEBUG_END_ACTIVE_DETACH) } {
-            let _ = unsafe { self.client.EndSession(DEBUG_END_PASSIVE) };
-            return Err(DbgEngError::OperationFailed(detach));
+    /// **Best-effort per process, and the session ends either way.** This sits on a teardown that
+    /// a client disconnect and a lease expiry both run, where a session that will not close is
+    /// worse than a debuggee that was killed. It still **reports** the first failure, because a
+    /// caller told "released" would have no reason to go and look at a process that had just been
+    /// taken by the passive end instead.
+    fn detach_attached_processes(&self) -> Result<(), DbgEngError> {
+        let attached = std::mem::take(
+            &mut *self
+                .attached_processes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if attached.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let _ = self.execute_command("bc *");
+        let mut failure = None;
+        // Walked by engine id rather than by the recorded pid, because `SetCurrentProcessId` takes
+        // the engine's id and a pid this engine no longer holds — the process exited, a raw
+        // `.detach` took it — is simply not in this list. So a stale entry costs nothing and needs
+        // no separate check.
+        for (id, pid) in self.session_processes()? {
+            if !attached.contains(&pid) {
+                continue;
+            }
+            if let Err(e) = unsafe {
+                self.system_objects()?
+                    .SetCurrentProcessId(id)
+                    .and_then(|()| self.client.DetachCurrentProcess())
+            } {
+                failure.get_or_insert(DbgEngError::OperationFailed(e));
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// The user-mode processes in this session, as `(engine id, system pid)`.
+    ///
+    /// The engine id is what `SetCurrentProcessId` takes and the pid is what a caller knows a
+    /// process by, and they are not the same number — `GetProcessIdsByIndex` is the one call that
+    /// answers both, which is why this returns pairs rather than either alone.
+    fn session_processes(&self) -> Result<Vec<(u32, u32)>, DbgEngError> {
+        // An engine with no debuggee holds no processes, and answering that rather than asking is
+        // not a shortcut: `GetNumberProcesses` fails `E_UNEXPECTED` ("Catastrophic failure") in
+        // that state — measured — which would turn "the program had already finished" into a
+        // failed teardown. `has_target` is the one call that answers reliably there; see its docs.
+        if !self.has_target()? {
+            return Ok(Vec::new());
+        }
+        let system = self.system_objects()?;
+        let count =
+            unsafe { system.GetNumberProcesses() }.map_err(|source| DbgEngError::Context {
+                operation: "counting the processes in this session".into(),
+                source,
+            })? as usize;
+        let mut ids = vec![0u32; count];
+        let mut pids = vec![0u32; count];
+        unsafe {
+            system.GetProcessIdsByIndex(
+                0,
+                count as u32,
+                Some(ids.as_mut_ptr()),
+                Some(pids.as_mut_ptr()),
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "listing the processes in this session".into(),
+            source,
+        })?;
+        Ok(ids.into_iter().zip(pids).collect())
+    }
+
+    /// `IDebugSystemObjects` off this engine's client.
+    fn system_objects(&self) -> Result<IDebugSystemObjects, DbgEngError> {
+        self.client.cast().map_err(|source| DbgEngError::Context {
+            operation: "querying IDebugSystemObjects".into(),
+            source,
+        })
     }
 }
 
@@ -3573,11 +3686,10 @@ impl Drop for DebugEngine {
         }
         // And don't take somebody else's process down with us — the same asymmetry as the kernel
         // above, handled in the same place and for the same reason: a teardown that is nobody's
-        // call to make still has to leave a target this engine did not create alive.
-        if self.attached_live_process.swap(false, Ordering::SeqCst) {
-            let _ = self.detach_live_process();
-            return;
-        }
+        // call to make still has to leave a target this engine did not create alive. Before the
+        // end rather than instead of it: what this detaches is only the processes this engine
+        // attached to, and the session still has to be ended for the rest.
+        let _ = self.detach_attached_processes();
         // Best-effort teardown; ignore errors (e.g. when no session is active).
         unsafe {
             let _ = self.client.EndSession(DEBUG_END_PASSIVE);
@@ -5312,6 +5424,188 @@ mod tests {
             Some(STILL_RUNNING),
             "the process this engine launched (pid {pid}) outlived its session"
         );
+    }
+
+    /// **An engine is reusable, so where its target came from is answered by the last opener and
+    /// not by the last attach** — the gap review found in the first version of the fix above
+    /// ([glslang/dbgscope#121](https://github.com/glslang/dbgscope/pull/121)).
+    ///
+    /// The sequence is reachable without a teardown anywhere in it: attach, lose the target (here
+    /// a raw `.detach`, which takes it the moment the command returns; a process exiting on its
+    /// own does the same), then launch something else on the same engine. With only
+    /// `attach_process_begin` recording anything, the flag was still set, and the *launched*
+    /// process took the detach branch and survived a session that is supposed to take it.
+    ///
+    /// Two claims, and the second is the one that generalises: the launched process goes, and the
+    /// engine no longer believes it is holding an attached one.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_launch_after_a_lost_attach_is_still_a_launch() {
+        let _debuggee = one_debuggee();
+        let mut target = a_process_to_attach_to();
+
+        let e = DebugEngine::new();
+        e.attach_process(target.id()).expect("attach failed");
+        let detached = e
+            .execute_command_bounded(".detach", 10_000)
+            .expect("`.detach` failed");
+        assert!(
+            detached.target_gone,
+            "`.detach` left a target behind, so this is not the state under test: {detached:?}"
+        );
+
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch after a lost attach failed");
+        // Answered from the session rather than from the record, which is what makes it false
+        // here: the pid is still recorded, and the process it names is not in this session.
+        assert!(
+            !e.attached_to_a_live_process(),
+            "the engine still believes it holds an attached process after launching one"
+        );
+        let launched = eval_expression(&e, "@$tpid").expect("could not read the launched pid");
+
+        e.end_session().expect("end_session failed");
+        assert_ne!(
+            exit_code_of(launched as u32),
+            Some(STILL_RUNNING),
+            "the process this engine launched (pid {launched}) outlived its session, because the \
+             engine was still carrying the previous attach"
+        );
+
+        let _ = target.kill();
+        let _ = target.wait();
+    }
+
+    /// **A target that leaves on its own does not turn its teardown into an error.**
+    ///
+    /// The other half of the same finding, and the one with a caller-visible cost: an attached
+    /// process can exit under the debugger, and if the active detach then failed, ending that
+    /// session would report "the debugger reported an error releasing the target" for a program
+    /// that had simply finished.
+    ///
+    /// **It does not fail** — measured on dbgeng 10.0.26100.1 (ARM64): `EndSession` with
+    /// `DEBUG_END_ACTIVE_DETACH` succeeds on an engine holding no debuggee. That is why
+    /// `end_session` does *not* check `has_target` before taking this branch: the check was
+    /// written, measured to change nothing, and removed. This test is what stands in its place —
+    /// an engine that ever does refuse fails here, and the guard is one line away.
+    ///
+    /// `.detach` stands in for the process exiting because it is instantaneous and leaves the
+    /// engine in the same state (`DEBUG_STATUS_NO_DEBUGGEE`); what the teardown meets is that
+    /// state, not how the target came to be missing.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_ending_a_session_whose_attached_target_already_left_is_not_an_error() {
+        let _debuggee = one_debuggee();
+        let mut target = a_process_to_attach_to();
+
+        let e = DebugEngine::new();
+        e.attach_process(target.id()).expect("attach failed");
+        assert!(
+            e.execute_command_bounded(".detach", 10_000)
+                .expect("`.detach` failed")
+                .target_gone,
+            "`.detach` left a target behind, so this is not the state under test"
+        );
+        // And the engine says so, because this asks the session rather than the record: the pid
+        // is still written down, and the process it named is gone.
+        assert!(
+            !e.attached_to_a_live_process(),
+            "the engine reports holding an attached process after that process has gone"
+        );
+
+        e.end_session()
+            .expect("end_session failed on a session whose attached target had already gone");
+
+        let _ = target.kill();
+        let _ = target.wait();
+    }
+
+    /// The system pids of the processes in this session, read by **selecting each one in turn**.
+    ///
+    /// `@$tpid` answers for whichever process is *current*, and which process that is after a
+    /// launch is not something to assume: measured, a fresh engine leaves the process it just
+    /// created current, while one that has held a target before leaves the earlier process
+    /// current — so a test reading `@$tpid` straight after a launch gets the launched pid or the
+    /// attached one depending on what ran before it in the same binary. That cost a whole round of
+    /// "the fix does not work" against a fix that did.
+    #[cfg(not(miri))]
+    fn session_pids(e: &DebugEngine, count: usize) -> Vec<u64> {
+        (0..count)
+            .filter_map(|index| {
+                e.execute_command(&format!("|{index}s")).ok()?;
+                eval_expression(e, "@$tpid")
+            })
+            .collect()
+    }
+
+    /// **A session holding both kinds of process comes apart by where each one came from.**
+    ///
+    /// The second thing review found, and the one that made the record a set of pids: DbgEng keeps
+    /// several user-mode targets in one session — `|` lists them and says `attach` or `create`
+    /// against each — so an engine can hold somebody's running service *and* a program it launched
+    /// itself. `EndSession` takes one flag for the whole session, so **no choice of flag is
+    /// right**: a passive end kills the attached process, an active detach lets the launched one
+    /// survive. Detaching the attached ones first, one at a time, is what makes both true at once.
+    ///
+    /// Both orderings, because what the first version got wrong was an ordering: with one
+    /// session-wide flag written by whichever opener ran last, attach-then-launch killed the
+    /// service and launch-then-attach let the launched program outlive its session.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_mixed_session_comes_apart_by_where_each_process_came_from() {
+        let _debuggee = one_debuggee();
+
+        for attach_first in [true, false] {
+            let mut theirs = a_process_to_attach_to();
+            let e = DebugEngine::new();
+            if attach_first {
+                e.attach_process(theirs.id()).expect("attach failed");
+                e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+                    .expect("launch failed");
+            } else {
+                e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+                    .expect("launch failed");
+                e.attach_process(theirs.id()).expect("attach failed");
+            }
+
+            // The state under test is a session holding two processes; if the second opener did
+            // not add one, this test is asserting about something else entirely.
+            let listed = e.execute_command("|").expect("`|` failed");
+            let pids = session_pids(&e, 2);
+            assert_eq!(
+                pids.len(),
+                2,
+                "attach_first={attach_first}: this is not a two-process session:\n{listed}"
+            );
+            // Identified by elimination rather than by asking which is current, for the reason
+            // `session_pids` gives.
+            let ours = *pids
+                .iter()
+                .find(|pid| **pid != u64::from(theirs.id()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "attach_first={attach_first}: the launched process is not here: {pids:?}"
+                    )
+                });
+
+            e.end_session()
+                .expect("end_session failed on a mixed session");
+            assert_eq!(
+                exit_code_of(theirs.id()),
+                Some(STILL_RUNNING),
+                "attach_first={attach_first}: the session's end killed the process it had only \
+                 attached to"
+            );
+            assert_ne!(
+                exit_code_of(ours as u32),
+                Some(STILL_RUNNING),
+                "attach_first={attach_first}: the process this engine launched (pid {ours}) \
+                 outlived its session"
+            );
+
+            let _ = theirs.kill();
+            let _ = theirs.wait();
+        }
     }
 
     /// Execution control with no debuggee is **refused**, because letting it reach DbgEng takes
