@@ -24,12 +24,13 @@ see [Unknown, not absent](docs/unknown-not-absent.md).
 
 - **Session drivers** for every target DbgEng opens: `attach_kernel`, `attach_local_kernel`,
   `launch_process`, `attach_process`, `open_dump`, `open_trace`, plus `connect` for an existing
-  debugging server.
-- **Two-step opening.** Each opener is a thin `x_begin()?.wait()`. `x_begin` does only the side
-  effect that creates or claims the target and hands back a `PendingTarget`; `wait` completes the
-  initial break. The split lets a caller tell "nothing happened, retry is clean" from "the target
-  exists and only the wait failed" — opposite recoveries, since re-running the second spawns a
-  second process or re-dials a live KD link.
+  debugging server. `open_dump` and `open_trace` commit the session and leave the pump to the
+  caller — the engine has no current process or thread until `wait_for_event` has run.
+- **Two-step opening** on the four *live* openers, each a thin `x_begin()?.wait()`. `x_begin`
+  does only the side effect that creates or claims the target and hands back a `PendingTarget`;
+  `wait` completes the initial break. The split lets a caller tell "nothing happened, retry is
+  clean" from "the target exists and only the wait failed" — opposite recoveries, since
+  re-running the second spawns a second process or re-dials a live KD link.
 - **Typed reads of session state**: `register_values` (a tagged `RegisterValue`, not a string),
   `register_descriptions`, `modules` / `unloaded_modules` / `module_at`, `module_pdb`,
   `stack_frames` carrying the module each frame belongs to, `bug_check` as fields, `breakpoints`,
@@ -103,6 +104,9 @@ use dbgscope::dbgeng::DebugEngine;
 
 let engine = DebugEngine::new();
 engine.open_dump(r"C:\dumps\MEMORY.DMP")?;
+// `open_dump` only commits the session. The engine has no current process or thread until
+// it has been pumped, so every read below fails without this.
+engine.wait_for_event(60_000)?;
 
 for module in engine.modules()? {
     println!("{:#018x}  {:<24} {:?}", module.base, module.name, module.symbols);

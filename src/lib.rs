@@ -74,6 +74,9 @@
 //!
 //! let engine = DebugEngine::new();
 //! engine.open_dump(r"C:\dumps\MEMORY.DMP")?;
+//! // `open_dump` only commits the session. The engine has no current process or thread
+//! // until it has been pumped, so every read below fails without this.
+//! engine.wait_for_event(60_000)?;
 //!
 //! for module in engine.modules()? {
 //!     println!("{:#018x}  {:<24} {:?}", module.base, module.name, module.symbols);
