@@ -12,8 +12,10 @@ All notable changes to this project are documented here. The format follows
   engine's answers are about, and which of a kernel target's processors it is on. Typed rather
   than parsed out of `~.`, whose text is one shape for a user-mode thread, another for a kernel
   processor, and a third when there is no thread context at all. `current_processor` answers
-  `None` for *no processor number applies here*, which a user-mode target and a kernel target
-  pointed at an arbitrary `ETHREAD` both are; it resolves through `GetThreadIdByProcessor` rather
+  `None` for *no processor number applies here* — a user-mode target, a dump of one and a TTD trace,
+  by construction — and it is not an answer about the register context, since `.thread` and `.trap`
+  change what the debugger displays without changing which processor it is stopped on. It resolves
+  through `GetThreadIdByProcessor` rather
   than reading the current thread index as a processor number, so nothing is inferred about the
   mapping it is asking about. Exercised beside `~.` in `examples/typed_context.rs`.
 

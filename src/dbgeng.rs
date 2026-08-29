@@ -1521,11 +1521,17 @@ impl DebugEngine {
     /// Which of the target's processors the debugger is currently on, or `None` where no
     /// processor number applies.
     ///
-    /// `None` is one meaning, not two: *nothing here has a processor number*. A user-mode
-    /// target, a dump of one, and a TTD trace have none by construction; a kernel target whose
-    /// current thread is not one of its processor contexts — `.thread` having pointed the
-    /// engine at an arbitrary `ETHREAD`, for one — has none either. A caller wanting to know
-    /// *why* asks [`Self::is_kernel_target`], which is the question that separates them.
+    /// `None` is one meaning, not two: *nothing here has a processor number*. A user-mode target,
+    /// a dump of one, and a TTD trace have none by construction, and that is the whole of the
+    /// common case; a kernel target answers `None` only if the engine will not map its current
+    /// thread to any of the processors it says it has, which is not a state this crate has seen.
+    /// A caller wanting to know which of the two it is asks [`Self::is_kernel_target`].
+    ///
+    /// **It is not an answer about the register context**, and the difference matters on a kernel
+    /// target: `.thread` and `.trap` change which context the debugger *displays* without changing
+    /// which processor it is stopped on, so this still names that processor. That is the honest
+    /// answer — the CPU is where the break is — but a caller reporting a position read under a
+    /// switched context should say so from the switch, not expect this to.
     ///
     /// **Resolved through `GetThreadIdByProcessor` rather than by reading the current thread
     /// index as a processor number.** In kernel mode the engine's threads *are* the processors,
