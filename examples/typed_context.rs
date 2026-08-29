@@ -107,7 +107,9 @@ fn main() {
         // a dump of one. A number here means the mapping resolved on a kernel target.
         Ok(None) => println!("  current_processor() = none (no processor number applies here)"),
         Ok(Some(cpu)) => println!("  current_processor() = {cpu}"),
-        Err(err) => println!("  current_processor ERR: {err}"),
+        // Distinct from `none` on purpose: this is a mapping that could not be read, not a target
+        // with no processor. Against either of this example's openers it should not happen.
+        Err(err) => println!("  current_processor ERR (unknown, not absent): {err}"),
     }
 
     // --- modules --------------------------------------------------------------------

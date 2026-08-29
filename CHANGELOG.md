@@ -18,8 +18,10 @@ All notable changes to this project are documented here. The format follows
   through `GetThreadIdByProcessor` rather
   than reading the current thread index as a processor number, so nothing is inferred about the
   mapping it is asking about — the index is tried first, and confirmed by that same call, so the
-  ordinary case costs one call rather than one per processor. Exercised beside `~.` in
-  `examples/typed_context.rs`.
+  ordinary case costs one call rather than one per processor. A lookup that **fails** is not a
+  processor that does not match: a match wins whatever else failed, and no match with a failure
+  among the lookups is an `Err` rather than an `Ok(None)` that would report absence where the truth
+  is unknown. Exercised beside `~.` in `examples/typed_context.rs`.
 
 ## [0.1.0] - 2026-08-29
 
