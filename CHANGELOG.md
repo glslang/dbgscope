@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `DebugEngine::current_thread_system_id` and `DebugEngine::current_processor` — which thread the
+  engine's answers are about, and which of a kernel target's processors it is on. Typed rather
+  than parsed out of `~.`, whose text is one shape for a user-mode thread, another for a kernel
+  processor, and a third when there is no thread context at all. `current_processor` answers
+  `None` for *no processor number applies here*, which a user-mode target and a kernel target
+  pointed at an arbitrary `ETHREAD` both are; it resolves through `GetThreadIdByProcessor` rather
+  than reading the current thread index as a processor number, so nothing is inferred about the
+  mapping it is asking about. Exercised beside `~.` in `examples/typed_context.rs`.
+
 ## [0.1.0] - 2026-08-29
 
 First release. `dbgscope` gives typed access to a WinDbg/DbgEng debug session, and kernel-pool
