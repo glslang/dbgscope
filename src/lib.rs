@@ -15,6 +15,92 @@
 //! machinery either side of the ring boundary.
 //!
 //! Everything is Windows-only in practice: the public surface calls Windows APIs directly.
+//!
+//! # The design rule
+//!
+//! The organising idea is smaller than the API and worth stating first: **every answer
+//! carries what the answering cost.**
+//!
+//! A debugger reads a machine bigger than any one read of it. Paged pool is partly out on
+//! disk, and a page the memory manager has paged out cannot be read through the debugger
+//! either. A live kernel keeps allocating between the reads that make up a single walk. A
+//! minidump was written by someone who chose what to keep. In each case there is a true
+//! answer and this crate cannot see all of it — and a type that reports a partial reading as
+//! a total one is wrong in the direction that gets acted on. "No chunk carries that tag" and
+//! "the walk reached almost none of the pool" are the same empty [`Vec`] and opposite
+//! conclusions.
+//!
+//! The familiar advice is to make illegal states unrepresentable, which presumes you know
+//! which states are legal. Here the problem is the inverse: when the ground truth is
+//! genuinely unknowable, the type has to carry its own incompleteness. Three places where
+//! that surfaces in the public API:
+//!
+//! * **Coverage.** [`pool::query::WalkCoverage`] is a three-way enum, not a `bool`, because
+//!   the two ways of falling short need opposite responses:
+//!   [`BudgetExpired`](pool::query::WalkCoverage::BudgetExpired) reaches more of the pool if
+//!   given more time, and [`Partial`](pool::query::WalkCoverage::Partial) reports the same
+//!   gaps however long it runs. Running out of
+//!   [`DEFAULT_WALK_BUDGET`](pool::query::DEFAULT_WALK_BUDGET) is not an error: the walk
+//!   returns what it reached, with the coverage saying so.
+//!
+//! * **Forced breaks.** A bounded command Ctrl+Broken at its deadline comes back as a
+//!   [`CommandRun`](dbgeng::CommandRun) whose `cut_short` is
+//!   [`Interruption::Deadline`](dbgeng::Interruption::Deadline), *keeping the output captured
+//!   up to the break*. Not an `Err`, which would discard that output — the whole reason to
+//!   interrupt rather than end the session — and not a bare [`String`], because a search cut
+//!   short prints the hits it reached and nothing to say there were more.
+//!
+//! * **Tags.** A pool tag is four bytes and its printed form is a lossy rendering: every
+//!   unprintable byte becomes `.`, and so does a literal `.`. The tag stays raw internally,
+//!   and every output site prints through [`pool::tag_label`], which shows the raw form
+//!   wherever the rendering would not survive being handed back.
+//!
+//! Carrying that without making the ordinary call unpleasant is the part that took the work.
+//! [`PoolAnswer<T>`](pool::query::PoolAnswer) pairs an answer with the walk it came from, so
+//! the two cannot be drawn from different walks; `impl From<bool>` for
+//! [`PoolWalk`](pool::query::PoolWalk) leaves existing call sites unchanged while adding a
+//! budget dimension; and [`WalkCoverage::complete`](pool::query::WalkCoverage::complete) is a
+//! one-word escape hatch for a caller who only needs the boolean.
+//!
+//! The repository's `docs/unknown-not-absent.md` is the long form, including what the rule
+//! costs and where it does not apply.
+//!
+//! # Examples
+//!
+//! Open a dump and read its modules as values:
+//!
+//! ```ignore
+//! use dbgscope::dbgeng::DebugEngine;
+//!
+//! let engine = DebugEngine::new();
+//! engine.open_dump(r"C:\dumps\MEMORY.DMP")?;
+//!
+//! for module in engine.modules()? {
+//!     println!("{:#018x}  {:<24} {:?}", module.base, module.name, module.symbols);
+//! }
+//! ```
+//!
+//! Walk the pool for a tag, and qualify the answer by the walk that produced it:
+//!
+//! ```ignore
+//! use dbgscope::pool::{query, tag_label};
+//!
+//! // `false` converts into a PoolWalk meaning "reuse any snapshot cached for this
+//! // target"; `true` rebuilds. Either picks up DEFAULT_WALK_BUDGET.
+//! let answer = query::find_tag(&engine, "Pipe", None, false)?;
+//!
+//! for span in &answer.found {
+//!     println!("{:#018x} {:>8} {}", span.usable_address, span.size, tag_label(span.raw_tag));
+//! }
+//!
+//! if !answer.walk.coverage.complete() {
+//!     eprintln!(
+//!         "{} spans is a floor, not a total ({:?})",
+//!         answer.found.len(),
+//!         answer.walk.coverage,
+//!     );
+//! }
+//! ```
 
 pub mod allocator;
 pub mod dbgeng;
