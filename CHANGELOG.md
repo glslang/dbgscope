@@ -20,16 +20,19 @@ the API, is that every answer carries what the answering cost — see
   client (`from_windbg_client`, `from_client_interface`, and their `try_` forms). `owns_session`
   governs teardown, so a borrowed client is never ended.
 - Openers for every target DbgEng handles: `attach_kernel`, `attach_local_kernel`,
-  `launch_process`, `attach_process`, `open_dump`, `open_trace`.
+  `launch_process`, `attach_process`, `open_dump`, `open_trace`. The two post-mortem openers
+  commit the session and leave the pump to the caller: the engine has no current process or
+  thread — and `GetNumberRegisters` answers `0x8000FFFF` — until `wait_for_event` has run.
 - `connect(remote_options)` for an existing debugging server, so an extension can load out of
   process.
-- **Two-step opening.** Each opener is a thin `x_begin()?.wait()`. `x_begin` performs only the
-  side effect that creates or claims the target and returns a `PendingTarget`; `wait` completes
-  the initial break. The split lets a caller distinguish "nothing happened, retry is clean" from
-  "the target exists and only the wait failed" — opposite recoveries, since re-running the
-  second spawns a second process, attaches twice, or re-dials a live KD link. Dropping a guard
-  is safe and non-blocking: deferred input buffers are parked on the engine rather than the
-  guard, because `CreateProcessWide` reads the command line at the *next* `WaitForEvent`.
+- **Two-step opening** on the four *live* openers, each a thin `x_begin()?.wait()`. `x_begin`
+  performs only the side effect that creates or claims the target and returns a `PendingTarget`;
+  `wait` completes the initial break. The split lets a caller distinguish "nothing happened,
+  retry is clean" from "the target exists and only the wait failed" — opposite recoveries, since
+  re-running the second spawns a second process, attaches twice, or re-dials a live KD link.
+  Dropping a guard is safe and non-blocking: deferred input buffers are parked on the engine
+  rather than the guard, because `CreateProcessWide` reads the command line at the *next*
+  `WaitForEvent`.
 - **Per-process teardown.** DbgEng holds several user-mode targets at once and `EndSession`
   takes one flag for the whole session, so provenance is recorded per pid at open time. A
   process this engine *attached* to is detached individually before the session ends — otherwise
