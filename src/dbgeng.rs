@@ -1542,8 +1542,16 @@ impl DebugEngine {
     /// engine-side lookups into a table the connection already populated, against a
     /// [`Self::execute_and_wait`] that has just pumped the target.
     ///
-    /// A processor the engine will not map is skipped rather than failing the call: the answer
-    /// is about the one the debugger is on, and a gap elsewhere in the table cannot change it.
+    /// **A lookup that fails is not a processor that does not match**, and the difference is this
+    /// crate's founding rule (see [`docs/unknown-not-absent.md`]): `Ok(None)` says *nothing here
+    /// has a processor number*, and answering it after a read that failed — a KD link that dropped
+    /// mid-walk — reports absence where the truth is unknown. So the three cases are kept apart. A
+    /// lookup that **matches** wins whatever else failed, because the answer is about the
+    /// processor the debugger is on and a gap elsewhere in the table cannot change it. No match
+    /// with every lookup answered is a real `Ok(None)`. No match with at least one failure is
+    /// `Err`, carrying the first failure's own error.
+    ///
+    /// [`docs/unknown-not-absent.md`]: https://github.com/glslang/dbgscope/blob/main/docs/unknown-not-absent.md
     pub fn current_processor(&self) -> Result<Option<u32>, DbgEngError> {
         if !self.is_kernel_target()? {
             return Ok(None);
@@ -1560,25 +1568,40 @@ impl DebugEngine {
                 source,
             }
         })?;
-        // The likely answer, **asked rather than assumed**: in kernel mode the engine's thread
-        // indices and its processor numbers coincide, so the current index is nearly always the
-        // processor — but it is `GetThreadIdByProcessor` that says so, here as in the walk below.
-        // Trying it first is an ordering of candidates, not an inference: a wrong guess falls
-        // through to the scan and the answer is identical either way.
+        // The likely answer first, **asked rather than assumed**: in kernel mode the engine's
+        // thread indices and its processor numbers coincide, so the current index is nearly always
+        // the processor — but it is `GetThreadIdByProcessor` that says so, here as in the walk
+        // behind it. Trying it first is an ordering of candidates, not an inference: a wrong guess
+        // falls through and the answer is identical either way.
         //
-        // It is here because the scan's cost is not knowable from this side. A server-class kernel
-        // target has scores of processors, this runs after every stop, and whether
-        // `GetThreadIdByProcessor` is an engine-side table lookup or a question for the target
-        // over a KD wire is DbgEng's business. One call in the ordinary case makes that not matter.
-        let candidate = |processor: u32| {
-            unsafe { objects.GetThreadIdByProcessor(processor) }.is_ok_and(|t| t == current)
-        };
-        if current < processors && candidate(current) {
-            return Ok(Some(current));
+        // It is ordered because the walk's cost is not knowable from this side. A server-class
+        // kernel target has scores of processors, this runs after every stop, and whether that
+        // call is an engine-side table lookup or a question for the target over a KD wire is
+        // DbgEng's business. One call in the ordinary case makes that not matter; the candidate
+        // being asked twice costs one more only on the rare path where it did not match.
+        let order = std::iter::once(current)
+            .filter(|&candidate| candidate < processors)
+            .chain(0..processors);
+        // The first failure, kept rather than counted: what a caller can act on is *why* the
+        // mapping could not be read, and one reason is as good as five of the same.
+        let mut unreadable = None;
+        for processor in order {
+            match unsafe { objects.GetThreadIdByProcessor(processor) } {
+                Ok(thread) if thread == current => return Ok(Some(processor)),
+                Ok(_) => {}
+                Err(why) => {
+                    unreadable.get_or_insert(why);
+                }
+            }
         }
-        (0..processors)
-            .find(|&processor| candidate(processor))
-            .map_or(Ok(None), |p| Ok(Some(p)))
+        match unreadable {
+            // Nothing matched and every lookup answered, so there really is no processor here.
+            None => Ok(None),
+            Some(source) => Err(DbgEngError::Context {
+                operation: "reading which processor the debugger is on".into(),
+                source,
+            }),
+        }
     }
 
     pub fn valid_virtual_region(
