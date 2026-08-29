@@ -6,8 +6,20 @@ description = "Typed WinDbg/DbgEng debug sessions, with kernel pool and user hea
 repository = "https://github.com/glslang/dbgscope"
 license = "MIT"
 readme = "README.md"
+documentation = "https://docs.rs/dbgscope"
 keywords = ["windbg", "dbgeng", "debugging", "kernel", "windows"]
 categories = ["development-tools::debugging", "os::windows-apis"]
+# Edition 2024's floor. Nothing here needs anything newer, and CI tracks stable rather than
+# pinning, so this is the claim a downstream resolver gets rather than a version we test.
+rust-version = "1.85"
+# Agent instructions and CI config are repository furniture, not part of the published crate.
+# `docs/` stays in: the README links into it, and a reader on docs.rs should be able to follow.
+exclude = [
+    ".github/",
+    ".cursor/",
+    "AGENTS.md",
+    "CLAUDE.md",
+]
 
 [lib]
 # cdylib is the !poolmap WinDbg extension (src/pool_extension.rs), not a shellcode payload.
@@ -34,6 +46,10 @@ features = [
 version = "0.62.2"
 features = ["Win32_System_Memory", "Win32_System_Threading"]
 
-# docs.rs builds on Linux, where this crate does not compile at all.
+# docs.rs builds on Linux, where this crate does not compile at all. `default-target` is
+# spelled out rather than left to docs.rs' "first of `targets`" fallback, because that fallback
+# is the only thing standing between a rename of this list and a docs build against the Linux
+# host — which fails outright, and fails the same way for every version.
 [package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
 targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
