@@ -78,10 +78,14 @@ pub const DEFAULT_WALK_BUDGET: Duration = Duration::from_secs(120);
 
 A walk is thousands of debugger reads plus every committed pool page, and over a live KDNET
 link each of those crosses the wire. On a busy kernel that is minutes. Nothing used to stop it.
-The walk polls for Ctrl+C — but **only a human at a WinDbg prompt ever sets that flag**. A
-programmatic caller had no way to say "that is long enough", and because one engine serves one
-target one call at a time, every later call queued behind the walk. The session was wedged
-until it was killed, which on a live kernel leaves the guest halted.
+
+The walk polls the engine's interrupt flag, and two things set it: Ctrl+C from a human at a
+WinDbg prompt, and `InterruptHandle::interrupt` from a host thread. **Both need somebody
+watching the clock.** A caller that is simply blocked on the call is not watching anything, and
+because one engine serves one target one call at a time, every later call queued behind the
+walk. The session was wedged until it was killed, which on a live kernel leaves the guest
+halted. A deadline is the one stopper that needs nobody present — which is why it exists
+alongside the handle rather than instead of it.
 
 The budget frees the caller. What matters for this document is what it returns: not
 `Err(Timeout)`, but the chunks it reached, `coverage: BudgetExpired`, and a diagnostic saying
@@ -92,7 +96,9 @@ the answer to travel back; a host that knows its own deadline passes that instea
 Interruption gets the same treatment one level up. `PoolQueryError::Interrupted` is its own
 variant rather than a `Walk(String)`, because it is not a failure of the walk at all: somebody
 asked for it to stop. A host that reports "walking the pool failed" for an interrupt it raised
-itself is telling its user the target is broken.
+itself is telling its user the target is broken. This is also what makes `PoolWalk::unbounded()`
+usable away from an interactive prompt: a host that holds an `InterruptHandle` and knows its own
+cancellation conditions can run without a deadline and stop the walk on its own terms.
 
 ---
 

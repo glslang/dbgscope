@@ -140,15 +140,18 @@ pub(crate) trait PoolMemory {
 
 /// A memory source with a deadline attached.
 ///
-/// The walk already polled for Ctrl+C, but **only a human at a WinDbg prompt ever sets
-/// that**. A programmatic caller — an MCP server driving the query API — has no way to say
-/// "that is long enough", so its own timeout frees the caller and leaves the engine
-/// walking; since one engine serves one target one call at a time, every later call to that
-/// target queues behind the walk. The session is then wedged until it is killed, which on a
-/// live kernel leaves the guest halted. This is the clock that makes that impossible.
+/// The walk already polls the engine's interrupt flag, which Ctrl+C sets and so does a host
+/// through [`InterruptHandle`](crate::dbgeng::InterruptHandle) — but **both need somebody
+/// watching**, and a caller blocked on the query is not. Without a clock its own call never
+/// returns and the engine keeps walking; since one engine serves one target one call at a
+/// time, every later call to that target queues behind the walk. The session is then wedged
+/// until it is killed, which on a live kernel leaves the guest halted. This is the one
+/// stopper that needs nobody present.
 struct Budgeted<'a, M> {
     inner: &'a M,
-    /// `None` runs to completion — correct only where something else can stop the walk.
+    /// `None` runs to completion — correct only where something else can stop the walk: an
+    /// operator at a prompt, or a host that both holds an interrupt handle and knows when to
+    /// use it.
     deadline: Option<Instant>,
 }
 

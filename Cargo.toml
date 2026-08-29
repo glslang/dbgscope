@@ -9,9 +9,12 @@ readme = "README.md"
 documentation = "https://docs.rs/dbgscope"
 keywords = ["windbg", "dbgeng", "debugging", "kernel", "windows"]
 categories = ["development-tools::debugging", "os::windows-apis"]
-# Edition 2024's floor. Nothing here needs anything newer, and CI tracks stable rather than
-# pinning, so this is the claim a downstream resolver gets rather than a version we test.
-rust-version = "1.85"
+# Not edition 2024's 1.85 floor: `src/pool/{layout,index,snapshot}.rs` use let-chains, which
+# stabilized in 1.88, and `snapshot.rs` uses `usize::is_multiple_of`, which stabilized in 1.87.
+# Established by reading the source, not by building on 1.88 -- CI tracks stable and nothing
+# here pins a toolchain, so treat it as a floor to re-verify with `cargo-msrv` rather than a
+# version under test.
+rust-version = "1.88"
 # Agent instructions and CI config are repository furniture, not part of the published crate.
 # `docs/` stays in: the README links into it, and a reader on docs.rs should be able to follow.
 exclude = [

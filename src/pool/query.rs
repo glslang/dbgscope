@@ -121,10 +121,14 @@ pub enum PoolQueryError {
 ///
 /// A walk is thousands of debugger reads plus every committed pool page, and over a live
 /// KDNET link each of those crosses the wire; on a busy kernel that is minutes. Nothing used
-/// to stop it. The walk polls for Ctrl+C, but **only a human at a WinDbg prompt ever sets
-/// that flag** — a programmatic caller has no way to say "that is long enough". Its own
-/// timeout frees the caller and leaves the engine walking, and since one engine serves one
-/// target one call at a time, every later call to that target queues behind the walk; the
+/// to stop it.
+///
+/// The walk polls the engine's interrupt flag, and two things set it: Ctrl+C from a human at a
+/// WinDbg prompt, and [`InterruptHandle::interrupt`](crate::dbgeng::InterruptHandle::interrupt)
+/// from a host thread. **Both need somebody watching the clock**, and a caller that is simply
+/// blocked on this call is not — which is what the deadline supplies and neither of them does.
+/// Its own timeout frees that caller and leaves the engine walking, and since one engine serves
+/// one target one call at a time, every later call to that target queues behind the walk; the
 /// session is wedged until it is killed, which on a live kernel leaves the guest halted.
 ///
 /// 120s is sized to fit inside a typical host's per-call budget with room for the answer to
@@ -141,8 +145,10 @@ pub struct PoolWalk {
     pub refresh: bool,
     /// Wall-clock ceiling on a rebuild, or `None` to run to completion.
     ///
-    /// `None` is correct only where something else can stop the walk — an operator at an
-    /// interactive prompt, who can Ctrl+C. Everywhere else it is the wedge described on
+    /// `None` is correct only where something else can stop the walk: an operator at an
+    /// interactive prompt who can Ctrl+C, or a host holding an
+    /// [`InterruptHandle`](crate::dbgeng::InterruptHandle) *and* watching something that tells
+    /// it when to use one. Everywhere else it is the wedge described on
     /// [`DEFAULT_WALK_BUDGET`].
     pub budget: Option<Duration>,
 }
