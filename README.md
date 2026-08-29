@@ -209,7 +209,7 @@ ordinary four-byte tag `0x2e`.
 - Windows x86_64 or Windows ARM64. The crate calls Windows APIs directly with no `#[cfg]`
   gating and is not designed to build elsewhere; pool *walking* is x64-only, because the
   allocator encodings it consults are.
-- Rust 1.85 or later (edition 2024); nightly for Miri.
+- Rust 1.88 or later (let-chains, used in the pool walker); nightly for Miri.
 - MSVC build tools.
 - Optional: `cargo nextest` as the local test runner.
 
@@ -247,13 +247,15 @@ information for `nt`. Configure a symbol server, break in, and force-load kernel
 !dbgscope.poolmap -tag Pipe
 !dbgscope.poolmap -tag ABC -paged
 !dbgscope.poolmap -tag Test -nonpaged -refresh
-!dbgscope.poolmap 0x5467736d
+!dbgscope.poolmap -tag 0x5467736d
 !dbgscope.poolmap ffff800012345678
 ```
 
-`-tag` takes either tag form. `-paged` and `-nonpaged` filter exact pool identities and cannot
-be combined; the map retains nearby unrelated allocations and holes. An address argument prints
-detail for the allocation or hole containing it. `-refresh` discards a complete cached snapshot
+`-tag` takes either tag form, and a tag only ever arrives through it: a bare positional
+argument is always parsed as an address, so `!dbgscope.poolmap 0x5467736d` asks about that
+address rather than about `Tgsm`. `-paged` and `-nonpaged` filter exact pool identities and
+cannot be combined; the map retains nearby unrelated allocations and holes. An address argument
+prints detail for the allocation or hole containing it. `-refresh` discards a complete cached snapshot
 and walks again. Where WinDbg accepts DML, map cells have colours and clickable address links;
 the same rows use ASCII glyphs and carry a legend when DML is stripped or the output is
 captured as plain text.
@@ -265,9 +267,15 @@ and incomplete or Ctrl+C-interrupted walks are never cached.
 
 A walk is thousands of debugger reads plus every committed pool page, so over a live KDNET link
 it can run for minutes. The extension lets it run to completion, because there is an operator at
-a prompt who can Ctrl+Break. `pool::query` cannot assume that — nothing else sets that flag — so
-its walks carry a wall-clock budget (`DEFAULT_WALK_BUDGET`, 120s), and a walk that runs out of
-it returns what it reached rather than failing.
+a prompt who can Ctrl+Break. `pool::query` cannot assume anyone is watching the clock, so its
+walks carry a wall-clock budget (`DEFAULT_WALK_BUDGET`, 120s), and a walk that runs out of it
+returns what it reached rather than failing.
+
+A host that *is* watching can stop one itself. `engine.interrupt_handle()` hands back a
+`Send + Sync` handle whose `interrupt()` sets the same flag Ctrl+Break does, the walk polls it,
+and the query comes back as `PoolQueryError::Interrupted` — a variant of its own, because an
+interrupt somebody asked for is not a walk that failed. That is what makes
+`PoolWalk::unbounded()` usable away from an interactive prompt.
 
 Per-session paged heaps are outside the initial pool-map scope, and the command says so.
 
@@ -305,7 +313,8 @@ cargo build --verbose            # build for the active Windows target
 cargo fmt --all -- --check       # the CI formatter gate
 cargo nextest run --verbose      # preferred test runner
 cargo test                       # fallback
-cargo miri test --verbose        # nightly unsafe-code check
+cargo miri nextest run           # nightly unsafe-code check, as miri.yml runs it
+cargo miri test --doc            # the doctests nextest cannot run
 ```
 
 Run `examples/session_fuzz.rs` after touching anything in the wait/settle/guard seam. It is

@@ -144,7 +144,9 @@ the API, is that every answer carries what the answering cost — see
 - DML colours and clickable address links where WinDbg accepts DML; meaningful ASCII glyphs and
   a legend where it is stripped or the output is captured as plain text.
 - The extension lets a walk run to completion, because there is an operator at a prompt who can
-  Ctrl+Break. `pool::query` cannot assume that, which is why its walks carry a budget.
+  Ctrl+Break. `pool::query` cannot assume anyone is watching the clock, which is why its walks
+  carry a budget — and a host that *is* watching can cancel one through `interrupt_handle()`,
+  which the walk polls and reports as `PoolQueryError::Interrupted`.
 
 ### Known limitations
 
