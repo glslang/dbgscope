@@ -1560,12 +1560,25 @@ impl DebugEngine {
                 source,
             }
         })?;
-        for processor in 0..processors {
-            if unsafe { objects.GetThreadIdByProcessor(processor) }.is_ok_and(|t| t == current) {
-                return Ok(Some(processor));
-            }
+        // The likely answer, **asked rather than assumed**: in kernel mode the engine's thread
+        // indices and its processor numbers coincide, so the current index is nearly always the
+        // processor — but it is `GetThreadIdByProcessor` that says so, here as in the walk below.
+        // Trying it first is an ordering of candidates, not an inference: a wrong guess falls
+        // through to the scan and the answer is identical either way.
+        //
+        // It is here because the scan's cost is not knowable from this side. A server-class kernel
+        // target has scores of processors, this runs after every stop, and whether
+        // `GetThreadIdByProcessor` is an engine-side table lookup or a question for the target
+        // over a KD wire is DbgEng's business. One call in the ordinary case makes that not matter.
+        let candidate = |processor: u32| {
+            unsafe { objects.GetThreadIdByProcessor(processor) }.is_ok_and(|t| t == current)
+        };
+        if current < processors && candidate(current) {
+            return Ok(Some(current));
         }
-        Ok(None)
+        (0..processors)
+            .find(|&processor| candidate(processor))
+            .map_or(Ok(None), |p| Ok(Some(p)))
     }
 
     pub fn valid_virtual_region(

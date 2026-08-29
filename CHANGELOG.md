@@ -17,7 +17,9 @@ All notable changes to this project are documented here. The format follows
   change what the debugger displays without changing which processor it is stopped on. It resolves
   through `GetThreadIdByProcessor` rather
   than reading the current thread index as a processor number, so nothing is inferred about the
-  mapping it is asking about. Exercised beside `~.` in `examples/typed_context.rs`.
+  mapping it is asking about — the index is tried first, and confirmed by that same call, so the
+  ordinary case costs one call rather than one per processor. Exercised beside `~.` in
+  `examples/typed_context.rs`.
 
 ## [0.1.0] - 2026-08-29
 
