@@ -69,7 +69,8 @@
 //!
 //! Open a dump and read its modules as values:
 //!
-//! ```ignore
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use dbgscope::dbgeng::DebugEngine;
 //!
 //! let engine = DebugEngine::new();
@@ -81,11 +82,15 @@
 //! for module in engine.modules()? {
 //!     println!("{:#018x}  {:<24} {:?}", module.base, module.name, module.symbols);
 //! }
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Walk the pool for a tag, and qualify the answer by the walk that produced it:
 //!
-//! ```ignore
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # let engine = dbgscope::dbgeng::DebugEngine::new();
 //! use dbgscope::pool::{query, tag_label};
 //!
 //! // `false` converts into a PoolWalk meaning "reuse any snapshot cached for this
@@ -103,6 +108,8 @@
 //!         answer.walk.coverage,
 //!     );
 //! }
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod allocator;
