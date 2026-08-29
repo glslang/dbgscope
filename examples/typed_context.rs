@@ -90,6 +90,26 @@ fn main() {
         Err(err) => println!("  instruction_pointer ERR: {err}"),
     }
 
+    // --- where the debugger is ------------------------------------------------------
+    //
+    // `~.` is the text these two replace, and it is three different shapes: a user-mode thread
+    // prints an engine index and a system id, a kernel processor prints a processor number, and
+    // an engine with no thread context prints nothing useful at all. Read the pair against it.
+    println!("\n=== ~. ===");
+    show(&e, "~.");
+    println!("\n=== current_thread_system_id() / current_processor() ===");
+    match e.current_thread_system_id() {
+        Ok(tid) => println!("  current_thread_system_id() = {tid} ({tid:#x})"),
+        Err(err) => println!("  current_thread_system_id ERR: {err}"),
+    }
+    match e.current_processor() {
+        // Expected on every target this example can open: both of its openers are user-mode or
+        // a dump of one. A number here means the mapping resolved on a kernel target.
+        Ok(None) => println!("  current_processor() = none (no processor number applies here)"),
+        Ok(Some(cpu)) => println!("  current_processor() = {cpu}"),
+        Err(err) => println!("  current_processor ERR: {err}"),
+    }
+
     // --- modules --------------------------------------------------------------------
     println!("\n=== lm ===");
     show(&e, "lm");

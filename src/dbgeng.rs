@@ -1492,6 +1492,76 @@ impl DebugEngine {
         })
     }
 
+    /// The operating-system thread id of DbgEng's current thread — *which* thread the answers
+    /// above and below are about.
+    ///
+    /// Reported beside a stop rather than left to be parsed out of `~.`, for the reason every
+    /// typed reader here exists: the text is one shape for a user-mode thread, another for a
+    /// kernel processor, and a third when the engine has no thread context at all.
+    ///
+    /// **This is the id the operating system knows the thread by, not the engine's index for
+    /// it** — `IDebugSystemObjects` has both, and they are different numbers. The engine numbers
+    /// its threads from zero per process; the system id is what `kernel32!GetCurrentThreadId`
+    /// answers inside that thread and what a process listing shows. On a **kernel** target the
+    /// engine's threads are the target's processors, so the answer worth reading there is
+    /// [`Self::current_processor`] rather than this one.
+    ///
+    /// No no-debuggee guard, for the same reason [`Self::current_process_system_id`] has none:
+    /// this is a query, not a road into execution, so an engine holding nothing fails the call
+    /// (`E_UNEXPECTED`) rather than faulting the process — see [`Self::refuse_without_a_debuggee`]
+    /// for which calls are the dangerous ones.
+    pub fn current_thread_system_id(&self) -> Result<u32, DbgEngError> {
+        let objects = self.system_objects()?;
+        unsafe { objects.GetCurrentThreadSystemId() }.map_err(|source| DbgEngError::Context {
+            operation: "reading the current thread id".into(),
+            source,
+        })
+    }
+
+    /// Which of the target's processors the debugger is currently on, or `None` where no
+    /// processor number applies.
+    ///
+    /// `None` is one meaning, not two: *nothing here has a processor number*. A user-mode
+    /// target, a dump of one, and a TTD trace have none by construction; a kernel target whose
+    /// current thread is not one of its processor contexts — `.thread` having pointed the
+    /// engine at an arbitrary `ETHREAD`, for one — has none either. A caller wanting to know
+    /// *why* asks [`Self::is_kernel_target`], which is the question that separates them.
+    ///
+    /// **Resolved through `GetThreadIdByProcessor` rather than by reading the current thread
+    /// index as a processor number.** In kernel mode the engine's threads *are* the processors,
+    /// so the index and the number coincide and reading one as the other looks right — but that
+    /// is an inference about a mapping DbgEng owns, and it is the mapping this call is asking
+    /// about. Asking the engine to name each processor's thread and matching the current one is
+    /// the same answer with nothing inferred. It costs one call per processor, all of them
+    /// engine-side lookups into a table the connection already populated, against a
+    /// [`Self::execute_and_wait`] that has just pumped the target.
+    ///
+    /// A processor the engine will not map is skipped rather than failing the call: the answer
+    /// is about the one the debugger is on, and a gap elsewhere in the table cannot change it.
+    pub fn current_processor(&self) -> Result<Option<u32>, DbgEngError> {
+        if !self.is_kernel_target()? {
+            return Ok(None);
+        }
+        let objects = self.system_objects()?;
+        let current =
+            unsafe { objects.GetCurrentThreadId() }.map_err(|source| DbgEngError::Context {
+                operation: "reading the current thread index".into(),
+                source,
+            })?;
+        let processors = unsafe { self.control.GetNumberProcessors() }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "counting the target's processors".into(),
+                source,
+            }
+        })?;
+        for processor in 0..processors {
+            if unsafe { objects.GetThreadIdByProcessor(processor) }.is_ok_and(|t| t == current) {
+                return Ok(Some(processor));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn valid_virtual_region(
         &self,
         base: u64,
