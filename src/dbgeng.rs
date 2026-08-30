@@ -1499,6 +1499,17 @@ impl DebugEngine {
     /// typed reader here exists: the text is one shape for a user-mode thread, another for a
     /// kernel processor, and a third when the engine has no thread context at all.
     ///
+    /// **It is the engine's current thread, which a context switch does not move**, and that
+    /// is the qualifier the sentence above needs on a kernel target: `.thread` and `.trap` change
+    /// which context the debugger reads registers and an instruction pointer from, without
+    /// changing which thread the engine is *on*. So a position read under a switched context is
+    /// not this thread's, and a caller that switched is the one that knows — the same division
+    /// [`Self::current_processor`] draws, for the same reason. Resolving the implicit context
+    /// here instead would answer a different question and answer it worse: it is a symbol-shaped
+    /// read of `ETHREAD` rather than an engine query, so it can fail on a target where the plain
+    /// answer is right, and it would be wrong for every caller reporting a stop — which is where
+    /// this is read, and where no switch has happened.
+    ///
     /// **This is the id the operating system knows the thread by, not the engine's index for
     /// it** — `IDebugSystemObjects` has both, and they are different numbers. The engine numbers
     /// its threads from zero per process; the system id is what `kernel32!GetCurrentThreadId`
