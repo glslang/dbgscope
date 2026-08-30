@@ -10,6 +10,7 @@
 //! the programmatic caller re-serializes them (as JSON, say) and scraping the DML the
 //! extension prints would be lossy and brittle.
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
@@ -22,7 +23,7 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
 use super::decode::parse_tag;
 use super::index::{PoolIndex, SnapshotCache};
 use super::layout::{LayoutCache, LayoutTarget, SessionKey};
-use super::snapshot::{SnapshotError, SnapshotWalker, WalkStalls};
+use super::snapshot::{PoolMatchLimit, SnapshotError, SnapshotWalker, WalkStalls};
 use super::{PoolBackend, PoolDiagnostics, PoolSpan, PoolState};
 use crate::dbgeng::{DbgEngError, DebugEngine};
 
@@ -238,6 +239,9 @@ pub struct PoolSnapshotReport {
     /// How much of the pool the walk actually covered, and — when it fell short — what stopped
     /// it. See [`WalkCoverage`]; [`WalkCoverage::complete`] is the plain bool.
     pub coverage: WalkCoverage,
+    /// The requested number of matches that intentionally stopped this walk. Absent when the
+    /// threshold was not requested, was not reached, or a complete cached snapshot answered.
+    pub stopped_after_matches: Option<usize>,
     /// What the walk complained about, grouped by shape.
     ///
     /// Ask it for [`PoolDiagnostics::emitted`] when reporting how much the walk complained:
@@ -327,6 +331,7 @@ fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
             (false, true) => WalkCoverage::BudgetExpired,
             (false, false) => WalkCoverage::Partial,
         },
+        stopped_after_matches: index.stopped_after_matches,
         diagnostics: index.diagnostics.clone(),
         stalls: index.stalls,
         refused_chunks: index.refused_chunks,
@@ -342,6 +347,14 @@ fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
 pub(crate) fn prepare_index(
     engine: &DebugEngine,
     walk: PoolWalk,
+) -> Result<PoolIndex, PoolQueryError> {
+    prepare_index_until(engine, walk, None)
+}
+
+fn prepare_index_until(
+    engine: &DebugEngine,
+    walk: PoolWalk,
+    match_limit: Option<PoolMatchLimit>,
 ) -> Result<PoolIndex, PoolQueryError> {
     let started = Instant::now();
     if !engine.is_kernel_target()? {
@@ -397,12 +410,15 @@ pub(crate) fn prepare_index(
     // notifications, so the generation alone would let a snapshot outlive its target.
     snapshots()
         .get_or_refresh(key, walk.refresh, || {
-            let mut snapshot = SnapshotWalker {
+            let walker = SnapshotWalker {
                 memory: engine,
                 layout: &layout,
                 traversal_limit: 1_000_000,
-            }
-            .walk(remaining)?;
+            };
+            let mut snapshot = match match_limit {
+                Some(limit) => walker.walk_until(remaining, Some(limit))?,
+                None => walker.walk(remaining)?,
+            };
             snapshot.layout = provenance;
             Ok(snapshot)
         })
@@ -426,14 +442,26 @@ pub(crate) fn prepare_index(
 /// Only allocated chunks are indexed by tag: a freed chunk's tag is not reliably
 /// preserved by the allocator, so returning "freed chunks with this tag" would be
 /// inventing information. Use [`chunk_at`] to ask about a specific freed address.
+///
+/// `stop_after_matches` makes a newly built snapshot explicitly partial and returns as soon as
+/// that many in-scope allocations have been decoded. It does not discard a reusable complete
+/// snapshot: when one is cached, the query returns its exhaustive answer instead.
 pub fn find_tag(
     engine: &DebugEngine,
     tag: &str,
     filter: Option<PoolPageFilter>,
+    stop_after_matches: Option<NonZeroUsize>,
     walk: impl Into<PoolWalk>,
 ) -> Result<PoolAnswer<Vec<PoolSpan>>, PoolQueryError> {
     let raw_tag = parse_tag(tag).ok_or(PoolQueryError::InvalidTag)?;
-    let index = prepare_index(engine, walk.into())?;
+    let match_limit = stop_after_matches.map(|matches| {
+        PoolMatchLimit::new(
+            raw_tag,
+            filter.map(|filter| filter == PoolPageFilter::Paged),
+            matches,
+        )
+    });
+    let index = prepare_index_until(engine, walk.into(), match_limit)?;
     Ok(PoolAnswer {
         found: collect_tag(&index, raw_tag, filter),
         walk: report_of(&index),
@@ -896,6 +924,25 @@ mod tests {
         assert!(WalkCoverage::Complete.complete());
         assert!(!WalkCoverage::BudgetExpired.complete());
         assert!(!WalkCoverage::Partial.complete());
+    }
+
+    #[test]
+    fn test_intentional_match_stop_is_reported_beside_coverage() {
+        let report = report_of(&PoolIndex::build(crate::pool::PoolSnapshot {
+            complete: false,
+            stopped_after_matches: Some(3),
+            ..crate::pool::PoolSnapshot::default()
+        }));
+        assert_eq!(report.coverage, WalkCoverage::Partial);
+        assert_eq!(report.stopped_after_matches, Some(3));
+
+        let deadline = report_of(&PoolIndex::build(crate::pool::PoolSnapshot {
+            complete: false,
+            budget_expired: true,
+            ..crate::pool::PoolSnapshot::default()
+        }));
+        assert_eq!(deadline.coverage, WalkCoverage::BudgetExpired);
+        assert_eq!(deadline.stopped_after_matches, None);
     }
 
     #[test]

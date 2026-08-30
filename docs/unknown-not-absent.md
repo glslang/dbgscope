@@ -131,7 +131,13 @@ else. The cost to a caller who does not care is one field access: `answer.found`
 ### `impl From<bool> for PoolWalk` — the ordinary call did not change
 
 ```rust
-pub fn find_tag(engine: &DebugEngine, tag: &str, ..., walk: impl Into<PoolWalk>)
+pub fn find_tag(
+    engine: &DebugEngine,
+    tag: &str,
+    ...,
+    stop_after_matches: Option<NonZeroUsize>,
+    walk: impl Into<PoolWalk>,
+)
 ```
 
 `PoolWalk` carries a refresh flag and a budget. Callers that had been passing `false` for

@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Pool tag queries accept an optional nonzero match threshold. A new walk stops immediately after
+  that many in-scope allocated chunks, reports the fired threshold separately from deadline and
+  diagnostic truncation, and never caches the intentionally partial snapshot. A complete cached
+  snapshot still answers exhaustively without being discarded.
+
+### Added
+
 - `DebugEngine::current_thread_system_id` and `DebugEngine::current_processor` — which thread the
   engine's answers are about, and which of a kernel target's processors it is on. Typed rather
   than parsed out of `~.`, whose text is one shape for a user-mode thread, another for a kernel
