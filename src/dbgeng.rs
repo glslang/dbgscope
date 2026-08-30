@@ -1577,11 +1577,16 @@ impl DebugEngine {
         // It is ordered because the walk's cost is not knowable from this side. A server-class
         // kernel target has scores of processors, this runs after every stop, and whether that
         // call is an engine-side table lookup or a question for the target over a KD wire is
-        // DbgEng's business. One call in the ordinary case makes that not matter; the candidate
-        // being asked twice costs one more only on the rare path where it did not match.
+        // DbgEng's business. One call in the ordinary case makes that not matter.
+        //
+        // The candidate is then **excluded** from the scan behind it rather than merely being
+        // asked twice, and that is a correctness point rather than a saved call: a repeat of a
+        // lookup that has already answered can only fail, and a failure is `Err` below — so
+        // leaving it in would let a link dropping late in the walk overturn a `None` every
+        // distinct processor had already agreed on.
         let order = std::iter::once(current)
             .filter(|&candidate| candidate < processors)
-            .chain(0..processors);
+            .chain((0..processors).filter(move |&candidate| candidate != current));
         // The first failure, kept rather than counted: what a caller can act on is *why* the
         // mapping could not be read, and one reason is as good as five of the same.
         let mut unreadable = None;
