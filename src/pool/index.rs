@@ -34,6 +34,8 @@ pub(crate) struct PoolIndex {
     /// an index that outlives the walk is the only thing a caller ever sees, so a reason left
     /// behind here is a reason nobody can recover.
     pub budget_expired: bool,
+    /// The match threshold that intentionally stopped the walk, when one fired.
+    pub stopped_after_matches: Option<usize>,
     /// Carried through from [`PoolSnapshot::stalls`], for the same reason the two flags above
     /// are: the index is all a caller ever sees of the walk.
     pub stalls: WalkStalls,
@@ -91,6 +93,7 @@ impl PoolIndex {
             diagnostics: snapshot.diagnostics,
             complete: snapshot.complete,
             budget_expired: snapshot.budget_expired,
+            stopped_after_matches: snapshot.stopped_after_matches,
             stalls: snapshot.stalls,
             refused_chunks: snapshot.refused_chunks,
             unplaced_bytes: snapshot.unplaced_bytes,
@@ -386,5 +389,72 @@ mod tests {
         cache.get_or_refresh(same_base(100), false, make).unwrap();
         cache.get_or_refresh(same_base(101), false, make).unwrap();
         assert_eq!(builds.load(Ordering::SeqCst), 9);
+    }
+
+    #[test]
+    fn test_match_limited_snapshot_is_never_cached_as_exhaustive() {
+        let session = super::super::layout::SessionKey {
+            image: crate::dbgeng::KernelImage {
+                base: 0x1000,
+                ..Default::default()
+            },
+            session: 1,
+            target: 1,
+        };
+        let cache = SnapshotCache::default();
+        let builds = AtomicUsize::new(0);
+        let make_stopped = || -> Result<PoolSnapshot, String> {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(PoolSnapshot {
+                complete: false,
+                stopped_after_matches: Some(1),
+                spans: vec![span(
+                    0x1000,
+                    u32::from_le_bytes(*b"Tgsm"),
+                    PoolState::Allocated,
+                    1,
+                )],
+                ..PoolSnapshot::default()
+            })
+        };
+
+        let first = cache.get_or_refresh(session, false, make_stopped).unwrap();
+        let second = cache.get_or_refresh(session, false, make_stopped).unwrap();
+        assert_eq!(first.stopped_after_matches, Some(1));
+        assert_eq!(second.stopped_after_matches, Some(1));
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        let exhaustive_builds = AtomicUsize::new(0);
+        let make_complete = || -> Result<PoolSnapshot, String> {
+            exhaustive_builds.fetch_add(1, Ordering::SeqCst);
+            Ok(PoolSnapshot {
+                complete: true,
+                spans: vec![
+                    span(
+                        0x1000,
+                        u32::from_le_bytes(*b"Tgsm"),
+                        PoolState::Allocated,
+                        1,
+                    ),
+                    span(
+                        0x1020,
+                        u32::from_le_bytes(*b"Tgsm"),
+                        PoolState::Allocated,
+                        1,
+                    ),
+                ],
+                ..PoolSnapshot::default()
+            })
+        };
+        let complete = cache.get_or_refresh(session, false, make_complete).unwrap();
+        let reused = cache
+            .get_or_refresh(session, false, || -> Result<PoolSnapshot, String> {
+                panic!("a complete cached snapshot should satisfy a limited query")
+            })
+            .unwrap();
+        assert_eq!(complete.spans.len(), 2);
+        assert_eq!(reused.spans.len(), 2);
+        assert_eq!(reused.stopped_after_matches, None);
+        assert_eq!(exhaustive_builds.load(Ordering::SeqCst), 1);
     }
 }

@@ -95,7 +95,7 @@
 //!
 //! // `false` converts into a PoolWalk meaning "reuse any snapshot cached for this
 //! // target"; `true` rebuilds. Either picks up DEFAULT_WALK_BUDGET.
-//! let answer = query::find_tag(&engine, "Pipe", None, false)?;
+//! let answer = query::find_tag(&engine, "Pipe", None, None, false)?;
 //!
 //! for span in &answer.found {
 //!     println!("{:#018x} {:>8} {}", span.usable_address, span.size, tag_label(span.raw_tag));

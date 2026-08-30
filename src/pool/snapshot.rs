@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1662,6 +1663,17 @@ pub(crate) struct PoolSnapshot {
     /// the snapshot, both look like a short list — so the reason travels as a field rather than
     /// being inferred downstream from the diagnostic it also writes.
     pub budget_expired: bool,
+    /// The match threshold that intentionally ended this walk, when one fired.
+    ///
+    /// This is separate from `budget_expired` and from diagnostics because all three make the
+    /// snapshot partial for different reasons. A caller that asked only whether a tag exists has
+    /// its answer when this is present; a caller seeing either of the others does not.
+    pub stopped_after_matches: Option<usize>,
+    /// Query-specific stop policy for a snapshot currently being built. It never survives into
+    /// the cache: a walk that fires it clears `complete`, and the cache stores complete snapshots
+    /// only.
+    pub match_limit: Option<PoolMatchLimit>,
+    pub matched_allocations: usize,
     /// What the walk stepped over rather than gave up on; see [`WalkStalls`].
     pub stalls: WalkStalls,
     /// Chunk headers a backend decoder refused and resynchronised past, across the whole walk.
@@ -1685,6 +1697,55 @@ pub(crate) struct PoolSnapshot {
     /// reports a large figure here has lost the chunk chain somewhere, and the chain is the only
     /// thing that can find a variable-size header.
     pub unplaced_bytes: u64,
+}
+
+/// An explicitly partial tag query: stop after this many matching allocated chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolMatchLimit {
+    raw_tag: u32,
+    /// `Some(true)` means paged only, `Some(false)` nonpaged only, and `None` means both.
+    paged: Option<bool>,
+    matches: NonZeroUsize,
+}
+
+impl PoolMatchLimit {
+    pub(crate) fn new(raw_tag: u32, paged: Option<bool>, matches: NonZeroUsize) -> Self {
+        Self {
+            raw_tag,
+            paged,
+            matches,
+        }
+    }
+
+    fn accepts(self, span: &PoolSpan) -> bool {
+        span.state == PoolState::Allocated
+            && span.raw_tag == self.raw_tag
+            && self
+                .paged
+                .is_none_or(|paged| span.pool_kind.is_paged() == paged)
+    }
+}
+
+impl PoolSnapshot {
+    fn record_span(&mut self, span: PoolSpan) {
+        let matched = self.match_limit.is_some_and(|limit| limit.accepts(&span));
+        self.spans.push(span);
+        if !matched {
+            return;
+        }
+        self.matched_allocations = self.matched_allocations.saturating_add(1);
+        let Some(limit) = self.match_limit else {
+            return;
+        };
+        if self.matched_allocations >= limit.matches.get() {
+            self.complete = false;
+            self.stopped_after_matches = Some(limit.matches.get());
+        }
+    }
+
+    fn match_limit_reached(&self) -> bool {
+        self.stopped_after_matches.is_some()
+    }
 }
 
 /// What valid-region queries that could not advance cost the walk, and what stepping over them
@@ -1873,12 +1934,22 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     /// and still errors: an operator who interrupts is asking for the walk to stop, not for
     /// whatever it happened to have.
     pub(crate) fn walk(&self, budget: Option<Duration>) -> Result<PoolSnapshot, SnapshotError> {
+        self.walk_until(budget, None)
+    }
+
+    /// Walk with an optional query-specific match threshold.
+    pub(crate) fn walk_until(
+        &self,
+        budget: Option<Duration>,
+        match_limit: Option<PoolMatchLimit>,
+    ) -> Result<PoolSnapshot, SnapshotError> {
         let (discovery_deadline, walk_deadline) = budget_deadlines(Instant::now(), budget);
         let mut snapshot = PoolSnapshot {
             diagnostics: PoolDiagnostics::from_iter([
                 "per-session paged heaps are not included".to_string()
             ]),
             complete: true,
+            match_limit,
             ..PoolSnapshot::default()
         };
 
@@ -1934,6 +2005,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             match outcome {
                 // Counted only when the region was walked *through*. A region abandoned
                 // part-way is exactly what the caveat below is for.
+                Ok(()) if snapshot.match_limit_reached() => break,
                 Ok(()) => walked += 1,
                 Err(SnapshotError::BudgetExpired) => {
                     expired = true;
@@ -2131,6 +2203,9 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             // disappears from the snapshot.
             if region.heap.special {
                 self.walk_special_pool(region, valid_base, &bytes, snapshot);
+                if snapshot.match_limit_reached() {
+                    return Ok(());
+                }
                 cursor = valid_end;
                 continue;
             }
@@ -2141,6 +2216,9 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 }
                 PoolBackend::Segment => self.walk_page_ranges(region, valid_base, &bytes, snapshot),
                 PoolBackend::Large => return Ok(()),
+            }
+            if snapshot.match_limit_reached() {
+                return Ok(());
             }
             cursor = valid_end;
         }
@@ -2197,7 +2275,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         if region.size == 0 {
             return;
         }
-        snapshot.spans.push(
+        snapshot.record_span(
             self.base_span(
                 region,
                 region.address,
@@ -2248,7 +2326,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
     ) {
         if size != 0 {
             snapshot.complete = false;
-            snapshot.spans.push(self.base_span(
+            snapshot.record_span(self.base_span(
                 region,
                 address,
                 address,
@@ -2322,7 +2400,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                     snapshot.complete = false;
                 }
                 let (usable, size) = (placement.usable, placement.size);
-                snapshot.spans.push(self.base_span(
+                snapshot.record_span(self.base_span(
                     region,
                     page,
                     usable,
@@ -2330,6 +2408,9 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                     header.tag,
                     PoolState::Allocated,
                 ));
+                if snapshot.match_limit_reached() {
+                    break;
+                }
             }
             let Some(next) = page.checked_add(PAGE_SIZE) else {
                 break;
@@ -2381,7 +2462,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             let tag = decode_pool_header(bytes, offset, region.pool_header)
                 .map_or(0, |header| header.tag);
             let usable = address + region.pool_header.size as u64;
-            snapshot.spans.push(self.base_span(
+            snapshot.record_span(self.base_span(
                 region,
                 address,
                 usable,
@@ -2389,6 +2470,9 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 tag,
                 state,
             ));
+            if snapshot.match_limit_reached() {
+                break;
+            }
             slot += 1;
         }
     }
@@ -2608,11 +2692,14 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 state,
             );
             span.size_class = chunk_size.min(u32::MAX as usize) as u32;
-            snapshot.spans.push(span);
+            snapshot.record_span(span);
             previous_chunk = Some(chunk_size);
             offset += chunk_size;
             resume = base + offset as u64;
             chunks += 1;
+            if snapshot.match_limit_reached() {
+                break;
+            }
         }
         if let Some(from) = resync_from {
             snapshot.refused_chunks = snapshot.refused_chunks.saturating_add(refused);
@@ -2626,7 +2713,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                  from {base:#x}"
             ));
         }
-        if chunks >= self.traversal_limit {
+        if !snapshot.match_limit_reached() && chunks >= self.traversal_limit {
             snapshot.complete = false;
             snapshot
                 .diagnostics
@@ -2665,7 +2752,7 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             });
             let address = region.address + slot_offset as u64;
             let header_size = region.pool_header.size.min(size);
-            snapshot.spans.push(self.base_span(
+            snapshot.record_span(self.base_span(
                 region,
                 address,
                 address + header_size as u64,
@@ -2673,6 +2760,9 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 tag.unwrap_or(0),
                 state,
             ));
+            if snapshot.match_limit_reached() {
+                break;
+            }
             slot += 1;
         }
     }
@@ -2859,6 +2949,100 @@ mod tests {
             snapshot.complete,
             "a straddling slot is expected layout and must not mark the snapshot incomplete"
         );
+    }
+
+    fn match_limited_snapshot(tag: &[u8; 4], matches: usize) -> PoolSnapshot {
+        PoolSnapshot {
+            complete: true,
+            match_limit: Some(PoolMatchLimit::new(
+                u32::from_le_bytes(*tag),
+                None,
+                NonZeroUsize::new(matches).expect("test match limits are nonzero"),
+            )),
+            ..PoolSnapshot::default()
+        }
+    }
+
+    fn walk_page_tag(tag: [u8; 4], slots: usize, stop_after: usize) -> PoolSnapshot {
+        let bytes = vec![0; slots * 0x20];
+        let mut region = lfh_region(0x4000, 0x20);
+        region.backend = PoolBackend::Segment;
+        region.size = bytes.len();
+        region.known_tag = Some(u32::from_le_bytes(tag));
+        region.states = vec![PoolState::Allocated; slots];
+        let memory = FlatMemory::new(region.address, bytes.len());
+        let layout = vs_layout(false);
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+        let mut snapshot = match_limited_snapshot(b"Tgsm", stop_after);
+        walker.walk_page_ranges(&region, region.address, &bytes, &mut snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn test_match_limit_does_not_stop_a_walk_with_zero_matches() {
+        let snapshot = walk_page_tag(*b"Othr", 3, 1);
+        assert_eq!(snapshot.spans.len(), 3);
+        assert_eq!(snapshot.stopped_after_matches, None);
+        assert!(snapshot.complete);
+    }
+
+    #[test]
+    fn test_match_limit_stops_on_the_first_match() {
+        let snapshot = walk_page_tag(*b"Tgsm", 3, 1);
+        assert_eq!(snapshot.spans.len(), 1);
+        assert_eq!(snapshot.stopped_after_matches, Some(1));
+        assert_eq!(snapshot.matched_allocations, 1);
+        assert!(!snapshot.complete);
+    }
+
+    #[test]
+    fn test_match_limit_stops_on_the_requested_nth_match() {
+        let snapshot = walk_page_tag(*b"Tgsm", 4, 2);
+        assert_eq!(snapshot.spans.len(), 2);
+        assert_eq!(snapshot.stopped_after_matches, Some(2));
+        assert_eq!(snapshot.matched_allocations, 2);
+        assert_eq!(snapshot.spans.last().unwrap().display_tag, "Tgsm");
+    }
+
+    #[test]
+    fn test_match_limit_counts_only_allocated_chunks_in_scope() {
+        let raw_tag = u32::from_le_bytes(*b"Tgsm");
+        let mut snapshot = PoolSnapshot {
+            complete: true,
+            match_limit: Some(PoolMatchLimit::new(
+                raw_tag,
+                Some(false),
+                NonZeroUsize::new(2).unwrap(),
+            )),
+            ..PoolSnapshot::default()
+        };
+        let span = |address, kind, state| {
+            let mut span = PoolSpan::allocation(
+                address,
+                0x20,
+                raw_tag,
+                kind,
+                HeapIdentity {
+                    pool_state: 1,
+                    heap: 1,
+                    special: false,
+                },
+                PoolBackend::Lfh,
+            );
+            span.state = state;
+            span
+        };
+
+        snapshot.record_span(span(0x1000, PoolKind::Paged, PoolState::Allocated));
+        snapshot.record_span(span(0x1020, PoolKind::NonPagedNx, PoolState::ReusableFree));
+        snapshot.record_span(span(0x1040, PoolKind::NonPagedNx, PoolState::Allocated));
+        assert_eq!(snapshot.stopped_after_matches, None);
+        snapshot.record_span(span(0x1060, PoolKind::NonPagedNx, PoolState::Allocated));
+        assert_eq!(snapshot.stopped_after_matches, Some(2));
     }
 
     #[test]
