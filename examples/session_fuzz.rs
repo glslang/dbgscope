@@ -128,12 +128,15 @@ enum Health {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // The clock reading is taken as it comes. It used to be `| 1` as well, which cost a bare bit
+    // of entropy and, worse, meant a run seeded from the clock could never be an even seed — so
+    // half the space was unreachable by default as well as by `--seed`. [`Rng::new`] is where the
+    // one forbidden state is handled, and it is the only place that needs to.
     let seed = numeric(&args, "--seed").unwrap_or_else(|| {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|since| since.as_nanos() as u64)
             .unwrap_or(0x243F_6A88_85A3_08D3)
-            | 1
     });
     let rounds = numeric(&args, "--rounds").unwrap_or(20);
     let steps = numeric(&args, "--steps").unwrap_or(8);
@@ -334,8 +337,30 @@ fn numeric(args: &[String], flag: &str) -> Option<u64> {
 struct Rng(u64);
 
 impl Rng {
+    /// **The forbidden state is zero, not "even".**
+    ///
+    /// This was `seed | 1`, which quietly folded every even seed onto the odd one above it: `42`
+    /// and `43` were one run, `6` and `7` were one run, and half of what `--seed` can name walked
+    /// a sequence something else already walked. That defeats the flag: its whole purpose is to
+    /// let someone reproduce a failing run and then *vary* it, and a seed that silently aliases
+    /// looks like a new sequence while covering nothing new.
+    ///
+    /// Measured over the first 512 seeds, drawing ten corpus steps each: `seed | 1` gives **256**
+    /// distinct walks and this gives **512**. Running a SplitMix64 finalizer over the seed first
+    /// also gives 512, and was tried and dropped — adjacent seeds already walk differently
+    /// without it, so it would be machinery bought with nothing. The one collision left is `0`
+    /// against the constant it maps to, which is the state xorshift64* cannot be given rather
+    /// than a pair of ordinary seeds.
+    ///
+    /// Found downstream, where this example had been ported to drive windbg-mcp's tool surface
+    /// and the seed is a small integer someone types while scanning
+    /// ([windbg-mcp#268](https://github.com/glslang/windbg-mcp/pull/268)).
     fn new(seed: u64) -> Self {
-        Self(seed | 1)
+        Self(if seed == 0 {
+            0x243F_6A88_85A3_08D3
+        } else {
+            seed
+        })
     }
 
     fn next(&mut self) -> u64 {

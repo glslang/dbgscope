@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `examples/session_fuzz.rs` no longer forces its seed odd, which had silently halved what
+  `--seed` can name: `Rng::new` did `seed | 1`, so `42` and `43` were one run and `6` and `7` were
+  one run. The flag exists so a failing sequence can be reproduced and then *varied*, and a seed
+  that aliases another looks like a new sequence while covering nothing new. The forbidden state
+  for xorshift64* is zero rather than "even", so that is now the only case handled, and the
+  clock-derived default is taken as it comes instead of being forced odd as well. Measured over
+  the first 512 seeds, ten corpus draws each: **256** distinct walks before, **512** after. Seeds
+  that were already odd — including the `1` this example's notes are written against — walk
+  exactly what they walked. Found downstream in
+  [windbg-mcp#268](https://github.com/glslang/windbg-mcp/pull/268), which ported this example to
+  drive that server's tool surface, where the seed is a small integer someone types while
+  scanning.
+
 ### Added
 
 - Pool tag queries accept an optional nonzero match threshold. A new walk stops immediately after
