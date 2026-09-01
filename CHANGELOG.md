@@ -37,6 +37,11 @@ All notable changes to this project are documented here. The format follows
   leaves the address armed by the others. Nothing is removed until the replacement is fully
   configured and certain to be armed, so a call that fails part-way leaves the caller's existing
   breakpoints alone rather than handing them an error and an address they had already lost.
+- `BreakpointInfo::data` reports a data breakpoint's watched region — what access, over how many
+  bytes — read through `GetDataParameters`. The read side could previously say a breakpoint *was* a
+  data breakpoint and not what it watched, which left the new read-back unable to confirm the half
+  of a spec most worth confirming. `DataAccess::Other` keeps an access combination this build does
+  not name rather than folding it into a plausible neighbour, as `BreakpointKind::Other` does.
 - `examples/breakpoint_probe.rs`, the record behind all of the above.
 
 ### Removed
