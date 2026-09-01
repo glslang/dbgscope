@@ -844,6 +844,12 @@ pub enum DataAccess {
     /// I/O port access. Kernel mode, x86, Windows XP and Server 2003 only — spelled here because
     /// the engine takes it, and refused by the engine everywhere else.
     Io,
+    /// A combination this build does not name, kept as the engine's own bits.
+    ///
+    /// Produced by reading a breakpoint back ([`BreakpointInfo::data`]), as
+    /// [`BreakpointKind::Other`] is. Passing one to a setter sends those bits unchanged and lets
+    /// the engine judge them, which is the same deal every other variant gets.
+    Other(u32),
 }
 
 impl DataAccess {
@@ -854,6 +860,21 @@ impl DataAccess {
             Self::ReadWrite => DEBUG_BREAK_READ | DEBUG_BREAK_WRITE,
             Self::Execute => DEBUG_BREAK_EXECUTE,
             Self::Io => DEBUG_BREAK_IO,
+            Self::Other(bits) => bits,
+        }
+    }
+
+    fn from_engine(bits: u32) -> Self {
+        const READ: u32 = DEBUG_BREAK_READ;
+        const WRITE: u32 = DEBUG_BREAK_WRITE;
+        const READ_WRITE: u32 = DEBUG_BREAK_READ | DEBUG_BREAK_WRITE;
+        match bits {
+            READ => Self::Read,
+            WRITE => Self::Write,
+            READ_WRITE => Self::ReadWrite,
+            DEBUG_BREAK_EXECUTE => Self::Execute,
+            DEBUG_BREAK_IO => Self::Io,
+            other => Self::Other(other),
         }
     }
 }
@@ -1021,6 +1042,15 @@ impl BreakpointSpec {
     /// it: this crate does not know the target's pointer width without an engine, and a rule
     /// stated here that contradicts the engine on one architecture is worse than the engine's own
     /// answer.
+    ///
+    /// **The access type is not judged against the size here, and that is measured rather than
+    /// overlooked.** An execute watch must be one byte on x86/x64 — a DR7 slot with `R/W=00`
+    /// carries `LEN=00` — and it was raised in review as another delayed failure. It is not one:
+    /// `SetDataParameters` refuses `Execute` with size 2, 4 or 8 **synchronously**, with
+    /// `E_INVALIDARG`, and `ba e4` fails the same way (measured on dbgeng 10.0.29547.1002, all
+    /// three sizes, against a size 1 that is accepted). So the engine already reports it against
+    /// the call that caused it, which is the whole property this function exists to provide — and
+    /// restating it here would put an x86/x64 rule in front of an engine that answers per target.
     fn validated(&self) -> Result<(), DbgEngError> {
         let Some(watch) = self.data else {
             return Ok(());
@@ -1113,6 +1143,14 @@ pub struct BreakpointInfo {
     pub expression: Option<String>,
     /// The command string the debugger runs each time it fires, where it has one.
     pub command: Option<String>,
+    /// The watched region, for a [data](BreakpointKind::Data) breakpoint — what access, over how
+    /// many bytes. `None` for a code breakpoint, which has neither.
+    ///
+    /// Read through `GetDataParameters`, so a breakpoint set with a [`DataWatch`] reads back as
+    /// the same pair. Without it the read side could say a breakpoint *is* a data breakpoint and
+    /// not what it watches, which would leave [`BreakpointSet::breakpoint`] unable to confirm the
+    /// half of a spec most worth confirming.
+    pub data: Option<DataWatch>,
     /// The thread it is restricted to, or `None` for any thread.
     pub thread: Option<u32>,
     pub enabled: bool,
@@ -4622,6 +4660,21 @@ fn breakpoint_info(
     let thread = unsafe { breakpoint.GetMatchThreadId() }
         .ok()
         .filter(|id| *id != DEBUG_ANY_ID);
+    // Asked only of a data breakpoint. A code breakpoint has no watched region, and the engine is
+    // under no obligation to answer meaningfully for one — so a size and an access read off it
+    // would be an invention rather than a reading.
+    let data = (kind == BreakpointKind::Data)
+        .then(|| {
+            let mut size = 0u32;
+            let mut access = 0u32;
+            unsafe { breakpoint.GetDataParameters(&mut size, &mut access) }
+                .ok()
+                .map(|()| DataWatch {
+                    access: DataAccess::from_engine(access),
+                    size,
+                })
+        })
+        .flatten();
     Ok(BreakpointInfo {
         id,
         kind,
@@ -4629,6 +4682,7 @@ fn breakpoint_info(
         expression,
         command,
         thread,
+        data,
         enabled: flags & DEBUG_BREAKPOINT_ENABLED != 0,
         deferred: flags & DEBUG_BREAKPOINT_DEFERRED != 0,
         one_shot: flags & DEBUG_BREAKPOINT_ONE_SHOT != 0,
@@ -4807,6 +4861,34 @@ mod tests {
             DataAccess::Read.to_engine(),
             DataAccess::ReadWrite.to_engine()
         );
+    }
+
+    /// Every access survives the trip to the engine and back, including one this build cannot name.
+    ///
+    /// The round trip is the property that matters, because `BreakpointInfo::data` is read back
+    /// through `GetDataParameters` and compared against the spec that set it: a mapping that is
+    /// merely *a* function each way would let a breakpoint read back as something it is not.
+    /// `Other` carries bits rather than discarding them, as [`BreakpointKind::Other`] does, so an
+    /// engine reporting a combination this build has never heard of still reports it.
+    #[test]
+    fn test_a_data_access_survives_the_round_trip_to_the_engine() {
+        for access in [
+            DataAccess::Read,
+            DataAccess::Write,
+            DataAccess::ReadWrite,
+            DataAccess::Execute,
+            DataAccess::Io,
+        ] {
+            assert_eq!(
+                DataAccess::from_engine(access.to_engine()),
+                access,
+                "{access:?} did not survive"
+            );
+        }
+        // Bits with no name are kept, not folded into a plausible neighbour.
+        let odd = DEBUG_BREAK_EXECUTE | DEBUG_BREAK_WRITE;
+        assert_eq!(DataAccess::from_engine(odd), DataAccess::Other(odd));
+        assert_eq!(DataAccess::Other(odd).to_engine(), odd);
     }
 
     /// A processor breakpoint's size and alignment are refused *here*, before one exists.

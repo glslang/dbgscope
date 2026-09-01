@@ -392,10 +392,22 @@ fn data(engine: &DebugEngine, _symbol: &str) {
         return;
     };
     match engine.set_breakpoint(&BreakpointSpec::data(BreakpointAt::Address(address), watch)) {
-        Ok(set) => println!(
-            "  8-byte write watch at {address:#x}: id={} kind={:?}",
-            set.breakpoint.id, set.breakpoint.kind
-        ),
+        Ok(set) => {
+            println!(
+                "  8-byte write watch at {address:#x}: id={} kind={:?} data={:?}",
+                set.breakpoint.id, set.breakpoint.kind, set.breakpoint.data
+            );
+            // The read-back is only worth having if it can contradict the spec, so say whether it
+            // agrees rather than printing both and leaving it to the reader.
+            println!(
+                "  the engine reports the same watch: {}",
+                if set.breakpoint.data == Some(watch) {
+                    "yes"
+                } else {
+                    "NO — the engine holds something else"
+                }
+            );
+        }
         Err(e) => println!("  could not set a data breakpoint: {e}"),
     }
     held(engine, "held");
