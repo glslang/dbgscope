@@ -11,7 +11,8 @@ use windows::core::{HRESULT, IUnknown, Interface, PCSTR, PCWSTR, PWSTR};
 
 // Import the necessary Windows Debug Engine interfaces
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
-    DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAKPOINT_CODE,
+    DEBUG_ANY_ID, DEBUG_ATTACH_KERNEL_CONNECTION, DEBUG_ATTACH_LOCAL_KERNEL, DEBUG_BREAK_EXECUTE,
+    DEBUG_BREAK_IO, DEBUG_BREAK_READ, DEBUG_BREAK_WRITE, DEBUG_BREAKPOINT_CODE,
     DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_DEFERRED, DEBUG_BREAKPOINT_ENABLED,
     DEBUG_BREAKPOINT_ONE_SHOT, DEBUG_CLASS_KERNEL, DEBUG_ENGOPT_INITIAL_BREAK,
     DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE, DEBUG_KERNEL_SMALL_DUMP,
@@ -27,7 +28,7 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82, DEBUG_VALUE_FLOAT128,
     DEBUG_VALUE_INT8, DEBUG_VALUE_INT16, DEBUG_VALUE_INT32, DEBUG_VALUE_INT64,
     DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128, DebugConnectWide, IDebugAdvanced2,
-    IDebugBreakpoint, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
+    IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
     IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
     IDebugSystemObjects,
 };
@@ -62,6 +63,15 @@ pub enum DbgEngError {
 
     #[error("Breakpoint failed: {0}")]
     BreakpointFailed(windows::core::Error),
+
+    /// A [`crate::dbgeng::BreakpointSpec`] the engine would accept and then refuse later.
+    ///
+    /// Separate from [`Self::BreakpointFailed`] because nothing failed: the spec is refused here,
+    /// before a breakpoint exists, so there is no `windows::core::Error` to carry and nothing to
+    /// undo. A processor breakpoint with a bad size or alignment is the case — the engine takes it
+    /// at the set and rejects it at the *resume*, against an operation that did nothing wrong.
+    #[error("Invalid breakpoint: {0}")]
+    InvalidBreakpoint(String),
 
     #[error("Invalid command string (contains interior NUL)")]
     InvalidCommand,
@@ -800,6 +810,270 @@ impl BreakpointKind {
     }
 }
 
+/// Where a breakpoint goes.
+///
+/// Two variants rather than one string because they reach the engine through different calls with
+/// different costs, and a caller that already has an address should not pay for an evaluator it
+/// does not need. [`Self::Expression`] is `SetOffsetExpression`, [`Self::Address`] is `SetOffset`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreakpointAt {
+    /// A resolved address. Cannot block and cannot defer.
+    Address(u64),
+    /// A symbolic expression — `nt!Foo`, `hevd!Trigger+0x40`, a register expression.
+    ///
+    /// **Resolved eagerly, and the resolve can block.** The engine evaluates the expression as the
+    /// breakpoint's offset is set, and flags the breakpoint [deferred](BreakpointInfo::deferred)
+    /// only when it *cannot* — so on a module whose PDB is not in the local store this is a
+    /// symbol-server fetch, with the engine held for all of it. Measured on dbgeng
+    /// 10.0.29547.1002: 6 ms warm, **2620 ms** for a cold `KERNELBASE!CreateFileW` over `srv*`
+    /// against an empty downstream store, and 0 ms for an expression whose module is absent, which
+    /// defers instead. That is what [`DebugEngine::set_breakpoint_bounded`] is for.
+    Expression(String),
+}
+
+/// What accesses activate a data (processor) breakpoint — `ba`'s access argument.
+///
+/// [`Self::Read`] behaves as [`Self::ReadWrite`] on x86 and x64; it is kept distinct because the
+/// engine takes the distinction and other architectures may honour it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataAccess {
+    Read,
+    Write,
+    ReadWrite,
+    Execute,
+    /// I/O port access. Kernel mode, x86, Windows XP and Server 2003 only — spelled here because
+    /// the engine takes it, and refused by the engine everywhere else.
+    Io,
+}
+
+impl DataAccess {
+    fn to_engine(self) -> u32 {
+        match self {
+            Self::Read => DEBUG_BREAK_READ,
+            Self::Write => DEBUG_BREAK_WRITE,
+            Self::ReadWrite => DEBUG_BREAK_READ | DEBUG_BREAK_WRITE,
+            Self::Execute => DEBUG_BREAK_EXECUTE,
+            Self::Io => DEBUG_BREAK_IO,
+        }
+    }
+}
+
+/// The watched region of a data breakpoint: what access, over how many bytes.
+///
+/// One value because the engine takes them in one call (`SetDataParameters`) and because neither
+/// is meaningful alone — a size with no access type does not describe a breakpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataWatch {
+    pub access: DataAccess,
+    /// 1, 2, 4 or 8 bytes on x64; 1, 2 or 4 on x86. The address must be a multiple of it.
+    ///
+    /// Checked before the engine is asked ([`DebugEngine::set_breakpoint`]) rather than left to
+    /// it, because a processor breakpoint whose size or alignment is wrong is refused when the
+    /// target is **resumed** — so the engine's complaint arrives detached from the call that
+    /// caused it, against a debug register nobody has looked at.
+    pub size: u32,
+}
+
+/// What to do about breakpoints the engine already holds at the address a new one resolves to.
+///
+/// The engine has **no** deduplication of its own: `AddBreakpoint2` plus a location, twice on one
+/// address, leaves two breakpoints — both enabled, both listed by `bl`. What deduplicates is the
+/// *command layer*: `bp` and `bu` alike resolve their argument and then remove whatever is already
+/// at that address, printing `breakpoint N redefined`. Measured on dbgeng 10.0.29547.1002, by
+/// symbol, by literal address and by `symbol+0` alike. A **deferred** expression has no address to
+/// key on and so duplicates freely, which is why `bp nosuchmod!Sym` three times leaves three
+/// breakpoints where `bp ntdll!NtCreateFile` three times leaves one.
+///
+/// So a caller replacing a `bp` with this primitive has to say which of the two it meant, or it
+/// changes behaviour silently. Duplicates are not benign: the target stops **once** at the
+/// address, but every breakpoint there is activated — the stop banner reads `Breakpoint 0 hit`
+/// *and* `Breakpoint 1 hit`, each one's [command](BreakpointSpec::command) runs, and removing one
+/// by id leaves the address armed by the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnExisting {
+    /// Leave them. The engine's own behaviour, and the honest default for a primitive: nothing is
+    /// destroyed that the caller did not name.
+    #[default]
+    Add,
+    /// Remove every other breakpoint at the resolved address first, reporting their ids as
+    /// [`BreakpointSet::replaced`] — what `bp` does, with the collapse as a value rather than a
+    /// line of text.
+    ///
+    /// A location that does not resolve replaces nothing, there being no address to compare:
+    /// `replaced` comes back empty and [`BreakpointInfo::deferred`] says why.
+    Replace,
+}
+
+/// A breakpoint to create: where it goes, and every parameter the engine will hold it by.
+///
+/// Built with [`Self::code`] or [`Self::data`] and narrowed with the methods below, so the
+/// combination that cannot exist — a data breakpoint with no watched region — cannot be spelled.
+/// That is also why the kind is not a field of its own: [`Self::data`] is `Some` exactly when this
+/// is a processor breakpoint, so the kind and its parameters cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakpointSpec {
+    pub at: BreakpointAt,
+    /// `Some` makes this a data (processor) breakpoint — `ba` — and `None` a code one, `bp`.
+    pub data: Option<DataWatch>,
+    /// A debugger command run every time it is activated, as `bp`'s quoted trailing argument is.
+    ///
+    /// **This is the parameter that makes the text hatch unnecessary.** A command that reaches the
+    /// engine as an argument needs no quoting and no screening: it is never parsed as part of a
+    /// command line, so a `;` in it separates nothing and a `"` in it opens nothing.
+    pub command: Option<String>,
+    /// Restricts it to one thread, by engine thread id. `None` matches any thread.
+    pub thread: Option<u32>,
+    /// How many times it must be reached before it stops the target. `None` and `Some(1)` mean the
+    /// same thing to the engine: stop every time.
+    pub pass_count: Option<u32>,
+    /// Removes itself the first time it is activated (`DEBUG_BREAKPOINT_ONE_SHOT`) — `bp /1`.
+    pub one_shot: bool,
+    /// Whether it is armed. **Defaults to `true`**, which is not the engine's default: a
+    /// breakpoint is born disabled *and* at address zero, so the engine's default is a breakpoint
+    /// on the null page that never fires. The wrapper this type replaces shipped exactly that.
+    pub enabled: bool,
+    pub on_existing: OnExisting,
+}
+
+impl BreakpointSpec {
+    /// A code breakpoint — execution reaching an address. `bp`.
+    pub fn code(at: BreakpointAt) -> Self {
+        Self {
+            at,
+            data: None,
+            command: None,
+            thread: None,
+            pass_count: None,
+            one_shot: false,
+            enabled: true,
+            on_existing: OnExisting::Add,
+        }
+    }
+
+    /// A data breakpoint — the processor accessing a region. `ba`.
+    pub fn data(at: BreakpointAt, watch: DataWatch) -> Self {
+        Self {
+            data: Some(watch),
+            ..Self::code(at)
+        }
+    }
+
+    /// A command the debugger runs on every activation. See [`Self::command`].
+    pub fn with_command(mut self, command: impl Into<String>) -> Self {
+        self.command = Some(command.into());
+        self
+    }
+
+    /// Restrict it to one thread.
+    pub fn on_thread(mut self, thread: u32) -> Self {
+        self.thread = Some(thread);
+        self
+    }
+
+    /// Stop only on the nth arrival.
+    pub fn with_pass_count(mut self, passes: u32) -> Self {
+        self.pass_count = Some(passes);
+        self
+    }
+
+    /// Remove itself once activated.
+    pub fn one_shot(mut self) -> Self {
+        self.one_shot = true;
+        self
+    }
+
+    /// Create it disabled, to be armed later with [`DebugEngine::enable_breakpoint`].
+    pub fn disabled(mut self) -> Self {
+        self.enabled = false;
+        self
+    }
+
+    /// Remove whatever the engine already holds at this address. See [`OnExisting::Replace`].
+    pub fn replacing_existing(mut self) -> Self {
+        self.on_existing = OnExisting::Replace;
+        self
+    }
+
+    /// Refuses a spec the engine would accept now and reject later.
+    ///
+    /// A processor breakpoint's size must be a power of two up to the pointer width and its
+    /// address a multiple of that size. The engine takes a bad pair without complaint at the set
+    /// and refuses it when the target is **resumed**, so the error arrives against a `go` that did
+    /// nothing wrong, naming a debug register rather than the call that armed it.
+    ///
+    /// The size is checked for both location kinds; the alignment only for
+    /// [`BreakpointAt::Address`], since an expression's address is not known until the engine
+    /// resolves it and guessing at one here would refuse specs that are fine.
+    ///
+    /// 8 bytes is accepted on every target, including a 32-bit one where the engine will refuse
+    /// it: this crate does not know the target's pointer width without an engine, and a rule
+    /// stated here that contradicts the engine on one architecture is worse than the engine's own
+    /// answer.
+    fn validated(&self) -> Result<(), DbgEngError> {
+        let Some(watch) = self.data else {
+            return Ok(());
+        };
+        if !matches!(watch.size, 1 | 2 | 4 | 8) {
+            return Err(DbgEngError::InvalidBreakpoint(format!(
+                "a data breakpoint's size must be 1, 2, 4 or 8 bytes, not {}",
+                watch.size
+            )));
+        }
+        if let BreakpointAt::Address(address) = self.at
+            && !address.is_multiple_of(u64::from(watch.size))
+        {
+            return Err(DbgEngError::InvalidBreakpoint(format!(
+                "a {}-byte data breakpoint must be {}-byte aligned, and {address:#x} is not",
+                watch.size, watch.size
+            )));
+        }
+        Ok(())
+    }
+
+    /// The flags a freshly created breakpoint has to be given to match this spec.
+    ///
+    /// `DEBUG_BREAKPOINT_DEFERRED` is absent deliberately and cannot be added: the engine owns it
+    /// — it is set when an expression will not evaluate, and *"cannot be modified by any client"* —
+    /// so it is read back on [`BreakpointInfo`] and never sent.
+    fn flags(&self) -> u32 {
+        let mut flags = 0;
+        if self.enabled {
+            flags |= DEBUG_BREAKPOINT_ENABLED;
+        }
+        if self.one_shot {
+            flags |= DEBUG_BREAKPOINT_ONE_SHOT;
+        }
+        flags
+    }
+}
+
+/// What [`DebugEngine::set_breakpoint`] left the session holding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakpointSet {
+    /// The new breakpoint as the **engine** holds it, read back through the same getters
+    /// [`DebugEngine::breakpoints`] uses rather than echoed from the spec.
+    ///
+    /// The difference is the whole value of the field: the spec says what was asked for, and this
+    /// says what happened — whether an expression resolved, what address it resolved to, and
+    /// whether the engine kept the text.
+    pub breakpoint: BreakpointInfo,
+    /// Ids removed to make room, under [`OnExisting::Replace`]. Empty under [`OnExisting::Add`],
+    /// and empty when the location did not resolve.
+    pub replaced: Vec<u32>,
+    /// `None` when the whole set ran to completion.
+    ///
+    /// **The breakpoint exists either way**, which is why this is a field on a success rather than
+    /// an error: a caller that retries on an error ends up with two. What is uncertain when this
+    /// is `Some` is only whether the *location* finished resolving — and
+    /// [`BreakpointInfo::deferred`] and [`BreakpointInfo::address`] on the record above answer
+    /// that, having been read back after the fact rather than assumed.
+    ///
+    /// A break also abandons the symbol load it interrupted: measured, the module is left on
+    /// export symbols for the rest of the session, so a caller that needs the PDB has to reload it
+    /// rather than expect the next call to retry.
+    pub cut_short: Option<Interruption>,
+}
+
 /// One breakpoint the engine holds, as [`DebugEngine::breakpoints`] reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BreakpointInfo {
@@ -809,10 +1083,21 @@ pub struct BreakpointInfo {
     /// Where it will fire, or `None` while it is [deferred](Self::deferred) — its module is not
     /// loaded, so it has no address yet. Never zero for "unknown".
     pub address: Option<u64>,
-    /// The expression the engine is still holding this breakpoint as — in practice a deferred
-    /// one (`hevd!Trigger+0x40` for a driver that has not loaded). A breakpoint that resolved
-    /// when it was set keeps its [address](Self::address) instead and the engine no longer holds
-    /// the text, so `None` here is the normal case for a live breakpoint, not a gap.
+    /// The expression the engine is still holding this breakpoint as, where it holds one.
+    ///
+    /// **Whether a resolved breakpoint keeps its text depends on who set it**, which this doc used
+    /// to get wrong by describing only the command's behaviour. Measured on dbgeng
+    /// 10.0.29547.1002:
+    ///
+    /// - set by `bp`/`bu`, the engine discards the text once it resolves, so `None` beside a
+    ///   [resolved address](Self::address) is the ordinary case rather than a gap;
+    /// - set by [`DebugEngine::set_breakpoint`] with a [`BreakpointAt::Expression`], the engine
+    ///   **keeps** it — `Some("ntdll!NtCreateFile")` beside a resolved address, with
+    ///   [`Self::deferred`] false.
+    ///
+    /// So this is `Some` for every deferred breakpoint and for a resolved one whose location was
+    /// set through the typed path. Read [`Self::deferred`] rather than this field to ask whether a
+    /// breakpoint has an address yet.
     pub expression: Option<String>,
     /// The command string the debugger runs each time it fires, where it has one.
     pub command: Option<String>,
@@ -3430,62 +3715,279 @@ impl DebugEngine {
         let mut out = Vec::with_capacity(count as usize);
         for index in 0..count {
             let breakpoint =
-                unsafe { self.control.GetBreakpointByIndex(index) }.map_err(|source| {
+                unsafe { self.control.GetBreakpointByIndex2(index) }.map_err(|source| {
                     DbgEngError::Context {
                         operation: format!("reading breakpoint at index {index}"),
                         source,
                     }
                 })?;
-            // Never released, exactly as in [`Breakpoint`]: DbgEng owns breakpoint objects and
-            // hands out borrowed interfaces, so letting the generated wrapper `Release()` one is
-            // a call on an object this code does not own. There is nothing to leak — the engine
-            // frees them with the session.
+            // Never released: DbgEng owns breakpoint objects and hands out borrowed interfaces, so
+            // letting the generated wrapper `Release()` one is a call on an object this code does
+            // not own. There is nothing to leak — the engine frees them with the session.
             let breakpoint = std::mem::ManuallyDrop::new(breakpoint);
-            let id = unsafe { breakpoint.GetId() }.map_err(|source| DbgEngError::Context {
-                operation: format!("reading the id of breakpoint {index}"),
-                source,
-            })?;
-            let mut kind = 0u32;
-            let mut _processor = 0u32;
-            let kind = match unsafe { breakpoint.GetType(&mut kind, &mut _processor) } {
-                Ok(()) => BreakpointKind::from_engine(kind),
-                Err(_) => BreakpointKind::Other(DEBUG_ANY_ID),
-            };
-            let flags = unsafe { breakpoint.GetFlags() }.unwrap_or(0);
-            // A deferred breakpoint answers `GetOffset` with an error, and one whose expression
-            // resolved to nothing answers with `DEBUG_INVALID_OFFSET`. Both mean "no address
-            // yet", and neither means address zero.
-            let address = match unsafe { breakpoint.GetOffset() } {
-                Ok(offset) if offset != DEBUG_INVALID_OFFSET => Some(offset),
-                _ => None,
-            };
-            let expression = read_engine_string(|buffer, size| unsafe {
-                breakpoint.GetOffsetExpression(buffer, size)
-            })
-            .ok()
-            .filter(|text| !text.is_empty());
-            let command =
-                read_engine_string(|buffer, size| unsafe { breakpoint.GetCommand(buffer, size) })
-                    .ok()
-                    .filter(|text| !text.is_empty());
-            let thread = unsafe { breakpoint.GetMatchThreadId() }
-                .ok()
-                .filter(|id| *id != DEBUG_ANY_ID);
-            out.push(BreakpointInfo {
-                id,
-                kind,
-                address,
-                expression,
-                command,
-                thread,
-                enabled: flags & DEBUG_BREAKPOINT_ENABLED != 0,
-                deferred: flags & DEBUG_BREAKPOINT_DEFERRED != 0,
-                one_shot: flags & DEBUG_BREAKPOINT_ONE_SHOT != 0,
-                pass_count: unsafe { breakpoint.GetPassCount() }.unwrap_or(0),
-                passes_remaining: unsafe { breakpoint.GetCurrentPassCount() }.unwrap_or(0),
-            });
+            out.push(breakpoint_info(&breakpoint, &format!("at index {index}"))?);
         }
         Ok(out)
+    }
+
+    /// Creates a breakpoint from `spec` and reports what the engine ended up holding.
+    ///
+    /// The typed half of `bp`/`ba`/`bu`. Every parameter arrives as a **parameter** rather than as
+    /// text spliced into a command line, so a caller has nothing to quote and nothing to screen:
+    /// the [command](BreakpointSpec::command) a breakpoint runs on each hit is the case that makes
+    /// this worth having, since building it as text means escaping a quoted string inside a
+    /// command whose separator is `;`.
+    ///
+    /// **Unbounded.** A [`BreakpointAt::Expression`] resolves eagerly and can therefore block on a
+    /// symbol-server fetch with the engine held; [`Self::set_breakpoint_bounded`] is the same call
+    /// with a watchdog. This one is right where the location is an address, where the module's
+    /// symbols are known to be local, or where the caller has no deadline to keep.
+    pub fn set_breakpoint(&self, spec: &BreakpointSpec) -> Result<BreakpointSet, DbgEngError> {
+        self.set_breakpoint_bounded(spec, 0)
+    }
+
+    /// [`Self::set_breakpoint`], with the location resolve bounded at `timeout_ms`.
+    ///
+    /// A zero `timeout_ms` arms nothing, which is how [`Self::set_breakpoint`] is spelled.
+    ///
+    /// The bound covers **the location step alone**, and only when the location is an
+    /// [expression](BreakpointAt::Expression): that is the one call here that can block, because
+    /// it makes the engine evaluate a symbol. Creating the breakpoint, setting its flags, its
+    /// command, its pass count and its thread are all local bookkeeping, and an address is a
+    /// number. So a watchdog around the rest would be a bound on nothing, advertising a promise
+    /// this cannot keep.
+    ///
+    /// **A break here does not fail the call**, for the reason [`BreakpointSet::cut_short`] gives:
+    /// the breakpoint exists, and an error is the shape a caller retries. What it does is leave
+    /// the location possibly unresolved — read it off the returned record rather than assuming.
+    pub fn set_breakpoint_bounded(
+        &self,
+        spec: &BreakpointSpec,
+        timeout_ms: u32,
+    ) -> Result<BreakpointSet, DbgEngError> {
+        spec.validated()?;
+        // Built before anything is created, so a bad command string fails with nothing to undo.
+        let command = spec
+            .command
+            .as_deref()
+            .map(|text| CString::new(text).map_err(|_| DbgEngError::InvalidCommand))
+            .transpose()?;
+
+        let (breakpoint, cut_short) = self.new_breakpoint(spec, timeout_ms)?;
+
+        // Under `Replace`, after the location is set and before the breakpoint is armed: the
+        // address is only known once the location has resolved, and removing the old ones while
+        // the new one is still disabled means the address is never armed twice.
+        let replaced = match spec.on_existing {
+            OnExisting::Add => Vec::new(),
+            OnExisting::Replace => {
+                let id = unsafe { breakpoint.breakpoint.GetId() }.map_err(|source| {
+                    DbgEngError::Context {
+                        operation: "reading the new breakpoint's id".into(),
+                        source,
+                    }
+                })?;
+                match unsafe { breakpoint.breakpoint.GetOffset() } {
+                    Ok(address) if address != DEBUG_INVALID_OFFSET => {
+                        self.remove_breakpoints_at(address, id)?
+                    }
+                    // Deferred, so there is no address to key on and nothing to replace. This is
+                    // the asymmetry `bp` has too: duplicates pile up exactly where the expression
+                    // does not resolve.
+                    _ => Vec::new(),
+                }
+            }
+        };
+
+        unsafe {
+            if let Some(command) = &command {
+                breakpoint
+                    .breakpoint
+                    .SetCommand(PCSTR::from_raw(command.as_ptr().cast()))
+                    .map_err(DbgEngError::BreakpointFailed)?;
+            }
+            if let Some(passes) = spec.pass_count {
+                breakpoint
+                    .breakpoint
+                    .SetPassCount(passes)
+                    .map_err(DbgEngError::BreakpointFailed)?;
+            }
+            if let Some(thread) = spec.thread {
+                breakpoint
+                    .breakpoint
+                    .SetMatchThreadId(thread)
+                    .map_err(DbgEngError::BreakpointFailed)?;
+            }
+            if let Some(watch) = spec.data {
+                breakpoint
+                    .breakpoint
+                    .SetDataParameters(watch.size, watch.access.to_engine())
+                    .map_err(DbgEngError::BreakpointFailed)?;
+            }
+            // Armed last, once everything above has landed. A breakpoint enabled before its
+            // command is set can be hit in between and *stop* the target rather than run the
+            // command — on a live target that is a halted machine where the caller asked for a
+            // log line. Every failure above therefore removes it rather than leaving a bare
+            // breakpoint where a command breakpoint was asked for.
+            if spec.flags() != 0 {
+                breakpoint
+                    .breakpoint
+                    .AddFlags(spec.flags())
+                    .map_err(DbgEngError::BreakpointFailed)?;
+            }
+        }
+
+        // Read back through the same getters `breakpoints()` uses, so what is reported is what the
+        // engine holds rather than an echo of the spec — the difference being whether the
+        // expression resolved, and to what.
+        let info = breakpoint_info(&breakpoint.breakpoint, "just set")?;
+        breakpoint.keep();
+        Ok(BreakpointSet {
+            breakpoint: info,
+            replaced,
+            cut_short,
+        })
+    }
+
+    /// Creates the breakpoint and gives it its location, bounded — the two steps that must either
+    /// both happen or leave nothing behind.
+    ///
+    /// Returns the guard **un-kept**, so every `?` from here to the end of
+    /// [`Self::set_breakpoint_bounded`] removes the half-built breakpoint rather than leaking one
+    /// into the session for a caller who was told the call failed.
+    fn new_breakpoint(
+        &self,
+        spec: &BreakpointSpec,
+        timeout_ms: u32,
+    ) -> Result<(ScopedBreakpoint<'_>, Option<Interruption>), DbgEngError> {
+        let kind = match spec.data {
+            Some(_) => DEBUG_BREAKPOINT_DATA,
+            None => DEBUG_BREAKPOINT_CODE,
+        };
+        let breakpoint = ScopedBreakpoint::new(self, kind)?;
+        let cut_short = match &spec.at {
+            BreakpointAt::Address(address) => {
+                unsafe { breakpoint.breakpoint.SetOffset(*address) }
+                    .map_err(DbgEngError::BreakpointFailed)?;
+                None
+            }
+            BreakpointAt::Expression(expression) => {
+                let text =
+                    CString::new(expression.as_str()).map_err(|_| DbgEngError::InvalidCommand)?;
+                // Same shape as `execute_command_bounded`: clear whatever was raised for an
+                // earlier operation, arm, run, then account for a break by either origin. Without
+                // the clear, a request left standing would be charged to this resolve.
+                self.interrupt_raised.store(false, Ordering::SeqCst);
+                let watchdog = (timeout_ms > 0).then(|| {
+                    let handle = self.interrupt_handle();
+                    Watchdog::arm(Duration::from_millis(u64::from(timeout_ms)), move || {
+                        let _ = handle.interrupt();
+                    })
+                });
+                let result = unsafe {
+                    breakpoint
+                        .breakpoint
+                        .SetOffsetExpression(PCSTR::from_raw(text.as_ptr().cast()))
+                };
+                let by_watchdog = watchdog.is_some_and(Watchdog::disarm);
+                let interrupted = by_watchdog | self.interrupt_raised.swap(false, Ordering::SeqCst);
+                if interrupted {
+                    // Consume a break that may still be pending, exactly as the bounded command
+                    // path does and for the same reason: the watchdog can raise one as the call
+                    // returns, and a flag left set belongs to no operation.
+                    let _ = self.interrupted();
+                }
+                // A break makes the resolve give up part-way, and the engine reports that
+                // variously — measured, `Ok(())` with the module left on export symbols. So an
+                // error is only propagated when nothing interrupted it; otherwise the breakpoint
+                // stands and the record read back below says where it ended up.
+                if !interrupted {
+                    result.map_err(DbgEngError::BreakpointFailed)?;
+                }
+                match (by_watchdog, interrupted) {
+                    (true, _) => Some(Interruption::Deadline {
+                        after_ms: timeout_ms,
+                    }),
+                    (false, true) => Some(Interruption::OnRequest),
+                    (false, false) => None,
+                }
+            }
+        };
+        Ok((breakpoint, cut_short))
+    }
+
+    /// Removes every breakpoint at `address` except `keep`, reporting the ids taken.
+    ///
+    /// The engine's list is walked by index, so the ids are collected first and removed after: a
+    /// removal renumbers the indices under a walk in progress, which would skip the entry that
+    /// moved into the slot just vacated.
+    fn remove_breakpoints_at(&self, address: u64, keep: u32) -> Result<Vec<u32>, DbgEngError> {
+        let doomed: Vec<u32> = self
+            .breakpoints()?
+            .into_iter()
+            .filter(|held| held.id != keep && held.address == Some(address))
+            .map(|held| held.id)
+            .collect();
+        for id in &doomed {
+            self.remove_breakpoint(*id)?;
+        }
+        Ok(doomed)
+    }
+
+    /// Removes the breakpoint with this id — `bc`.
+    ///
+    /// **An id names a breakpoint only while it exists.** The engine reuses the ids of removed
+    /// breakpoints, so an id stored across a removal may by then name a different breakpoint
+    /// entirely. Nothing can be checked here that would catch it — an id is the only identity a
+    /// breakpoint has — so the rule is a caller's: read an id and use it, do not keep one.
+    pub fn remove_breakpoint(&self, id: u32) -> Result<(), DbgEngError> {
+        let breakpoint = self.breakpoint_by_id(id)?;
+        unsafe { self.control.RemoveBreakpoint2(&*breakpoint) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: format!("removing breakpoint {id}"),
+                source,
+            }
+        })
+        // `breakpoint` is a `ManuallyDrop` and is deliberately not dropped: `RemoveBreakpoint2`
+        // destroys the object, so releasing it afterwards is a use-after-free. See
+        // [`ScopedBreakpoint::drop`], where that showed up as a dead host process.
+    }
+
+    /// Arms or disarms the breakpoint with this id — `be` and `bd`.
+    ///
+    /// Disabling keeps the breakpoint and its parameters; only `DEBUG_BREAKPOINT_ENABLED` moves.
+    pub fn enable_breakpoint(&self, id: u32, enabled: bool) -> Result<(), DbgEngError> {
+        let breakpoint = self.breakpoint_by_id(id)?;
+        let result = unsafe {
+            match enabled {
+                true => breakpoint.AddFlags(DEBUG_BREAKPOINT_ENABLED),
+                false => breakpoint.RemoveFlags(DEBUG_BREAKPOINT_ENABLED),
+            }
+        };
+        result.map_err(|source| DbgEngError::Context {
+            operation: format!(
+                "{} breakpoint {id}",
+                if enabled { "enabling" } else { "disabling" }
+            ),
+            source,
+        })
+    }
+
+    /// The engine's breakpoint object for `id`, borrowed.
+    ///
+    /// `ManuallyDrop` for the reason given wherever one of these is held: the engine owns the
+    /// object and hands out a borrowed interface.
+    fn breakpoint_by_id(
+        &self,
+        id: u32,
+    ) -> Result<std::mem::ManuallyDrop<IDebugBreakpoint2>, DbgEngError> {
+        let breakpoint = unsafe { self.control.GetBreakpointById2(id) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: format!("looking up breakpoint {id}"),
+                source,
+            }
+        })?;
+        Ok(std::mem::ManuallyDrop::new(breakpoint))
     }
 
     /// Ensures the engine breaks at the initial (loader) breakpoint. A bare
@@ -4046,37 +4548,102 @@ impl windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbac
     }
 }
 
-/// A breakpoint owned by a single operation and removed when that operation ends —
+/// Reads one breakpoint's every field through the getters, for [`DebugEngine::breakpoints`] and
+/// for the read-back at the end of [`DebugEngine::set_breakpoint_bounded`].
+///
+/// One function rather than two so a setter cannot report a breakpoint in a shape the lister would
+/// never produce. `where` names the breakpoint in an error — an index for a walk, "just set" for
+/// the read-back — since a failure here has no id to quote yet.
+fn breakpoint_info(
+    breakpoint: &IDebugBreakpoint2,
+    location: &str,
+) -> Result<BreakpointInfo, DbgEngError> {
+    let id = unsafe { breakpoint.GetId() }.map_err(|source| DbgEngError::Context {
+        operation: format!("reading the id of breakpoint {location}"),
+        source,
+    })?;
+    let mut kind = 0u32;
+    let mut _processor = 0u32;
+    let kind = match unsafe { breakpoint.GetType(&mut kind, &mut _processor) } {
+        Ok(()) => BreakpointKind::from_engine(kind),
+        Err(_) => BreakpointKind::Other(DEBUG_ANY_ID),
+    };
+    let flags = unsafe { breakpoint.GetFlags() }.unwrap_or(0);
+    // A deferred breakpoint answers `GetOffset` with an error, and one whose expression resolved
+    // to nothing answers with `DEBUG_INVALID_OFFSET`. Both mean "no address yet", and neither
+    // means address zero.
+    let address = match unsafe { breakpoint.GetOffset() } {
+        Ok(offset) if offset != DEBUG_INVALID_OFFSET => Some(offset),
+        _ => None,
+    };
+    let expression =
+        read_engine_string(|buffer, size| unsafe { breakpoint.GetOffsetExpression(buffer, size) })
+            .ok()
+            .filter(|text| !text.is_empty());
+    let command = read_engine_string(|buffer, size| unsafe { breakpoint.GetCommand(buffer, size) })
+        .ok()
+        .filter(|text| !text.is_empty());
+    let thread = unsafe { breakpoint.GetMatchThreadId() }
+        .ok()
+        .filter(|id| *id != DEBUG_ANY_ID);
+    Ok(BreakpointInfo {
+        id,
+        kind,
+        address,
+        expression,
+        command,
+        thread,
+        enabled: flags & DEBUG_BREAKPOINT_ENABLED != 0,
+        deferred: flags & DEBUG_BREAKPOINT_DEFERRED != 0,
+        one_shot: flags & DEBUG_BREAKPOINT_ONE_SHOT != 0,
+        pass_count: unsafe { breakpoint.GetPassCount() }.unwrap_or(0),
+        passes_remaining: unsafe { breakpoint.GetCurrentPassCount() }.unwrap_or(0),
+    })
+}
+
+/// A breakpoint that is removed when this guard drops, unless [`Self::keep`] has said otherwise —
 /// on success, on an early `?`, and on an unwind alike.
 ///
-/// [`DebugEngine::run_to_address`] previously drove execution with WinDbg's one-shot
-/// `g <addr>`, which DbgEng clears only when the breakpoint is *hit* and for which it hands
-/// back no handle. Every other outcome therefore left it armed and unremovable, and a later
-/// unrelated `g` passing `address` could stop there spuriously. Owning the handle is what
-/// makes cleanup possible at all.
+/// **One lifetime story for every breakpoint this crate creates**, which is the point of it being
+/// the only wrapper left. Two used to disagree: this one removed on drop, and a public
+/// `Breakpoint` did not remove at all unless a caller remembered to, having first handed them a
+/// breakpoint that was disabled and pointed at address zero. Everything a caller keeps is now
+/// named by **id** instead ([`DebugEngine::remove_breakpoint`],
+/// [`DebugEngine::enable_breakpoint`]), which is what `bc`/`be`/`bd` take and what
+/// [`BreakpointInfo`] already reports — and an id cannot dangle.
 ///
-/// Distinct from [`Breakpoint`], which is a caller-managed handle with explicit
-/// `enable`/`disable`/`remove` and no `Drop`.
+/// The two uses are opposite and both wanted. [`DebugEngine::run_to_address`] takes one and lets
+/// it drop, because a breakpoint that outlived that call would stop a later unrelated `g`;
+/// [`DebugEngine::set_breakpoint_bounded`] builds one and keeps it, because the caller asked for a
+/// breakpoint. What they share is that a failure part-way through configuration removes it, rather
+/// than leaving a half-built breakpoint in a session whose caller was told the call failed.
 struct ScopedBreakpoint<'a> {
     control: &'a IDebugControl4,
     breakpoint: std::mem::ManuallyDrop<IDebugBreakpoint2>,
+    /// Set by [`Self::keep`] once the breakpoint is fully configured and belongs to the caller.
+    keep: bool,
 }
 
 impl<'a> ScopedBreakpoint<'a> {
-    /// Adds an enabled code breakpoint at `address`.
-    fn at(engine: &'a DebugEngine, address: u64) -> Result<Self, DbgEngError> {
-        let breakpoint = unsafe {
-            engine
-                .control
-                .AddBreakpoint2(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)
-        }
-        .map_err(DbgEngError::BreakpointFailed)?;
-        // Wrapped before it is configured, so a failure below still removes it rather than
-        // leaking a half-built breakpoint into the session.
-        let scoped = Self {
+    /// Creates an unconfigured breakpoint of `kind`, already guarded.
+    ///
+    /// It is created **disabled and at address zero** — the engine's documented initial state, not
+    /// a choice made here — so every caller has to give it a location before it means anything,
+    /// and arming it is the last step rather than the first.
+    fn new(engine: &'a DebugEngine, kind: u32) -> Result<Self, DbgEngError> {
+        let breakpoint = unsafe { engine.control.AddBreakpoint2(kind, DEBUG_ANY_ID) }
+            .map_err(DbgEngError::BreakpointFailed)?;
+        // Wrapped before it is configured, so a failure below still removes it.
+        Ok(Self {
             control: &engine.control,
             breakpoint: std::mem::ManuallyDrop::new(breakpoint),
-        };
+            keep: false,
+        })
+    }
+
+    /// Adds an enabled code breakpoint at `address`, removed when the guard drops.
+    fn at(engine: &'a DebugEngine, address: u64) -> Result<Self, DbgEngError> {
+        let scoped = Self::new(engine, DEBUG_BREAKPOINT_CODE)?;
         unsafe {
             scoped
                 .breakpoint
@@ -4089,82 +4656,28 @@ impl<'a> ScopedBreakpoint<'a> {
         }
         Ok(scoped)
     }
+
+    /// Hands the breakpoint to the session: it survives this guard's drop.
+    fn keep(mut self) {
+        self.keep = true;
+    }
 }
 
 impl Drop for ScopedBreakpoint<'_> {
     fn drop(&mut self) {
-        // Best-effort: a failure here has nowhere to go, and this runs on unwind paths where
-        // panicking would abort the process.
-        unsafe {
-            let _ = self.control.RemoveBreakpoint2(&*self.breakpoint);
+        if !self.keep {
+            // Best-effort: a failure here has nowhere to go, and this runs on unwind paths where
+            // panicking would abort the process.
+            unsafe {
+                let _ = self.control.RemoveBreakpoint2(&*self.breakpoint);
+            }
         }
-        // `breakpoint` is deliberately not dropped. DbgEng owns breakpoint objects and
-        // `RemoveBreakpoint2` destroys this one, so letting the generated wrapper `Release()`
-        // it afterwards dereferences freed memory — observed as an access violation that took
-        // down the host process, not as an error return. `ManuallyDrop` is what stops that.
-    }
-}
-
-pub struct Breakpoint<'a> {
-    control: &'a IDebugControl4,
-    /// Never released by this wrapper: DbgEng owns breakpoint objects, and [`Self::remove`]
-    /// destroys this one, so a `Release()` afterwards would be a use-after-free. See
-    /// [`ScopedBreakpoint`], where the same hazard showed up as a host-process crash.
-    breakpoint: std::mem::ManuallyDrop<IDebugBreakpoint>,
-}
-
-impl<'a> Breakpoint<'a> {
-    pub fn new(engine: &'a DebugEngine) -> Result<Self, DbgEngError> {
-        let breakpoint = unsafe {
-            engine
-                .control
-                .AddBreakpoint(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)
-        };
-
-        if breakpoint.is_err() {
-            return Err(DbgEngError::BreakpointFailed(breakpoint.err().unwrap()));
-        }
-
-        Ok(Self {
-            breakpoint: std::mem::ManuallyDrop::new(breakpoint.unwrap()),
-            control: &engine.control,
-        })
-    }
-
-    pub fn set_offset_expression(&self, expression: &str) -> Result<(), DbgEngError> {
-        // Mirror execute_command: return an error on malformed input rather than panic.
-        let expr = CString::new(expression).map_err(|_| DbgEngError::InvalidCommand)?;
-
-        unsafe {
-            self.breakpoint
-                .SetOffsetExpression(PCSTR::from_raw(expr.as_ptr() as *const u8))
-                .map_err(DbgEngError::BreakpointFailed)?;
-        }
-        Ok(())
-    }
-
-    pub fn enable(&self) {
-        unsafe {
-            self.breakpoint
-                .AddFlags(DEBUG_BREAKPOINT_ENABLED)
-                .expect("[-] Failed to set breakpoint offset");
-        }
-    }
-
-    pub fn disable(&self) {
-        unsafe {
-            self.breakpoint
-                .RemoveFlags(DEBUG_BREAKPOINT_ENABLED)
-                .expect("[-] Failed to remove breakpoint offset");
-        }
-    }
-
-    pub fn remove(&self) {
-        unsafe {
-            self.control
-                .RemoveBreakpoint(&*self.breakpoint)
-                .expect("[-] Failed to remove breakpoint");
-        }
+        // `breakpoint` is deliberately not dropped, on **either** path. DbgEng owns breakpoint
+        // objects and hands out borrowed interfaces, so releasing one is a call on an object this
+        // code does not own — and where `RemoveBreakpoint2` has just destroyed it, letting the
+        // generated wrapper `Release()` it afterwards dereferences freed memory, observed as an
+        // access violation that took down the host process rather than as an error return.
+        // `ManuallyDrop` is what stops both.
     }
 }
 
@@ -4177,6 +4690,135 @@ mod tests {
     };
 
     use super::*;
+
+    /// A spec is born **armed**, which is the opposite of what the engine does and the whole
+    /// reason this type exists.
+    ///
+    /// `AddBreakpoint2` yields a breakpoint that is disabled *and* sitting at address zero — the
+    /// documented initial state — so the wrapper this replaced handed callers a breakpoint on the
+    /// null page that never fired, and its `enable` was one of three methods that panicked. A
+    /// caller wanting the engine's default asks for it by name.
+    #[test]
+    fn test_a_code_breakpoint_spec_is_armed_and_adds_rather_than_replaces() {
+        let spec = BreakpointSpec::code(BreakpointAt::Address(0x1000));
+        assert!(spec.enabled);
+        assert!(!spec.one_shot);
+        assert_eq!(spec.data, None);
+        assert_eq!(spec.on_existing, OnExisting::Add);
+        assert_eq!(spec.flags(), DEBUG_BREAKPOINT_ENABLED);
+
+        let disabled = BreakpointSpec::code(BreakpointAt::Address(0x1000)).disabled();
+        assert_eq!(disabled.flags(), 0);
+    }
+
+    /// `DEBUG_BREAKPOINT_DEFERRED` is the engine's to set and no spec may send it.
+    ///
+    /// The flag says an expression would not evaluate, and the documentation is explicit that it
+    /// "cannot be modified by any client" — so it is read back on [`BreakpointInfo`] and is
+    /// deliberately absent from [`BreakpointSpec`]. This pins the bits that *are* sent, so a flag
+    /// added to `flags()` later has to be a deliberate edit here too.
+    #[test]
+    fn test_a_spec_sends_only_the_two_flags_a_client_owns() {
+        let spec = BreakpointSpec::code(BreakpointAt::Expression("nt!Foo".into())).one_shot();
+        assert_eq!(
+            spec.flags(),
+            DEBUG_BREAKPOINT_ENABLED | DEBUG_BREAKPOINT_ONE_SHOT
+        );
+        assert_eq!(spec.flags() & DEBUG_BREAKPOINT_DEFERRED, 0);
+    }
+
+    /// The builder narrows a code spec into a data one without losing the rest of it.
+    ///
+    /// `data` is `Some` exactly when the breakpoint is a processor breakpoint, which is why the
+    /// kind is not a field of its own: there is no way to spell a data breakpoint with no watched
+    /// region, or a code one with a size.
+    #[test]
+    fn test_a_data_spec_keeps_the_code_defaults_and_carries_its_watch() {
+        let watch = DataWatch {
+            access: DataAccess::Write,
+            size: 8,
+        };
+        let spec = BreakpointSpec::data(BreakpointAt::Address(0x2000), watch)
+            .with_command(".echo hit; gc")
+            .on_thread(7)
+            .with_pass_count(3)
+            .replacing_existing();
+        assert_eq!(spec.data, Some(watch));
+        assert!(spec.enabled);
+        assert_eq!(spec.command.as_deref(), Some(".echo hit; gc"));
+        assert_eq!(spec.thread, Some(7));
+        assert_eq!(spec.pass_count, Some(3));
+        assert_eq!(spec.on_existing, OnExisting::Replace);
+    }
+
+    /// `Read` is not silently widened to `Read | Write`.
+    ///
+    /// It *behaves* as both on x86 and x64, which is a fact about those processors rather than
+    /// about this mapping — so the engine is told what the caller said and the widening is left
+    /// where it belongs. Folding the two here would make `Read` and `ReadWrite` indistinguishable
+    /// on an architecture that honours the difference.
+    #[test]
+    fn test_each_data_access_maps_to_its_own_engine_flags() {
+        assert_eq!(DataAccess::Read.to_engine(), DEBUG_BREAK_READ);
+        assert_eq!(DataAccess::Write.to_engine(), DEBUG_BREAK_WRITE);
+        assert_eq!(
+            DataAccess::ReadWrite.to_engine(),
+            DEBUG_BREAK_READ | DEBUG_BREAK_WRITE
+        );
+        assert_eq!(DataAccess::Execute.to_engine(), DEBUG_BREAK_EXECUTE);
+        assert_eq!(DataAccess::Io.to_engine(), DEBUG_BREAK_IO);
+        assert_ne!(
+            DataAccess::Read.to_engine(),
+            DataAccess::ReadWrite.to_engine()
+        );
+    }
+
+    /// A processor breakpoint's size and alignment are refused *here*, before one exists.
+    ///
+    /// The engine accepts a bad pair at the set and rejects it when the target is resumed, so
+    /// leaving it to the engine reports the mistake against a `go` that did nothing wrong. A code
+    /// breakpoint has neither constraint and is never refused for them.
+    #[test]
+    fn test_a_data_breakpoint_is_refused_for_a_bad_size_or_alignment() {
+        let watch = |size| DataWatch {
+            access: DataAccess::ReadWrite,
+            size,
+        };
+        for size in [0, 3, 5, 16] {
+            assert!(
+                BreakpointSpec::data(BreakpointAt::Address(0x1000), watch(size))
+                    .validated()
+                    .is_err(),
+                "a {size}-byte data breakpoint should be refused"
+            );
+        }
+        for size in [1, 2, 4, 8] {
+            assert!(
+                BreakpointSpec::data(BreakpointAt::Address(0x1000), watch(size))
+                    .validated()
+                    .is_ok(),
+                "a {size}-byte data breakpoint at an aligned address should be accepted"
+            );
+        }
+        assert!(
+            BreakpointSpec::data(BreakpointAt::Address(0x1004), watch(8))
+                .validated()
+                .is_err()
+        );
+        // An expression's address is not known until the engine resolves it, so alignment is not
+        // judged here — refusing it would refuse specs that are fine.
+        assert!(
+            BreakpointSpec::data(BreakpointAt::Expression("nt!Foo+1".into()), watch(8))
+                .validated()
+                .is_ok()
+        );
+        // A code breakpoint has no size and no alignment rule, at any address.
+        assert!(
+            BreakpointSpec::code(BreakpointAt::Address(0x1001))
+                .validated()
+                .is_ok()
+        );
+    }
 
     /// The spelling a symbol server path uses, which is **not** the braced, dashed form `Debug`
     /// prints and not a byte-order-preserving dump either: the first three fields are written as

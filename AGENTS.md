@@ -15,6 +15,7 @@ The crate is Windows-only in practice: most modules use the `windows` crate dire
 - `cargo test`: standard fallback test runner.
 - `cargo miri test --verbose`: nightly/Miri check for unsafe-code issues. CI runs it on merges to `main`, weekly, and on demand — **not on pull requests** (see `.github/workflows/miri.yml`), so run it yourself when a change touches unsafe code.
 - `cargo run --example kdtest -- "<kd connection>"`: run the kernel-debugging smoke test.
+- `cargo run --example breakpoint_probe -- all`: re-validate the breakpoint API against a real engine. Copy the engine DLLs into `target/debug/examples/` first — an example loads from its own directory, so otherwise it gets System32's `dbgeng.dll` and silently measures the wrong thing.
 
 There is no build script and no assembler step; both left with the exploitation half of this crate.
 
