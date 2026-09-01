@@ -6,8 +6,58 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Breakpoints can be **set**, not only listed. `DebugEngine::set_breakpoint` and
+  `set_breakpoint_bounded` take a `BreakpointSpec` — a location (`BreakpointAt::Address` or
+  `::Expression`), an optional command, match thread, pass count, one-shot flag, and a `DataWatch`
+  that makes it a data breakpoint (`ba`) — and answer with a `BreakpointSet` carrying the new
+  breakpoint **as the engine holds it**, read back through the same getters `breakpoints()` uses.
+  `remove_breakpoint` and `enable_breakpoint` take an id, as `bc`/`be`/`bd` do. Previously the only
+  write path was the `execute` text hatch, so a caller building `bp <expr> "<command>"` had to
+  escape a quoted string inside a `;`-separated command line and then screen the operand for both
+  characters; a command now arrives as a parameter, and `examples/breakpoint_probe.rs` checks that
+  one containing both survives byte-identical.
+- `set_breakpoint_bounded` bounds the **location resolve**, the one step that can block: a symbolic
+  location is evaluated eagerly, so on a module whose PDB is not local it is a symbol-server fetch
+  with the engine held. Measured on dbgeng 10.0.29547.1002 — 2445 ms for a cold
+  `KERNELBASE!CreateFileW` against an empty store, 151 ms warm, 0 ms for an address, and 0 ms to
+  defer when the module is absent. `SetInterrupt` reaches it, so the bound is real; and because a
+  break is otherwise **silent** — it returns `Ok` with a breakpoint, having abandoned the symbol
+  load and left the module on export symbols for the rest of the session — the result carries
+  `cut_short` rather than being a bare `Result<(), _>`.
+- `OnExisting` says what to do about breakpoints already at the resolved address. The engine
+  deduplicates nothing: three typed sets on one address leave three breakpoints. What deduplicates
+  is the command layer — `bp` and `bu` resolve and then remove whatever is there, printing
+  `breakpoint N redefined` — keyed by the resolved address, so a *deferred* expression duplicates
+  freely. `OnExisting::Replace` reproduces that as a value, reporting the removed ids as
+  `BreakpointSet::replaced`; `Add` is the default, since a primitive should not destroy what the
+  caller did not name. Worth choosing deliberately: duplicates at one address stop the target
+  **once** but activate every breakpoint there, so each one's command runs, and removing one by id
+  leaves the address armed by the others.
+- `examples/breakpoint_probe.rs`, the record behind all of the above.
+
+### Removed
+
+- The public `Breakpoint<'a>` type, which had no caller in `src/` or `examples/` and was a trap for
+  anyone who found it: built on the v1 `IDebugBreakpoint` where the read path uses v2, offering no
+  setter but `set_offset_expression`, and panicking in three of its four methods — `enable`'s
+  message was a copy of `set_offset_expression`'s. A breakpoint is created *disabled and at address
+  zero*, so its documented use left a breakpoint on the null page that never fired, and the method
+  that would have armed it was one of the three that panicked. Superseded by `set_breakpoint` and
+  the id-taking `remove_breakpoint`/`enable_breakpoint`; the private `ScopedBreakpoint` is now the
+  only wrapper over a raw breakpoint object, so there is one answer to who removes a breakpoint and
+  when rather than two that disagreed.
+
 ### Fixed
 
+- `BreakpointInfo::expression`'s documentation described only what `bp` does. A breakpoint whose
+  location was set through `SetOffsetExpression` **keeps** its expression beside a resolved address,
+  where one set by `bp` has the text discarded once it resolves — so `None` there is not the
+  universal case for a live breakpoint. `deferred` is the field that answers whether a breakpoint
+  has an address yet.
+- `breakpoints()` reads through `GetBreakpointByIndex2`, putting the whole breakpoint path on
+  `IDebugBreakpoint2` rather than mixing the two interface versions.
 - `examples/session_fuzz.rs` no longer forces its seed odd, which had silently halved what
   `--seed` can name: `Rng::new` did `seed | 1`, so `42` and `43` were one run and `6` and `7` were
   one run. The flag exists so a failing sequence can be reproduced and then *varied*, and a seed
