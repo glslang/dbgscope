@@ -928,11 +928,14 @@ pub enum OnExisting {
     /// A location that does not resolve replaces nothing, there being no address to compare:
     /// `replaced` comes back empty and [`BreakpointInfo::deferred`] says why.
     ///
-    /// **Nothing is removed until the replacement is complete**, which is a property of *when* it
-    /// happens rather than of this flag: the removal sits between the last of the new breakpoint's
-    /// setters and the arming. A call that fails part-way — a thread id the engine refuses, say —
-    /// therefore leaves the caller's existing breakpoints alone, rather than handing them an error
-    /// and an address they had already lost.
+    /// **Nothing is removed unless the replacement succeeds**, which is a property of *when* the
+    /// removal happens rather than of this flag: it is the last thing the call does, after every
+    /// step that can fail. A call that fails part-way — a thread id the engine refuses, an
+    /// unresolvable expression, a location the engine will not take — leaves the caller's existing
+    /// breakpoints exactly as they were, rather than handing them an error and an address they had
+    /// already lost.
+    ///
+    /// [`BreakpointSet::replaced`] reports what was actually removed, not what was intended.
     Replace,
 }
 
@@ -1101,6 +1104,11 @@ pub struct BreakpointSet {
     pub breakpoint: BreakpointInfo,
     /// Ids removed to make room, under [`OnExisting::Replace`]. Empty under [`OnExisting::Add`],
     /// and empty when the location did not resolve.
+    ///
+    /// What was **actually** removed. The removal runs after the new breakpoint is armed and is
+    /// deliberately best-effort, so one the engine would not give up is absent here and still
+    /// present in [`DebugEngine::breakpoints`] — reported by omission rather than by failing a call
+    /// whose breakpoint is already set.
     pub replaced: Vec<u32>,
     /// `None` when the whole set ran to completion.
     ///
@@ -3874,35 +3882,8 @@ impl DebugEngine {
             }
         }
 
-        // **Between the last setter and the arming**, which is the only window where replacing is
-        // not destructive. Everything above can still fail — a thread id the engine refuses, a
-        // pass count it will not take — and a failure there removes the new breakpoint and returns
-        // `Err`; done any earlier, that leaves a caller with an error *and* the breakpoints they
-        // had already destroyed. Done here, nothing is taken until the replacement is complete and
-        // certain to be armed.
-        //
-        // Still before the arming, so the address is never armed twice, and still after the
-        // location, since a resolved address is the only thing there is to key on.
-        let replaced = match spec.on_existing {
-            OnExisting::Add => Vec::new(),
-            // Deferred resolves to `None` above, so there is nothing to replace — the asymmetry
-            // `bp` has too: duplicates pile up exactly where the expression does not resolve.
-            OnExisting::Replace => match resolved {
-                Some(address) => {
-                    let id = unsafe { breakpoint.breakpoint.GetId() }.map_err(|source| {
-                        DbgEngError::Context {
-                            operation: "reading the new breakpoint's id".into(),
-                            source,
-                        }
-                    })?;
-                    self.remove_breakpoints_at(address, id)?
-                }
-                None => Vec::new(),
-            },
-        };
-
-        // Armed last, once everything above has landed. A breakpoint enabled before its command is
-        // set can be hit in between and *stop* the target rather than run the command — on a live
+        // Armed once everything above has landed. A breakpoint enabled before its command is set
+        // can be hit in between and *stop* the target rather than run the command — on a live
         // target that is a halted machine where the caller asked for a log line. Every failure
         // above therefore removes it rather than leaving a bare breakpoint where a command
         // breakpoint was asked for.
@@ -3910,6 +3891,38 @@ impl DebugEngine {
             unsafe { breakpoint.breakpoint.AddFlags(spec.flags()) }
                 .map_err(DbgEngError::BreakpointFailed)?;
         }
+
+        // **Last, after every step that can fail** — which is what makes replacing safe rather than
+        // where in the middle it is least unsafe. Review found the caller's breakpoints destroyed
+        // by a later failure three times, at three different positions for this block, because each
+        // fix moved it past one fallible step and left the next one behind it. There is no position
+        // in the middle that works: the property wanted is "nothing is destroyed unless the
+        // replacement is certain", and only the end of the sequence has that.
+        //
+        // What that gives up is the ordering's original reason — that the address is never armed
+        // twice — and it is worth less than it sounds. The window is between `AddFlags` and this
+        // block, and the engine is not pumping in it: nothing here resumes the target, and a
+        // `DebugEngine` drives one engine from one thread, so the target cannot execute between
+        // those two statements. An unobservable double-arm against a caller permanently losing
+        // breakpoints is not a close trade.
+        //
+        // Best-effort, and `replaced` reports what was actually taken rather than what was
+        // intended. A failure here cannot be raised: the mutation this call exists for has
+        // *happened*, it is armed, and reporting a cleanup failure as the call failing is what
+        // gets a caller to retry and set a second breakpoint — the same rule the openers follow
+        // when a post-commit step fails. One that could not be removed is simply still in
+        // `breakpoints()` and absent from `replaced`, where the caller can see it.
+        let replaced = match (spec.on_existing, resolved) {
+            // Deferred resolves to `None`, so there is nothing to replace — the asymmetry `bp` has
+            // too: duplicates pile up exactly where the expression does not resolve.
+            (OnExisting::Replace, Some(address)) => {
+                match unsafe { breakpoint.breakpoint.GetId() } {
+                    Ok(id) => self.remove_breakpoints_at(address, id),
+                    Err(_) => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        };
 
         // Read back through the same getters `breakpoints()` uses, so what is reported is what the
         // engine holds rather than an echo of the spec — the difference being whether the
@@ -3990,22 +4003,26 @@ impl DebugEngine {
         Ok((breakpoint, cut_short))
     }
 
-    /// Removes every breakpoint at `address` except `keep`, reporting the ids taken.
+    /// Removes every breakpoint at `address` except `keep`, reporting the ids actually taken.
     ///
     /// The engine's list is walked by index, so the ids are collected first and removed after: a
     /// removal renumbers the indices under a walk in progress, which would skip the entry that
     /// moved into the slot just vacated.
-    fn remove_breakpoints_at(&self, address: u64, keep: u32) -> Result<Vec<u32>, DbgEngError> {
-        let doomed: Vec<u32> = self
-            .breakpoints()?
-            .into_iter()
+    ///
+    /// **Best-effort, and it reports rather than raises**, because its one caller runs it after the
+    /// mutation it exists for has already happened and been armed — see the comment there. A list
+    /// that cannot be read means nothing is removed and nothing is claimed; a breakpoint that
+    /// cannot be removed is left out of the return, so it stays visible in [`Self::breakpoints`]
+    /// instead of being reported as gone.
+    fn remove_breakpoints_at(&self, address: u64, keep: u32) -> Vec<u32> {
+        let Ok(held) = self.breakpoints() else {
+            return Vec::new();
+        };
+        held.into_iter()
             .filter(|held| held.id != keep && held.address == Some(address))
             .map(|held| held.id)
-            .collect();
-        for id in &doomed {
-            self.remove_breakpoint(*id)?;
-        }
-        Ok(doomed)
+            .filter(|id| self.remove_breakpoint(*id).is_ok())
+            .collect()
     }
 
     /// Removes the breakpoint with this id — `bc`.
