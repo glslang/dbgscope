@@ -34,7 +34,9 @@ All notable changes to this project are documented here. The format follows
   `BreakpointSet::replaced`; `Add` is the default, since a primitive should not destroy what the
   caller did not name. Worth choosing deliberately: duplicates at one address stop the target
   **once** but activate every breakpoint there, so each one's command runs, and removing one by id
-  leaves the address armed by the others.
+  leaves the address armed by the others. Nothing is removed until the replacement is fully
+  configured and certain to be armed, so a call that fails part-way leaves the caller's existing
+  breakpoints alone rather than handing them an error and an address they had already lost.
 - `examples/breakpoint_probe.rs`, the record behind all of the above.
 
 ### Removed

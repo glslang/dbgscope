@@ -867,10 +867,15 @@ pub struct DataWatch {
     pub access: DataAccess,
     /// 1, 2, 4 or 8 bytes on x64; 1, 2 or 4 on x86. The address must be a multiple of it.
     ///
-    /// Checked before the engine is asked ([`DebugEngine::set_breakpoint`]) rather than left to
-    /// it, because a processor breakpoint whose size or alignment is wrong is refused when the
-    /// target is **resumed** — so the engine's complaint arrives detached from the call that
-    /// caused it, against a debug register nobody has looked at.
+    /// Both are refused by [`DebugEngine::set_breakpoint`] rather than left to the engine, because
+    /// a processor breakpoint whose size or alignment is wrong is refused when the target is
+    /// **resumed** — so the engine's complaint arrives detached from the call that caused it,
+    /// against a debug register nobody has looked at.
+    ///
+    /// The alignment is judged on the **resolved** address, so an expression is checked once the
+    /// engine has evaluated it rather than waved through. The one case that cannot be checked is a
+    /// [deferred](BreakpointInfo::deferred) data breakpoint, which the engine resolves on a later
+    /// module load with nothing of this crate's on the stack to see the result.
     pub size: u32,
 }
 
@@ -901,6 +906,12 @@ pub enum OnExisting {
     ///
     /// A location that does not resolve replaces nothing, there being no address to compare:
     /// `replaced` comes back empty and [`BreakpointInfo::deferred`] says why.
+    ///
+    /// **Nothing is removed until the replacement is complete**, which is a property of *when* it
+    /// happens rather than of this flag: the removal sits between the last of the new breakpoint's
+    /// setters and the arming. A call that fails part-way — a thread id the engine refuses, say —
+    /// therefore leaves the caller's existing breakpoints alone, rather than handing them an error
+    /// and an address they had already lost.
     Replace,
 }
 
@@ -1001,9 +1012,10 @@ impl BreakpointSpec {
     /// and refuses it when the target is **resumed**, so the error arrives against a `go` that did
     /// nothing wrong, naming a debug register rather than the call that armed it.
     ///
-    /// The size is checked for both location kinds; the alignment only for
-    /// [`BreakpointAt::Address`], since an expression's address is not known until the engine
-    /// resolves it and guessing at one here would refuse specs that are fine.
+    /// The size is checked for both location kinds. The alignment can only be checked here for
+    /// [`BreakpointAt::Address`], an expression having no address until the engine resolves it —
+    /// so [`DebugEngine::set_breakpoint_bounded`] checks it **again** on the resolved offset, which
+    /// is where `ba` on `nt!Foo+1` is caught. This is half of that rule rather than all of it.
     ///
     /// 8 bytes is accepted on every target, including a 32-bit one where the engine will refuse
     /// it: this crate does not know the target's pointer width without an engine, and a rule
@@ -3775,29 +3787,27 @@ impl DebugEngine {
 
         let (breakpoint, cut_short) = self.new_breakpoint(spec, timeout_ms)?;
 
-        // Under `Replace`, after the location is set and before the breakpoint is armed: the
-        // address is only known once the location has resolved, and removing the old ones while
-        // the new one is still disabled means the address is never armed twice.
-        let replaced = match spec.on_existing {
-            OnExisting::Add => Vec::new(),
-            OnExisting::Replace => {
-                let id = unsafe { breakpoint.breakpoint.GetId() }.map_err(|source| {
-                    DbgEngError::Context {
-                        operation: "reading the new breakpoint's id".into(),
-                        source,
-                    }
-                })?;
-                match unsafe { breakpoint.breakpoint.GetOffset() } {
-                    Ok(address) if address != DEBUG_INVALID_OFFSET => {
-                        self.remove_breakpoints_at(address, id)?
-                    }
-                    // Deferred, so there is no address to key on and nothing to replace. This is
-                    // the asymmetry `bp` has too: duplicates pile up exactly where the expression
-                    // does not resolve.
-                    _ => Vec::new(),
-                }
-            }
+        // Where the location resolved, that is the first point an *expression*'s address exists —
+        // so it is where a data breakpoint's alignment is judged. `validated()` above can only
+        // check an address the caller supplied, and skipping the check here would let
+        // `ba` on `nt!Foo+1` with an 8-byte watch through: accepted now, refused at the next
+        // resume, which is the delayed failure both checks exist to prevent.
+        //
+        // A **deferred** data breakpoint keeps the gap and cannot close it: the engine resolves it
+        // on a later module load, with nothing of this crate's on the stack to check the result.
+        let resolved = match unsafe { breakpoint.breakpoint.GetOffset() } {
+            Ok(address) if address != DEBUG_INVALID_OFFSET => Some(address),
+            _ => None,
         };
+        if let (Some(watch), Some(address)) = (spec.data, resolved)
+            && !address.is_multiple_of(u64::from(watch.size))
+        {
+            return Err(DbgEngError::InvalidBreakpoint(format!(
+                "a {}-byte data breakpoint must be {}-byte aligned, and this location resolved to \
+                 {address:#x}, which is not",
+                watch.size, watch.size
+            )));
+        }
 
         unsafe {
             if let Some(command) = &command {
@@ -3824,17 +3834,43 @@ impl DebugEngine {
                     .SetDataParameters(watch.size, watch.access.to_engine())
                     .map_err(DbgEngError::BreakpointFailed)?;
             }
-            // Armed last, once everything above has landed. A breakpoint enabled before its
-            // command is set can be hit in between and *stop* the target rather than run the
-            // command — on a live target that is a halted machine where the caller asked for a
-            // log line. Every failure above therefore removes it rather than leaving a bare
-            // breakpoint where a command breakpoint was asked for.
-            if spec.flags() != 0 {
-                breakpoint
-                    .breakpoint
-                    .AddFlags(spec.flags())
-                    .map_err(DbgEngError::BreakpointFailed)?;
-            }
+        }
+
+        // **Between the last setter and the arming**, which is the only window where replacing is
+        // not destructive. Everything above can still fail — a thread id the engine refuses, a
+        // pass count it will not take — and a failure there removes the new breakpoint and returns
+        // `Err`; done any earlier, that leaves a caller with an error *and* the breakpoints they
+        // had already destroyed. Done here, nothing is taken until the replacement is complete and
+        // certain to be armed.
+        //
+        // Still before the arming, so the address is never armed twice, and still after the
+        // location, since a resolved address is the only thing there is to key on.
+        let replaced = match spec.on_existing {
+            OnExisting::Add => Vec::new(),
+            // Deferred resolves to `None` above, so there is nothing to replace — the asymmetry
+            // `bp` has too: duplicates pile up exactly where the expression does not resolve.
+            OnExisting::Replace => match resolved {
+                Some(address) => {
+                    let id = unsafe { breakpoint.breakpoint.GetId() }.map_err(|source| {
+                        DbgEngError::Context {
+                            operation: "reading the new breakpoint's id".into(),
+                            source,
+                        }
+                    })?;
+                    self.remove_breakpoints_at(address, id)?
+                }
+                None => Vec::new(),
+            },
+        };
+
+        // Armed last, once everything above has landed. A breakpoint enabled before its command is
+        // set can be hit in between and *stop* the target rather than run the command — on a live
+        // target that is a halted machine where the caller asked for a log line. Every failure
+        // above therefore removes it rather than leaving a bare breakpoint where a command
+        // breakpoint was asked for.
+        if spec.flags() != 0 {
+            unsafe { breakpoint.breakpoint.AddFlags(spec.flags()) }
+                .map_err(DbgEngError::BreakpointFailed)?;
         }
 
         // Read back through the same getters `breakpoints()` uses, so what is reported is what the
@@ -4805,8 +4841,9 @@ mod tests {
                 .validated()
                 .is_err()
         );
-        // An expression's address is not known until the engine resolves it, so alignment is not
-        // judged here — refusing it would refuse specs that are fine.
+        // An expression has no address until the engine resolves it, so alignment cannot be judged
+        // *here* — `set_breakpoint_bounded` checks it again on the resolved offset, which is where
+        // this one is caught. Refusing it here would refuse specs that are fine.
         assert!(
             BreakpointSpec::data(BreakpointAt::Expression("nt!Foo+1".into()), watch(8))
                 .validated()

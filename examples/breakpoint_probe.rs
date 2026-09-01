@@ -415,6 +415,17 @@ fn data(engine: &DebugEngine, _symbol: &str) {
             "an unaligned 8-byte watch",
             BreakpointSpec::data(BreakpointAt::Address(address | 1), watch),
         ),
+        (
+            // The one the caller-supplied check cannot see: the address only exists once the
+            // engine has evaluated the expression, so this is caught on the *resolved* offset. Left
+            // unchecked it is accepted here and refused at the next resume, against a `go` that did
+            // nothing wrong.
+            "an unaligned 8-byte watch reached through an expression",
+            BreakpointSpec::data(
+                BreakpointAt::Expression("ntdll!NtCreateFile+1".into()),
+                watch,
+            ),
+        ),
     ] {
         match engine.set_breakpoint(&spec) {
             Ok(_) => println!("  {why} was ACCEPTED — the validation has regressed"),
