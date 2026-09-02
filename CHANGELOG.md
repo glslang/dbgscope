@@ -101,8 +101,10 @@ All notable changes to this project are documented here. The format follows
   snapshot that would not read, a session that has gone — returns as it did before, and only a
   process demonstrably not in the session by the bound answers the new
   `DbgEngError::LiveTargetTimeout`; one that is there but was never seen to stop ends the wait
-  `Ok`, because "not observed to stop" is not "never arrived". With the fix, 0 short in 40 rounds
-  under the same load. Reported as
+  `Ok`, because "not observed to stop" is not "never arrived". The record is cleared when the
+  session is replaced *and* when it is ended, since the next session hands engine ids out from zero
+  again — two `attach_process` calls to one pid on one engine would otherwise have the second
+  inherit the first's answer. With the fix, 0 short in 40 rounds under the same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
 - A `PendingTarget` **waited after something else pumped its target in** no longer waits for the
