@@ -111,14 +111,20 @@ All notable changes to this project are documented here. The format follows
   the first's answer. With the fix, 0 short in 40 rounds under the same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
-- **A break nobody's target asked for is not an arrival, whichever origin raised it.** The
-  watchdog's deadline and a host's `InterruptHandle` reach the engine through the same
-  `SetInterrupt` and produce the same stop; only the advice differs, which is what `Interruption`'s
-  two variants are for. The record stood down for the first and not the second, so a host
-  interrupting an `execute_and_wait` that was pumping a mixed session could stop a deferred target
-  before its initial breakpoint and leave its guard reporting an arrival. It is one condition now
-  rather than two, and reads the flag rather than consuming it, since the callers still need it to
-  say which origin asked.
+- **A break nobody's target asked for is not an arrival, whichever origin raised it and whichever
+  wait took it.** The watchdog's deadline and a host's `InterruptHandle` reach the engine through
+  the same `SetInterrupt` and produce the same stop; only the advice differs, which is what
+  `Interruption`'s two variants are for. Recording it lets a guard report an initial-break wait
+  that never happened, because a Ctrl+Break stops whatever was running -- in a mixed session, a
+  deferred target that has not reached its loader breakpoint. This arrived as three review rounds,
+  one door at a time: the watchdog on the bounded wait, then a host on the bounded wait, then a
+  host on the finite wait -- which is the one a live open pumps with, so the false arrival reaches
+  the guard directly. The rule is therefore inside `note_where_it_stopped` and not at its call
+  sites: both origins raise the same flag, so one question covers every wait in the crate and a
+  new one cannot forget it. It reads the flag rather than consuming it, since the callers still
+  need it to say which origin asked, and `wait_for_live_target` now clears it when an open begins
+  -- the line `execute_and_wait` and `settle` already carry, without which a stale flag would
+  leave an open pumping to its bound for an answer it had.
 - **A process that leaves a session takes its recorded stop with it.** `stopped_on` is keyed by
   `(engine id, pid)`, and engine ids are reused immediately -- measured: detaching engine id 0 and
   attaching another process hands the freed 0 straight back. So a session that `.detach`es one of
