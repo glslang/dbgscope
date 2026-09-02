@@ -2490,6 +2490,22 @@ impl DebugEngine {
     ///
     /// Fails on an engine that has seen no event, which is every engine before its first wait, and
     /// that failure is an answer of "cannot say" rather than "no".
+    ///
+    /// **The event *kind* is read and dropped, and that is not an oversight.** Review round 14
+    /// asked for the stop reason to be preserved and validated, so that an open completes on its
+    /// target's loader breakpoint rather than on whatever stopped it first. The engine does not
+    /// offer that distinction: measured on both openers, an initial break reports kind `0x2`,
+    /// `DEBUG_EVENT_EXCEPTION` -- not `DEBUG_EVENT_BREAKPOINT`, which is `0x1` -- because it
+    /// arrives as a `STATUS_BREAKPOINT` exception. So filtering on the breakpoint kind records
+    /// nothing at all and times out every live open on a target sitting in front of it, and
+    /// filtering on the exception kind admits exactly the early exceptions the finding is about.
+    /// The exception *code* is no better: an `sxe ld` break and any other `int3` are
+    /// `STATUS_BREAKPOINT` too. Nothing on the event says "this is the one the engine's
+    /// `DEBUG_ENGOPT_INITIAL_BREAK` arranged".
+    ///
+    /// What the pump can honestly claim is therefore "this target has stopped", which is what
+    /// [`Presence`] says and what the openers' own docs are worth. It is also not a regression:
+    /// a single-wait open returned at that earlier stop too.
     fn last_event_process(&self) -> Result<u32, DbgEngError> {
         let mut kind = 0u32;
         let mut process = 0u32;
