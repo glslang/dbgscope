@@ -825,9 +825,16 @@ pub enum BreakpointAt {
     /// breakpoint's offset is set, and flags the breakpoint [deferred](BreakpointInfo::deferred)
     /// only when it *cannot* — so on a module whose PDB is not in the local store this is a
     /// symbol-server fetch, with the engine held for all of it. Measured on dbgeng
-    /// 10.0.29547.1002: 6 ms warm, **2620 ms** for a cold `KERNELBASE!CreateFileW` over `srv*`
-    /// against an empty downstream store, and 0 ms for an expression whose module is absent, which
-    /// defers instead. That is what [`DebugEngine::set_breakpoint_bounded`] is for.
+    /// 10.0.29547.1002: **2445 ms** for a cold `KERNELBASE!CreateFileW` over `srv*` against an
+    /// empty downstream store, 151 ms warm, and 0 ms for an expression whose module is absent,
+    /// which defers instead. That is what [`DebugEngine::set_breakpoint_bounded`] is for.
+    ///
+    /// Those are `examples/breakpoint_probe.rs`'s `resolve` arm, which is the point of quoting
+    /// them rather than any other run: a figure in a doc comment that the harness beside it does
+    /// not print is one nobody can check. This said "6 ms warm, 2620 ms cold" until 2026-09-02 —
+    /// both real, and neither reproducible here. The 2620 ms was the same experiment through the
+    /// scratch probe this example replaced, and the 6 ms was a *different symbol* in a session
+    /// something else had already warmed.
     Expression(String),
 }
 
