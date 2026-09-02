@@ -69,9 +69,12 @@ All notable changes to this project are documented here. The format follows
   captured, and a caller that wants it can redirect (`cmd.exe /c prog > file`) rather than have
   every launch open a window on the chance someone is looking. A driver launching targets
   repeatedly made the machine unusable ([#129](https://github.com/glslang/dbgscope/issues/129)).
-  `a_launched_target_has_a_console_of_its_own_and_no_window` asserts both halves, the negative one
-  calibrated against a control the test spawns with `CREATE_NEW_CONSOLE` so that a desktop showing
-  no windows at all stands the check down rather than passing it.
+  `test_a_launched_target_has_a_console_of_its_own_and_no_window` asserts three things: that the
+  target's console is not this process's, that it *has* one (`mode con` in the target has to report
+  `Status for device CON`, which is what separates this flag from `DETACHED_PROCESS`), and that it
+  owns no visible window. The last is a negative, so it is calibrated against a control the test
+  spawns with `CREATE_NEW_CONSOLE`; a host where that control shows no window either fails the test
+  rather than skipping the check, since by then the other two have been made.
 
 ### Fixed
 

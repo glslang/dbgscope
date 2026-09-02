@@ -5804,11 +5804,11 @@ mod tests {
     ///
     /// Ignored: needs a live target, which CI has no way to provide. See the note above these
     /// tests on why they must not run in parallel.
-    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 a_launched_target`
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_a_launched_target`
     #[cfg(not(miri))]
     #[test]
     #[ignore = "needs a live debuggee; run manually with --ignored"]
-    fn a_launched_target_has_a_console_of_its_own_and_no_window() {
+    fn test_a_launched_target_has_a_console_of_its_own_and_no_window() {
         use std::os::windows::process::CommandExt;
 
         let probe =
