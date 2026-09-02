@@ -78,6 +78,38 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A **user-mode open now waits for its own target**, rather than for one event. `launch_process`
+  and `attach_process` completed on a single `WaitForEvent`, which is one event and not necessarily
+  theirs: `CreateProcessWide` defers the spawn into that wait, and an engine already holding a
+  target can return from it on *that* target's event instead. Measured
+  (`examples/deferred_arrival.rs`, 40 rounds under CPU load): an `AttachProcess` break-in whose
+  injected thread is slow to be scheduled lands a whole wait late, and the `launch_process` after
+  it spends its only wait on that break — returning `Ok` with its process absent from the session,
+  3 times in 40, and 0 in 40 on a quiet machine. `PendingTarget::wait` now pumps until the session
+  holds the process the open created or claimed, within the same `LIVE_WAIT_MS` bound for the whole
+  open; the event is queued rather than lost, so it arrived on the very next wait every time it was
+  observed. A wait that cannot evaluate its own postcondition — a snapshot that would not read, a
+  session that has gone — returns as it did before, and one whose target is demonstrably still
+  missing at the bound answers the new `DbgEngError::LiveTargetTimeout` instead of a false success.
+  With the fix, 0 short in 40 rounds under the same load. Reported as
+  [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
+  `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
+- A `PendingTarget` **waited after something else pumped its target in** no longer waits for the
+  next event. The guard's own docs describe dropping one and letting the target materialize at the
+  next `WaitForEvent` from any source; a guard still held when that happened made its wait anyway,
+  which resumes an arrived target and waits out whatever comes next. Measured across the fix:
+  **29.36s and `E_UNEXPECTED`** — the debuggee outran the bound and took the session with it —
+  against **8.6µs and `Ok`**. Neither opener lists its process before the wait that completes it
+  (measured), so the ordinary open still waits exactly once.
+- `a_watchdog_disarmed_before_its_deadline_costs_nothing` measured the machine rather than the
+  watchdog, and failed on the coverage job of a docs-only PR. Three things were wrong with it, and
+  the first meant it was not testing the property at all: armed and disarmed back to back, the
+  watchdog's thread usually had not run yet, so it saw the flag at the top of its loop and returned
+  without ever reaching a wait — **the test passed with the condvar reverted**. It now lets the
+  thread park first, bounds the disarm by `WATCHDOG_REPEAT` (the poll interval the condvar
+  replaced) halved rather than by an absolute 50ms, and takes the **fastest** of five rounds, since
+  a loaded runner makes some rounds slow while a watchdog that sleeps makes every round slow.
+  Checked both ways: it passes in 0.13s, and fails at 178.9ms against the reverted condvar.
 - `BreakpointInfo::expression`'s documentation described only what `bp` does. A breakpoint whose
   location was set through `SetOffsetExpression` **keeps** its expression beside a resolved address,
   where one set by `bp` has the text discarded once it resolves — so `None` there is not the
