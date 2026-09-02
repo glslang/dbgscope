@@ -102,6 +102,16 @@ pub enum DbgEngError {
     #[error("the process did not join the session within the open timeout")]
     LiveTargetTimeout,
 
+    /// A user-mode open a host stopped before its process joined the session.
+    ///
+    /// Distinct from [`Self::LiveTargetTimeout`] because the recovery is: a timeout says the
+    /// target is not coming, and this says nothing about the target at all -- somebody asked for
+    /// control back, and retrying is reasonable. Folding it into the timeout would report "within
+    /// the open timeout" for an open cut short two seconds in, which is the overstatement
+    /// docs/unknown-not-absent.md exists about.
+    #[error("the open was interrupted before the process joined the session")]
+    LiveTargetInterrupted,
+
     #[error("Operation failed: {0}")]
     OperationFailed(windows::core::Error),
 
@@ -2344,8 +2354,26 @@ impl DebugEngine {
                     .as_millis(),
             )
             .unwrap_or(LIVE_WAIT_MS);
-            if left == 0 {
+            // A host that asked for control back gets it. Before this function pumped, a single
+            // wait ended on the break and `wait()` returned, so carrying on round the loop would
+            // hold the caller for the rest of the bound -- a regression in the one direction an
+            // interrupt exists to prevent, and introduced by the pumping this whole change is.
+            // It also lets the target *go*: backing this check out and running
+            // `test_a_host_interrupt_ends_a_live_open_rather_than_pumping_through_it` spends the
+            // whole bound and comes back `CommandFailed(0x8000FFFF)` at 29.5s, because the
+            // debuggee ran to completion under the pumping and left no session behind it. So the
+            // cost is not only the caller's time; it is the target the host stopped.
+            //
+            // Terminal on the same rule as the bound, which is deliberate -- an interrupt is a
+            // reason to stop pumping, not a different question about the target -- except that a
+            // target which is not there is reported as interrupted rather than as a timeout the
+            // open never reached. Only a host can raise this here: the finite wait carries no
+            // watchdog, and the engine thread is inside this loop, so nothing else is running to
+            // raise one.
+            let asked_to_stop = self.interrupt_raised.load(Ordering::SeqCst);
+            if left == 0 || asked_to_stop {
                 return match presence {
+                    Presence::Absent if asked_to_stop => Err(DbgEngError::LiveTargetInterrupted),
                     Presence::Absent => Err(DbgEngError::LiveTargetTimeout),
                     // In the session, and never seen to stop. "Not observed to stop" is not "never
                     // arrived", and reporting a timeout on a process visibly in front of us would
@@ -7546,6 +7574,49 @@ mod tests {
                 .unwrap_or_else(|err| err.into_inner())
                 .is_empty(),
             "a break a host asked for was recorded as the target arriving"
+        );
+    }
+
+    /// **A host that asks for control back gets it**, rather than being held for the rest of the
+    /// bound while the loop pumps through the break it asked for.
+    ///
+    /// This is a regression the pumping introduced and review round 10 caught: before it, a live
+    /// open was a single `WaitForEvent`, so an interrupt ended the wait and `wait()` returned. The
+    /// arrival below never arrives -- the pid is not in the session and nothing will put it there
+    /// -- so without the check the loop spends the whole bound. Measured with it backed out: 29.5s
+    /// and `CommandFailed(0x8000FFFF)`, because the pumping let the debuggee run to completion and
+    /// there was no session left to ask. That is worse than the delay the review described, and it
+    /// is why the assertion is on the variant rather than on the timing -- every ending here is an
+    /// error, and only the variant says which one happened.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_host_interrupt_ends_a_live_open_rather_than_pumping_through_it() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        e.launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        // Running, so the break a host asks for is an event this wait can return on.
+        unsafe { e.control.SetExecutionStatus(DEBUG_STATUS_GO) }.expect("could not set it running");
+
+        let handle = e.interrupt_handle();
+        let asked = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            handle.interrupt()
+        });
+        let absent = e
+            .session_processes()
+            .expect("could not list the session")
+            .iter()
+            .map(|(_, pid)| *pid)
+            .max()
+            .unwrap_or(4)
+            + 1000;
+        let outcome = e.wait_for_live_target(&Arrival::Attached(absent));
+        asked.join().expect("interrupting thread panicked").ok();
+
+        assert!(
+            matches!(outcome, Err(DbgEngError::LiveTargetInterrupted)),
+            "a live open a host interrupted answered {outcome:?}, so it pumped through the break"
         );
     }
 

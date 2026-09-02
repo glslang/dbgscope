@@ -111,6 +111,16 @@ All notable changes to this project are documented here. The format follows
   the first's answer. With the fix, 0 short in 40 rounds under the same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
+- **A live open a host interrupts now ends, instead of pumping through the break.** New:
+  `DbgEngError::LiveTargetInterrupted`. The pumping this release introduces made an interrupt
+  something the open ignored -- before it, a live open was a single `WaitForEvent`, so the break
+  ended the wait and `wait()` returned. What that costs is not only the caller's time: measured
+  with the check backed out, an interrupted open spends the whole 30s bound and answers
+  `CommandFailed(0x8000FFFF)`, because the pumping let the debuggee run to completion and left no
+  session to ask. The ending is the same rule the bound uses -- a process visibly in the session
+  ends the wait `Ok` -- except that a process which is not there is reported as interrupted rather
+  than as a timeout the open never reached, since a timeout says the target is not coming and this
+  says nothing about the target at all.
 - **A break nobody's target asked for is not an arrival, whichever origin raised it and whichever
   wait took it.** The watchdog's deadline and a host's `InterruptHandle` reach the engine through
   the same `SetInterrupt` and produce the same stop; only the advice differs, which is what
