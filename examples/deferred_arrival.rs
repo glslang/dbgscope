@@ -28,6 +28,13 @@
 //! - **A guard may ask before it waits** (arms E and F). Neither opener lists its process before
 //!   the wait that completes it, and a guard whose target arrived meanwhile took 29.36s and
 //!   `E_UNEXPECTED` before the fix against 8.6µs and `Ok` after.
+//! - **Membership is not the same claim as the initial break** (arm G). A process is registered
+//!   when its create event is processed — `cpr` is ignored — and its loader breakpoint arrives
+//!   later, so a competing break in between would end a wait with the process listed and not
+//!   stopped. Arm G asks whose event the launch actually ended on and answers 0 in 40, which is
+//!   **not** evidence the window is unreachable: this fixture holds exactly one competing break,
+//!   the attach's injected break-in, and it is spent on the wider window before the narrower one
+//!   opens. The terminal condition is tightened on the mechanism rather than on that count.
 //! - **Two forcings that do not work**, recorded so they are not tried again: two pending targets
 //!   and one wait (arm B) and a `SetInterrupt` before the wait (arm D) both come back with the
 //!   session whole on a quiet machine. There is no deterministic reproduction of the race itself;
@@ -57,6 +64,21 @@ fn a_process_to_attach_to() -> Child {
 fn listed(e: &DebugEngine) -> (usize, String) {
     let text = e.execute_command("|").unwrap_or_default();
     (text.lines().filter(|l| l.contains("id:")).count(), text)
+}
+
+/// The system pid `|` gives for the process it says the engine `create`d.
+fn created_pid(listing: &str) -> Option<u64> {
+    let row = listing.lines().find(|l| l.contains("\tcreate\t"))?;
+    let after = row.split("id: ").nth(1)?;
+    u64::from_str_radix(after.split_whitespace().next()?, 16).ok()
+}
+
+/// The system pid `.lastevent` attributes the last event to.
+fn last_event_pid(e: &DebugEngine) -> Option<u64> {
+    let text = e.execute_command(".lastevent").ok()?;
+    let line = text.lines().find(|l| l.contains("Last event:"))?;
+    let after = line.split("Last event: ").nth(1)?;
+    u64::from_str_radix(after.split('.').next()?, 16).ok()
 }
 
 /// Pumps until the session holds `want` processes, reporting how many pumps it took.
@@ -176,6 +198,43 @@ fn forced() {
     let _ = theirs.kill();
     let _ = theirs.wait();
     std::thread::sleep(Duration::from_millis(200));
+}
+
+/// Arm G: is membership the same claim as the initial break? Review on #133 argued it is not —
+/// that a competing target's event can win *after* the launch's create-process event has put it in
+/// the session's list but *before* its loader breakpoint is delivered, so a wait that stops at
+/// membership can return with its own target not yet stopped. This asks the session which process
+/// the event it stopped on belongs to, on every round the openers came back whole.
+fn membership_against_the_break(rounds: usize) {
+    println!("=== G. does the launch's own event end the wait? x{rounds} ===");
+    let mut asked = 0usize;
+    let mut elsewhere = 0usize;
+    for round in 1..=rounds {
+        let mut theirs = a_process_to_attach_to();
+        {
+            let e = DebugEngine::new();
+            e.attach_process(theirs.id()).expect("attach failed");
+            e.launch_process(LAUNCH).expect("launch failed");
+            let (count, text) = listed(&e);
+            match (count, created_pid(&text), last_event_pid(&e)) {
+                (2, Some(ours), Some(event)) => {
+                    asked += 1;
+                    if event != ours {
+                        elsewhere += 1;
+                        println!(
+                            "  round {round}: the launch returned on {event:#x}'s event, not its \
+                             own ({ours:#x}):\n{text}"
+                        );
+                    }
+                }
+                other => println!("  round {round}: could not ask ({other:?}):\n{text}"),
+            }
+            let _ = e.end_session();
+        }
+        let _ = theirs.kill();
+        let _ = theirs.wait();
+    }
+    println!("  ended on another target's event: {elsewhere}/{asked} asked, of {rounds} rounds");
 }
 
 /// Arm E: may a wait ask *before* it waits? Only if neither opener puts its process in the
@@ -302,6 +361,7 @@ fn main() {
     if spinners > 0 {
         println!("(running under {spinners} CPU spinners)");
     }
+    membership_against_the_break(rounds.max(1));
     a_target_that_arrived_before_its_wait();
     listed_before_the_wait();
     a_launch_that_cannot_start();
