@@ -130,10 +130,28 @@ const DEBUG_MODULE_UNLOADED: u32 = 0x0000_0001;
 
 /// `CreateProcess` flag: debug only the launched process, not its children.
 const DEBUG_ONLY_THIS_PROCESS: u32 = 0x0000_0002;
-/// `CreateProcess` flag: give the launched target its own console. Without this a
-/// console target inherits the host's stdout — fatal when the host's stdout is an
-/// MCP/JSON-RPC channel, as the target's prints corrupt the stream.
-const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+/// `CreateProcess` flag: give the launched target a console of its own, **with no window**.
+///
+/// The console is the point and is not negotiable: without one, a console target inherits the
+/// host's stdout — fatal when the host's stdout is an MCP/JSON-RPC channel, as the target's prints
+/// corrupt the stream. Measured on this bench with a `STARTUPINFO` carrying no
+/// `STARTF_USESTDHANDLES`, which is the shape DbgEng uses: with no flag the target's `echo` lands
+/// in the launching process's own stdout, and with this one it does not — with `bInheritHandles`
+/// either way.
+///
+/// The *window* is what changed, and `CREATE_NO_WINDOW` rather than `CREATE_NEW_CONSOLE` is the
+/// whole of it. Both give the target its own console; the older flag also puts that console on the
+/// desktop, taking the foreground as it appears, so a host driving repeated launches made the
+/// machine unusable ([#129](https://github.com/glslang/dbgscope/issues/129), and
+/// [windbg-mcp#273](https://github.com/glslang/windbg-mcp/issues/273) for the same window arriving
+/// by the other route). The two are alternatives, not a pair: `CREATE_NO_WINDOW` is documented as
+/// ignored when it is passed beside `CREATE_NEW_CONSOLE`.
+///
+/// What it costs is a debuggee's console output no longer being *readable* on the desktop. It was
+/// never captured — these launches are driven by a program, not watched by a person — and a caller
+/// that wants to see a target's output can redirect it (`cmd.exe /c prog > file`) rather than have
+/// every launch open a window on the chance that someone is looking.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// `AttachProcess` default attach flags.
 const DEBUG_ATTACH_DEFAULT: u32 = 0x0000_0000;
 /// `EndSession` flag used on teardown: detach passively without resuming.
@@ -4141,7 +4159,7 @@ impl DebugEngine {
             self.client.CreateProcessWide(
                 0,
                 PWSTR::from_raw(wide.as_mut_ptr()),
-                DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE,
+                DEBUG_ONLY_THIS_PROCESS | CREATE_NO_WINDOW,
             )
         }
         .map_err(DbgEngError::OperationFailed)?;
@@ -5687,6 +5705,143 @@ mod tests {
         assert!(
             command_took_effect(&e, 0x63),
             "the engine is unusable after a timeout — the target was left running, or the              current process/thread was never restored"
+        );
+        let _ = e.end_session();
+    }
+
+    /// The processes attached to this process's console, or nothing when it has none.
+    #[cfg(not(miri))]
+    fn console_process_list() -> Vec<u32> {
+        use windows::Win32::System::Console::GetConsoleProcessList;
+        let mut buf = vec![0u32; 64];
+        loop {
+            // SAFETY: a valid, writable buffer, described to the call at its true length.
+            let n = unsafe { GetConsoleProcessList(&mut buf) } as usize;
+            if n == 0 {
+                return Vec::new(); // No console: `ERROR_INVALID_HANDLE`.
+            }
+            if n <= buf.len() {
+                buf.truncate(n);
+                return buf;
+            }
+            // Too small — the call stored nothing and answered how many there are.
+            buf = vec![0u32; n];
+        }
+    }
+
+    /// Whether `pid` owns a visible top-level window, which for a console process is its console.
+    #[cfg(not(miri))]
+    fn has_a_visible_window(pid: u32) -> bool {
+        use windows::Win32::Foundation::{HWND, LPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+        };
+        use windows::core::BOOL;
+
+        unsafe extern "system" fn visit(window: HWND, state: LPARAM) -> BOOL {
+            // SAFETY: `state` is the `Search` the enumeration below was started with, alive for
+            // the whole of it.
+            let search = unsafe { &mut *(state.0 as *mut Search) };
+            let mut owner = 0u32;
+            // SAFETY: a window handed to us by the enumeration, and a valid out-parameter.
+            unsafe { GetWindowThreadProcessId(window, Some(&mut owner)) };
+            // SAFETY: as above.
+            if owner == search.pid && unsafe { IsWindowVisible(window) }.as_bool() {
+                search.found = true;
+                return BOOL(0); // Stop: one is enough.
+            }
+            BOOL(1)
+        }
+        struct Search {
+            pid: u32,
+            found: bool,
+        }
+
+        let mut search = Search { pid, found: false };
+        // SAFETY: the callback is valid for the call, and the pointer outlives the enumeration.
+        let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut search as isize)) };
+        search.found
+    }
+
+    /// A launched target gets a console of its **own**, and that console has **no window**.
+    ///
+    /// The two halves are one flag ([`CREATE_NO_WINDOW`]) and they fail in opposite directions.
+    /// Without a console, a console target's prints land in the *launching* process's stdout,
+    /// which for an MCP host is its JSON-RPC channel. With a console on the desktop — which is
+    /// `CREATE_NEW_CONSOLE`, what this passed until
+    /// [#129](https://github.com/glslang/dbgscope/issues/129) — every launch opens a window and
+    /// takes the foreground.
+    ///
+    /// The second half is a *negative*, so it is calibrated rather than asserted into the void: a
+    /// control spawned here with `CREATE_NEW_CONSOLE` has to show its window first, and only then
+    /// is the debuggee — launched earlier, and by now stopped at its loader breakpoint — asked
+    /// whether it has one. A desktop that shows no window at all (a session-0 service, a runner
+    /// with no interactive window station) is one where this test can say nothing, and it stands
+    /// down there rather than passing.
+    ///
+    /// Ignored: needs a live target, which CI has no way to provide. See the note above these
+    /// tests on why they must not run in parallel.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 a_launched_target`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn a_launched_target_has_a_console_of_its_own_and_no_window() {
+        use std::os::windows::process::CommandExt;
+
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+        let target = e
+            .current_process_system_id()
+            .expect("the debuggee's system id");
+
+        // Its own console, which is what keeps its stdout off ours.
+        let ours = console_process_list();
+        assert!(
+            !ours.contains(&target),
+            "the debuggee ({target}) joined this process's console ({ours:?}), so its stdout is \
+             this process's stdout — which for an MCP host is the JSON-RPC channel"
+        );
+
+        // The calibration: a window this desktop *does* show, spawned after the debuggee so that
+        // by the time it appears the debuggee has had at least as long to open one.
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let mut control = std::process::Command::new("cmd.exe")
+            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+            // Its own handles, not ours: `Command` inherits by default, and this one is spawned
+            // by the test rather than by the engine — so without this its ping would print into
+            // the test's output and read exactly like a debuggee whose stdout leaked.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .expect("spawn the control");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut calibrated = false;
+        while std::time::Instant::now() < deadline {
+            if has_a_visible_window(control.id()) {
+                calibrated = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let debuggee_has_one = has_a_visible_window(target);
+        let _ = control.kill();
+        let _ = control.wait();
+
+        if !calibrated {
+            println!(
+                "SKIPPED: a control process spawned with CREATE_NEW_CONSOLE showed no window \
+                 either, so this desktop cannot tell the two flags apart"
+            );
+            let _ = e.end_session();
+            return;
+        }
+        assert!(
+            !debuggee_has_one,
+            "the debuggee ({target}) has a visible window, so it was given a console on the \
+             desktop — every launch then steals the foreground (#129)"
         );
         let _ = e.end_session();
     }

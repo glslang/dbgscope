@@ -47,7 +47,15 @@ features = [
 # of the library still resolves the four features above and no more.
 [dev-dependencies.windows]
 version = "0.62.2"
-features = ["Win32_System_Memory", "Win32_System_Threading"]
+features = [
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    # `GetConsoleProcessList` and `EnumWindows`/`IsWindowVisible`, which is how the launch tests
+    # check that a debuggee gets a console of its own and that the console has no window
+    # (issue #129). Test-only: a consumer of the library resolves neither.
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+]
 
 # docs.rs builds on Linux, where this crate does not compile at all. `default-target` is
 # spelled out rather than left to docs.rs' "first of `targets`" fallback, because that fallback

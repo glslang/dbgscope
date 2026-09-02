@@ -56,6 +56,23 @@ All notable changes to this project are documented here. The format follows
   only wrapper over a raw breakpoint object, so there is one answer to who removes a breakpoint and
   when rather than two that disagreed.
 
+### Changed
+
+- `launch_process` launches with `CREATE_NO_WINDOW` instead of `CREATE_NEW_CONSOLE`, so a launched
+  console target no longer opens a window on the desktop and takes the foreground with it. The
+  guarantee the old flag was there for is unchanged and is what `CREATE_NO_WINDOW` also provides:
+  the target gets a console of its **own**, so its prints cannot reach the launching process's
+  stdout — which for an MCP host is its JSON-RPC channel. Measured with a `STARTUPINFO` carrying no
+  `STARTF_USESTDHANDLES`, the shape DbgEng uses: with no flag at all the target's `echo` lands in
+  the launching process's stdout, and with either console flag it does not, `bInheritHandles` either
+  way. What is lost is a debuggee's console output being readable on the desktop — it was never
+  captured, and a caller that wants it can redirect (`cmd.exe /c prog > file`) rather than have
+  every launch open a window on the chance someone is looking. A driver launching targets
+  repeatedly made the machine unusable ([#129](https://github.com/glslang/dbgscope/issues/129)).
+  `a_launched_target_has_a_console_of_its_own_and_no_window` asserts both halves, the negative one
+  calibrated against a control the test spawns with `CREATE_NEW_CONSOLE` so that a desktop showing
+  no windows at all stands the check down rather than passing it.
+
 ### Fixed
 
 - `BreakpointInfo::expression`'s documentation described only what `bp` does. A breakpoint whose
