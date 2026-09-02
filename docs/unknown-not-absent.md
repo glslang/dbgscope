@@ -418,7 +418,24 @@ Once you adopt it, it stops being a pool-walker concern.
 | `Scope::has_context()` | `false` is a legitimate scope, not a failed read: a target with no thread context still has a position. |
 | `Scope`'s target identity | A scope carries the target it was read from and is refused rather than applied to a later one. |
 | `LayoutProvenance::fingerprint` | A digest of the resolved offsets actually used. Deliberately contains no build-number policy — it records what was decoded from, not what Microsoft shipped. |
+| `Presence::Listed` against `Arrived` | A process the session lists has not necessarily stopped. `cpr` is an ignored filter, so a process is registered when its create event is processed and its initial breakpoint arrives later; ending a live open on membership reports a target that is not where the open promised to leave it. |
+| `Presence::Unknown` against `Absent` | The ask failing, against a session that answered and holds nothing. See below — this is the one that runs the other way. |
 | `PoolQueryError`'s variants | "You are pointed at the wrong kind of target" (never going to work) is a different variant from "the target is running" (break in and retry). |
+
+**And once, the other way.** Every row above refuses to report a partial reading as a total one.
+`Presence` is the place the crate needed the converse as well, and getting it wrong cost a review
+round: `has_target` has three answers, and folding `Ok(false)` in with the unreadable ones reported
+*knowledge* as a question. It matters because the two are consumed differently — an open that
+cannot evaluate its own postcondition ends where a single wait used to end it, while one whose
+target is demonstrably not there is a timeout. A session holding nothing is an answer, and saying
+"unknown" about it is the same error as saying "absent" about a walk that could not look: both
+describe the reading instead of the thing.
+
+The rule also binds *inside* the crate, which is the other half of the same round. §4 says a
+forced break is reported as a forced break — and the consumer that has to honour that is not
+always a caller. `wait_for_event_bounded` records where each wait stopped, for a live open's
+postcondition, and recorded the watchdog's own Ctrl+Break along with the real ones: a rule stated
+on the way out and dropped on the way in.
 
 ---
 
