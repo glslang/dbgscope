@@ -1041,10 +1041,21 @@ impl BreakpointSpec {
     /// so [`DebugEngine::set_breakpoint_bounded`] checks it **again** on the resolved offset, which
     /// is where `ba` on `nt!Foo+1` is caught. This is half of that rule rather than all of it.
     ///
-    /// 8 bytes is accepted on every target, including a 32-bit one where the engine will refuse
-    /// it: this crate does not know the target's pointer width without an engine, and a rule
-    /// stated here that contradicts the engine on one architecture is worse than the engine's own
-    /// answer.
+    /// **8 bytes is accepted whatever the target is**, and the reason is a measurement rather than
+    /// this function's lack of an engine — which is what an earlier version of this comment
+    /// claimed, and it was the weak half of the argument, since the caller
+    /// ([`DebugEngine::set_breakpoint_bounded`]) has one.
+    ///
+    /// The constraint is the **hardware's** debug registers, not the target's bitness, and those
+    /// are not the same question: a WOW64 process is a 32-bit target on 64-bit registers. Measured
+    /// on this host — an 8-byte write watch on a `SysWOW64\cmd.exe` is accepted at the set *and*
+    /// survives the resume, exactly as it does for a 64-bit target. So a check keyed on the
+    /// target's architecture would refuse a spec that works. It would also not fire on the case it
+    /// was proposed for: `.effmach` reports **x64** for that WOW64 process at the loader break.
+    ///
+    /// What is left is a genuinely 32-bit *host*, which this crate does not build for — its
+    /// documented targets are `x86_64` and `aarch64` — and where the engine is the authority
+    /// anyway, as it is for [`DataAccess::Execute`] below.
     ///
     /// **The access type is not judged against the size here, and that is measured rather than
     /// overlooked.** An execute watch must be one byte on x86/x64 — a DR7 slot with `R/W=00`
