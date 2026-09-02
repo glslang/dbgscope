@@ -1473,8 +1473,12 @@ pub struct DebugEngine {
     ///
     /// A **pair**, so a target is not confused with a later process that inherited its engine id
     /// after it left; fooling that needs a pid reuse in the same instant, which is the residue
-    /// `prune_dead_attachments` already documents and lives with. Cleared wherever the session is
-    /// replaced ([`Self::forget_the_previous_session`]), since engine ids belong to a session.
+    /// `prune_dead_attachments` already documents and lives with — but only **within** a session.
+    /// Engine ids are handed out from zero again for the next one, so across a teardown the same
+    /// pair is no coincidence at all: two `attach_process` calls to one pid on one engine produce
+    /// it. Hence cleared both where a session is replaced
+    /// ([`Self::forget_the_previous_session`]) and where one is ended ([`Self::end_session`]) —
+    /// and it was review that caught the second half missing, not this sentence, which claimed it.
     ///
     /// It gains at most one entry per process the engine ever stops on, and a session holds a
     /// handful of processes, so there is nothing here to evict.
@@ -4585,8 +4589,21 @@ impl DebugEngine {
         // spawn or dial dies with it, so nothing can read these buffers afterwards. A failed
         // teardown may leave the session live and still owing that read, so the buffers stay
         // — retaining a few bytes for the life of the engine beats a use-after-free.
+        //
+        // `stopped_on` goes on the same condition, for a sharper version of the same reason:
+        // engine process ids are handed out from zero again for the next session, so a pair that
+        // outlives this one can be matched by a later process that inherited both numbers — which
+        // for two `attach_process` calls to the same pid on one engine is the ordinary case rather
+        // than a coincidence. `presence_of` would then answer `Arrived` on membership alone, which
+        // is the weaker claim this whole path exists to stop relying on. A teardown that failed
+        // may leave the session live, and its stops with it. (`detach_attached_processes` already
+        // takes the attach record; this is the other half of what a session owns.)
         if ended.is_ok() {
             self.release_deferred_inputs();
+            self.stopped_on
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
         }
         ended
     }
@@ -7259,6 +7276,46 @@ mod tests {
              not evidence that this one never arrived"
         );
         e.end_session().expect("end_session failed");
+        let _ = theirs.kill();
+        let _ = theirs.wait();
+    }
+
+    /// **Ending a session forgets which processes it stopped on.**
+    ///
+    /// The record is keyed by engine process id, and the next session hands those out from zero
+    /// again — so a pair that outlives a teardown is matched by whichever process inherits both
+    /// numbers, and two `attach_process` calls to the same pid on one engine produce exactly that.
+    /// `presence_of` would answer `Arrived` for the second on membership alone, which is the weaker
+    /// claim [`Arrival`] exists to stop relying on, and the window it reopens is the one between a
+    /// create event and the initial break.
+    ///
+    /// Asserted on the state rather than on that window, because the window is a race and the
+    /// state is not. The first assertion is also the only place the *write* side is pinned: a
+    /// record nothing wrote would pass every other test here by making each wait pump once more.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_ending_a_session_forgets_which_processes_it_stopped_on() {
+        let _debuggee = one_debuggee();
+        let mut theirs = a_process_to_attach_to();
+        let e = DebugEngine::new();
+        e.attach_process(theirs.id()).expect("attach failed");
+        assert!(
+            !e.stopped_on
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_empty(),
+            "an attach that broke its target in recorded no stop"
+        );
+
+        e.end_session().expect("end_session failed");
+        assert!(
+            e.stopped_on
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_empty(),
+            "the session's stops outlived it, where the next session's engine ids start over"
+        );
+
         let _ = theirs.kill();
         let _ = theirs.wait();
     }
