@@ -5730,6 +5730,16 @@ mod tests {
     }
 
     /// Whether `pid` owns a visible top-level window, which for a console process is its console.
+    ///
+    /// **The console window is attributed to the console's *client*, not to its host**, which is
+    /// the opposite of what the architecture suggests — `conhost.exe` creates the window, and a
+    /// reviewer will say so. Measured on this bench: a `cmd.exe` spawned with
+    /// `CREATE_NEW_CONSOLE` has exactly one visible top-level window whose
+    /// `GetWindowThreadProcessId` is `cmd.exe`'s own pid, titled with its image path, while every
+    /// `conhost.exe` on the machine owns none. It is also what `Process.MainWindowHandle` reports
+    /// for a console process, and what the caller's calibration re-checks at run time on the host
+    /// in front of it — so a host that does attribute the window elsewhere (a terminal that hosts
+    /// new consoles as tabs of its own) is caught there rather than assumed away here.
     #[cfg(not(miri))]
     fn has_a_visible_window(pid: u32) -> bool {
         use windows::Win32::Foundation::{HWND, LPARAM};
@@ -5786,9 +5796,11 @@ mod tests {
     /// The window claim is a *negative*, so it is calibrated rather than asserted into the void: a
     /// control spawned here with `CREATE_NEW_CONSOLE` has to show its window first, and only then
     /// is the debuggee — launched earlier, and by now stopped at its loader breakpoint — asked
-    /// whether it has one. A desktop that shows no window at all (a session-0 service, a runner
-    /// with no interactive window station) is one where this test can say nothing, and it stands
-    /// down there rather than passing.
+    /// whether it has one. A host that shows no window for the control (no interactive desktop, or
+    /// a default terminal that hosts new consoles as tabs of its own) **fails** rather than
+    /// standing down: by then the other two claims have been checked, so nothing is lost by
+    /// failing, and a skip here would be a green test that did not check the thing it is named
+    /// for. The message says which it is.
     ///
     /// Ignored: needs a live target, which CI has no way to provide. See the note above these
     /// tests on why they must not run in parallel.
@@ -5858,20 +5870,25 @@ mod tests {
             reported.trim()
         );
 
-        if !calibrated {
-            println!(
-                "SKIPPED: a control process spawned with CREATE_NEW_CONSOLE showed no window \
-                 either, so this desktop cannot tell the two flags apart"
-            );
-            let _ = e.end_session();
-            return;
-        }
+        // A failure and not a printed stand-down, deliberately: everything above has already run,
+        // so nothing is lost by failing here, and the alternative is a green test that did not
+        // check the thing it is named for. The two states that reach this are an environment
+        // rather than a regression — no interactive desktop, or a default terminal that hosts new
+        // consoles as tabs of its own, where the window belongs to the terminal and no window is
+        // attributable to any console client — and the message says so.
+        let _ = e.end_session();
+        assert!(
+            calibrated,
+            "a control spawned with CREATE_NEW_CONSOLE showed no window of its own either, so \
+             this host cannot tell the two flags apart and the window half of this test did not \
+             run. Not a regression in `launch_process`: run it on a desktop whose default \
+             terminal is the console host."
+        );
         assert!(
             !debuggee_has_one,
             "the debuggee ({target}) has a visible window, so it was given a console on the \
              desktop — every launch then steals the foreground (#129)"
         );
-        let _ = e.end_session();
     }
 
     /// Probes whether `GetInterrupt` *consumes* a pending `SetInterrupt`, which
