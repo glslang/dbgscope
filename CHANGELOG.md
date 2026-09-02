@@ -111,6 +111,15 @@ All notable changes to this project are documented here. The format follows
   the first's answer. With the fix, 0 short in 40 rounds under the same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
+- **What a teardown lets go of now turns on `EndSession`'s own outcome**, not on the value
+  `end_session` returns. The two differ exactly when a detach fails: `end_session` reports that
+  failure to its caller, and rightly, but a process this engine could not detach from is one left
+  attached and running â it does not keep the session alive. Gating on the combined result held
+  back both things the session owns on a session that had definitely gone: the deferred input
+  buffers, where the cost is a leak, and the record of which processes this engine stopped on,
+  where the cost is the stale entry the previous entry is about, reached by a second road. Found by
+  review rather than by a test, and it stays that way: the split cannot be staged, because the
+  detach loop *skips* a process the engine no longer lists rather than failing on it.
 - A `PendingTarget` **waited after something else pumped its target in** no longer waits for the
   next event. The guard's own docs describe dropping one and letting the target materialize at the
   next `WaitForEvent` from any source; a guard still held when that happened made its wait anyway,

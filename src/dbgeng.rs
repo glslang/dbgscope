@@ -4591,32 +4591,41 @@ impl DebugEngine {
         // A live kernel left halted (at a break) and detached *passively* stays FROZEN —
         // one CPU halted, the rest spinning — because a passive detach never tells the
         // target to run. Resume it and actively detach instead, leaving it running.
-        let ended = if self.is_live_kernel() {
-            self.resume_and_detach_live_kernel()
+        let (session_ended, ended) = if self.is_live_kernel() {
+            let ended = self.resume_and_detach_live_kernel();
+            (ended.is_ok(), ended)
         } else {
             // Detached one by one *before* the session ends, which is what makes a mixed session
             // come apart correctly: `EndSession` takes one flag for the whole session, so no
             // choice of flag can both keep an attached process and take a launched one. Anything
             // still in the session when the passive end runs is a target this engine created.
             let detached = self.detach_attached_processes();
-            unsafe { self.client.EndSession(DEBUG_END_PASSIVE) }
-                .map_err(DbgEngError::OperationFailed)
-                .and(detached)
+            let ended = unsafe { self.client.EndSession(DEBUG_END_PASSIVE) }
+                .map_err(DbgEngError::OperationFailed);
+            (ended.is_ok(), ended.and(detached))
         };
-        // Released only once the session is *confirmed* torn down: an outstanding deferred
-        // spawn or dial dies with it, so nothing can read these buffers afterwards. A failed
-        // teardown may leave the session live and still owing that read, so the buffers stay
-        // — retaining a few bytes for the life of the engine beats a use-after-free.
+        // Both of these are the session's, and both are let go of once it is *confirmed* gone.
         //
-        // `stopped_on` goes on the same condition, for a sharper version of the same reason: engine process ids are handed out from zero again for the next
+        // The buffers, because an outstanding deferred spawn or dial dies with the session and
+        // nothing can read them afterwards, while a session still live may still owe that read —
+        // retaining a few bytes for the life of the engine beats a use-after-free.
+        //
+        // `stopped_on`, because engine process ids are handed out from zero again for the next
         // session, so a pair that outlives this one can be matched by a later process that
         // inherited both numbers — which for two `attach_process` calls to the same pid on one
         // engine is the ordinary case rather than a coincidence. `presence_of` would then answer
         // `Arrived` on membership alone, which is the weaker claim this whole path exists to stop
-        // relying on. A teardown that failed may leave the session live, and its stops with it.
-        // (`detach_attached_processes` already takes the attach record; this is the other half of
-        // what a session owns.)
-        if ended.is_ok() {
+        // relying on. (`detach_attached_processes` already takes the attach record; this is the
+        // other half of what a session owns.)
+        //
+        // **The condition is `EndSession`'s own outcome and not the value this returns**, which
+        // are two different facts wherever a detach fails: the `.and` above reports that failure to
+        // the caller, and rightly, but a process this engine could not detach from is a process
+        // left attached and running — it does not keep the session alive. Gating on the combined
+        // result held both releases back on a session that had definitely gone, which for the
+        // buffers is a leak and for `stopped_on` is the stale record above, reached by a second
+        // road.
+        if session_ended {
             self.release_deferred_inputs();
             self.stopped_on
                 .lock()
