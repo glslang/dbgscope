@@ -25,13 +25,13 @@
 //! - **A pump must not swallow a real failure** (arm C). A launch whose image does not exist fails
 //!   *inside* the wait — `Err(0x80070002)` in 13ms, no debuggee behind it, a further wait
 //!   answering `E_UNEXPECTED` in 37µs — so the loop propagates rather than pumping on.
-//! - **A guard may ask before it waits, and what it may ask is membership** (arms E, F and H).
-//!   Neither opener lists its process before the wait that completes it, so the ask cannot fire on
-//!   an ordinary open; a guard whose target arrived meanwhile took 29.36s and `E_UNEXPECTED` before
-//!   the fix against 8.6µs and `Ok` after. Arm H is the same guard with a *second* target arrived
-//!   since, which overwrites the engine's one record of where it stopped: asking the last event
-//!   there costs 29.4s and `E_UNEXPECTED` again, and asking membership costs 5.4µs. So the last
-//!   event is evidence about a wait this call made, and nothing else.
+//! - **A guard may ask before it waits** (arms E, F and H). Neither opener lists its process
+//!   before the wait that completes it, so the ask cannot fire on an ordinary open; a guard whose
+//!   target arrived meanwhile took 29.36s and `E_UNEXPECTED` before the fix against single-digit
+//!   µs after. Arm H is the same guard with a *second* target arrived since, which overwrites the
+//!   engine's one slot recording where it stopped — 29.4s and `E_UNEXPECTED` when the ask reads
+//!   that slot, µs when it reads a record written as each wait observed a stop. That is the
+//!   argument for `stopped_on` being a record rather than a reading.
 //! - **Membership is not the same claim as the initial break** (arm G). A process is registered
 //!   when its create event is processed — `cpr` is ignored — and its loader breakpoint arrives
 //!   later, so a competing break in between would end a wait with the process listed and not

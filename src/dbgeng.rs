@@ -95,12 +95,10 @@ pub enum DbgEngError {
     /// the process was demonstrably not in it — an open that cannot evaluate its own postcondition
     /// returns `Ok` exactly as it did before, rather than failing on a probe.
     ///
-    /// **Membership, not the initial break.** The wait *pumps* for this target's own event
-    /// ([`Presence`]) and gives up on it quietly, because the engine's last event is one slot that
-    /// later events overwrite: a target that stopped before its guard was waited on is
-    /// indistinguishable from one still coming, and an error would be claiming absence where the
-    /// truth is unknown. A process visibly in the session therefore ends the wait `Ok` at the
-    /// bound, and only a missing one is this.
+    /// **Membership, not the stop.** The wait *pumps* until this target has stopped ([`Presence`])
+    /// and gives that up quietly at the bound: a process visibly in the session ends the wait `Ok`,
+    /// and only a missing one is this. Erroring on a process in front of us would be claiming
+    /// absence where the truth is that we did not see it stop — see docs/unknown-not-absent.md.
     #[error("the process did not join the session within the open timeout")]
     LiveTargetTimeout,
 
@@ -1462,6 +1460,25 @@ pub struct DebugEngine {
     /// decision behind an eviction policy, to serve an arrangement nothing here makes — the
     /// extension's borrowed wrapper never attaches and never ends a session.
     attached_processes: Mutex<std::collections::HashSet<u32>>,
+
+    /// Every process this engine has **stopped on**, as `(engine id, system pid)`.
+    ///
+    /// Written by [`Self::wait_for_event`] from `GetLastEventInformation`, read by
+    /// [`Self::presence_of`] to answer whether a live open's target has got where the open
+    /// promised to leave it. It exists because that call is a single **session-wide slot that
+    /// every later event overwrites**, while a live open needs a *per-target* fact: three review
+    /// rounds on [`Arrival`] each moved one defect around for want of it, since membership is too
+    /// weak — a process is registered when its create event is processed and its initial break
+    /// comes later — and the raw slot is unreadable the moment anything else has stopped.
+    ///
+    /// A **pair**, so a target is not confused with a later process that inherited its engine id
+    /// after it left; fooling that needs a pid reuse in the same instant, which is the residue
+    /// `prune_dead_attachments` already documents and lives with. Cleared wherever the session is
+    /// replaced ([`Self::forget_the_previous_session`]), since engine ids belong to a session.
+    ///
+    /// It gains at most one entry per process the engine ever stops on, and a session holds a
+    /// handful of processes, so there is nothing here to evict.
+    stopped_on: Mutex<std::collections::BTreeSet<(u32, u32)>>,
 }
 
 impl Default for DebugEngine {
@@ -1612,6 +1629,7 @@ impl DebugEngine {
             deferred_inputs: Mutex::new(Vec::new()),
             interrupt_raised: Arc::new(AtomicBool::new(false)),
             attached_processes: Mutex::new(std::collections::HashSet::new()),
+            stopped_on: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -1644,6 +1662,7 @@ impl DebugEngine {
             deferred_inputs: Mutex::new(Vec::new()),
             interrupt_raised: Arc::new(AtomicBool::new(false)),
             attached_processes: Mutex::new(std::collections::HashSet::new()),
+            stopped_on: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -2176,7 +2195,7 @@ impl DebugEngine {
         // A live kernel needs an INFINITE WaitForEvent (a finite timeout returns
         // E_NOTIMPL); INITIAL_BREAK makes it stop at the first event. `wait()` bounds it
         // so an unresponsive target can't hang the engine thread forever.
-        self.forget_attachments();
+        self.forget_the_previous_session();
         Ok(PendingTarget::new(self, WaitKind::KernelBreakIn))
     }
 
@@ -2236,7 +2255,7 @@ impl DebugEngine {
         // it so an unreachable target can't hang the engine thread forever. The connection
         // string rides along because that link is only established during the wait.
         self.retain_deferred_input(TargetInput::Ansi(connection));
-        self.forget_attachments();
+        self.forget_the_previous_session();
         Ok(PendingTarget::new(self, WaitKind::KernelBreakIn))
     }
 
@@ -2298,13 +2317,6 @@ impl DebugEngine {
             let presence = self.presence_of(arrival);
             match presence {
                 Presence::Arrived => return Ok(()),
-                // Before this call has pumped anything the last event is somebody else's news — it
-                // says where *they* stopped — so a target already in the session is the whole of
-                // what can honestly be asked here. Measured: without this, a guard waited after two
-                // targets had been pumped in takes 29.4s and `E_UNEXPECTED`, against 6µs for one
-                // waited after a single target. It cannot fire on an ordinary open, whose process
-                // is not in the session until a wait puts it there.
-                Presence::Listed if !waited => return Ok(()),
                 Presence::Unknown if waited => return Ok(()),
                 Presence::Listed | Presence::Absent | Presence::Unknown => {}
             }
@@ -2317,12 +2329,10 @@ impl DebugEngine {
             if left == 0 {
                 return match presence {
                     Presence::Absent => Err(DbgEngError::LiveTargetTimeout),
-                    // In the session, but this pump never saw its event. "Not observed" is not
-                    // "never arrived": the last event is one session-wide slot that a later event
-                    // overwrites, so a target that stopped for somebody else's pump before this
-                    // guard was waited on reads exactly like one that never got there. Reporting a
-                    // timeout on a process visibly in front of us would be claiming absence where
-                    // the truth is unknown — see docs/unknown-not-absent.md.
+                    // In the session, and never seen to stop. "Not observed to stop" is not "never
+                    // arrived", and reporting a timeout on a process visibly in front of us would
+                    // be claiming absence where the truth is unknown — see
+                    // docs/unknown-not-absent.md.
                     _ => Ok(()),
                 };
             }
@@ -2338,20 +2348,25 @@ impl DebugEngine {
     /// processes that process's create event and carries on — the initial breakpoint arrives later,
     /// after the loader has done its early work. A competing target breaking in between the two
     /// leaves this open's process listed and not yet where the open promised to leave it. So the
-    /// last event has to be **this** target's, which is what `sxe ibp` armed and what the doc
-    /// comments on both openers say they wait for.
+    /// target has to have **stopped**, which is what `sxe ibp` armed and what the doc comments on
+    /// both openers say they wait for.
+    ///
+    /// **It is asked of [`Self::stopped_on`] and not of the last event**, which is the whole of
+    /// what three rounds of review on this predicate settled. `GetLastEventInformation` is a single
+    /// session-wide slot that every later event overwrites, so read directly it answers "not this
+    /// target" for a target still on its way *and* for one that stopped before this guard was
+    /// waited on — and every rule that tried to tell those apart from the reading alone moved the
+    /// defect somewhere else. The record is per target and does not decay, so the question becomes
+    /// a plain one: has this engine ever stopped on this process.
     ///
     /// **The three answers are three states, not a boolean with excuses**, and the middle one is
-    /// what keeps the strictness above from becoming a lie of its own. The last event is a single
-    /// session-wide slot that every later event overwrites, so it can say "not this target" both
-    /// for a target still on its way and for one that stopped before this guard was waited on.
-    /// [`Presence::Listed`] is that pair held apart: keep pumping for the event, but do not let its
-    /// absence be reported as the target's.
+    /// what keeps the strictness from becoming a lie of its own. [`Presence::Listed`] is a target
+    /// in the session that has not stopped yet: worth pumping for, and not a missing process to
+    /// report at the bound.
     ///
     /// Every failure to *ask* answers [`Presence::Unknown`] rather than [`Presence::Absent`],
     /// which is the difference between a wait that ends where it always did and one that pumps an
-    /// engine holding nothing until it faults. That includes the last event: an engine that cannot
-    /// name one is not evidence of a target still coming.
+    /// engine holding nothing until it faults.
     fn presence_of(&self, arrival: &Arrival) -> Presence {
         let (Ok(true), Ok(held)) = (self.has_target(), self.session_processes()) else {
             return Presence::Unknown;
@@ -2369,13 +2384,18 @@ impl DebugEngine {
                     .find(|entry| !before.contains(entry) && !attached.contains(&entry.1))
             }
         };
-        let Some((id, _)) = ours else {
+        let Some(entry) = ours else {
             return Presence::Absent;
         };
-        match self.last_event_process() {
-            Ok(stopped_on) if stopped_on == *id => Presence::Arrived,
-            Ok(_) => Presence::Listed,
-            Err(_) => Presence::Unknown,
+        if self
+            .stopped_on
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(entry)
+        {
+            Presence::Arrived
+        } else {
+            Presence::Listed
         }
     }
 
@@ -2622,7 +2642,32 @@ impl DebugEngine {
             return Err(DbgEngError::CommandFailed(result.err().unwrap()));
         }
 
+        self.note_where_it_stopped();
         Ok(())
+    }
+
+    /// Records which process this engine has just stopped on, for [`Self::stopped_on`].
+    ///
+    /// **Here rather than in the pump that wants it**, because the fact it preserves is destroyed
+    /// by the *next* wait from any source: a caller that drives the engine itself — the documented
+    /// way to complete a target whose guard has been dropped — must leave the same record behind
+    /// as [`Self::wait_for_live_target`]'s own pumping, or a guard waited afterwards reads its own
+    /// arrival as a target still coming.
+    ///
+    /// Best-effort throughout: an engine with no event to name, a dump, a wait that expired
+    /// without stopping. Every one of those means "nothing to add" rather than a failure, and this
+    /// is on the path of every wait in the crate, so none of them may fail one.
+    fn note_where_it_stopped(&self) {
+        let (Ok(id), Ok(held)) = (self.last_event_process(), self.session_processes()) else {
+            return;
+        };
+        let Some(entry) = held.into_iter().find(|(held, _)| *held == id) else {
+            return;
+        };
+        self.stopped_on
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(entry);
     }
 
     /// `WaitForEvent` with the INFINITE timeout a live kernel requires, but **bounded**:
@@ -2651,6 +2696,12 @@ impl DebugEngine {
             let _ = handle.interrupt();
         });
         let result = unsafe { self.control.WaitForEvent(0, WAIT_INFINITE) };
+        // Same reason as in `wait_for_event`, and it has to be both of them: `PendingTarget` names
+        // `execute_and_wait` and `run_to_address` as pumps that complete a target whose guard has
+        // been dropped, and those two come through here rather than there.
+        if result.is_ok() {
+            self.note_where_it_stopped();
+        }
         (result, watchdog.disarm())
     }
 
@@ -4381,7 +4432,7 @@ impl DebugEngine {
                 .OpenDumpFileWide(PCWSTR::from_raw(wide.as_ptr()), 0)
         }
         .map_err(DbgEngError::OperationFailed)?;
-        self.forget_attachments();
+        self.forget_the_previous_session();
         Ok(())
     }
 
@@ -4451,15 +4502,23 @@ impl DebugEngine {
             .retain(|pid| held.iter().any(|(_, held)| held == pid));
     }
 
-    /// Forgets every recorded attach.
+    /// Forgets every recorded attach, and every process this engine had stopped on.
     ///
     /// Called when the session ends, and by the openers that **create** a target — a dump, a
     /// trace, a kernel connection. Those replace the session outright, so a pid recorded against
     /// the previous one is stale, and the one way a stale pid could matter is the one that would
     /// hurt: the operating system reusing it for a process this engine went on to launch, which
     /// would then be detached from and survive a session that is supposed to take it.
-    fn forget_attachments(&self) {
+    ///
+    /// [`Self::stopped_on`] goes with it for a plainer reason: an engine process id names a slot
+    /// in *a* session, so carrying one across would let the next session's first process inherit
+    /// an answer about a process that is gone.
+    fn forget_the_previous_session(&self) {
         self.attached_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.stopped_on
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -4704,9 +4763,13 @@ enum WaitKind {
 ///
 /// **A launch is identified by elimination and an attach by name**, because `CreateProcessWide`
 /// hands back no pid — the process does not exist yet — while `AttachProcess` is given one. Naming
-/// the process is only half of it: what ends the wait is the **last event belonging to it**, since
-/// membership is the weaker claim and the gap between the two is a window rather than an instant
-/// (`DebugEngine::presence_of`).
+/// the process is only half of it: what ends the wait is that process having **stopped**, which is
+/// the weaker claim membership is not — a process is registered when its create event is
+/// processed and its initial break comes later. That is what `DebugEngine::stopped_on` records,
+/// and reading it there rather than reading `GetLastEventInformation` in the moment is the part
+/// that took three rounds of review to get right: the last event is one session-wide slot, so any
+/// rule built on the reading alone answers the same way for a target still coming and for one that
+/// stopped before this guard was waited on.
 ///
 /// **The elimination is exact for opens made one after another and ambiguous for two launches
 /// pending at once**, where the first arrival is new to both snapshots and so ends both waits —
@@ -7123,11 +7186,11 @@ mod tests {
     /// happens next. Measured across this fix — **29.36s and `E_UNEXPECTED`** (the `ping` outran
     /// its own bound and took the target with it) against **8.6µs and `Ok`**.
     ///
-    /// Two phases, because the evidence a wait can consult is different in each. With one target
-    /// the engine's last event is still this one's; with a second target arrived since, it is not,
-    /// and the wait has only membership to go on. The rule that falls out — the last event governs
-    /// the pumping a wait does itself, and the ask it makes before pumping is membership — is the
-    /// one two rounds of review on this branch converged on.
+    /// Two phases, because they differ in what the engine's last event says at the moment of the
+    /// wait: with one target it is still this one's, and with a second target arrived since it is
+    /// not. Both must pass, and that they can is the argument for `stopped_on` being a record
+    /// written as each wait observes a stop rather than a reading taken from one slot afterwards —
+    /// which is where three rounds of review on this branch ended up.
     ///
     /// The deterministic half of dbgscope#128, and the only half that is: the issue's own failure
     /// is a race that reproduces a few times in forty rounds under CPU load and never on a quiet
@@ -7172,9 +7235,9 @@ mod tests {
 
         // And again with the engine's last event no longer this target's. `GetLastEventInformation`
         // is one session-wide slot, so a second target arriving overwrites the evidence that this
-        // one ever stopped — which is why the ask a wait makes *before* pumping is membership, and
-        // the last event governs only the pumping the wait does itself. Measured across that rule:
-        // 29.4s and `E_UNEXPECTED` without it, 5.4µs with.
+        // one ever stopped — which is why `stopped_on` records it as each wait observes it rather
+        // than being read back from that slot later. Measured across that record: 29.4s and
+        // `E_UNEXPECTED` without it, single-digit µs with.
         let mut theirs = a_process_to_attach_to();
         let e = DebugEngine::new();
         let pending = e
