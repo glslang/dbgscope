@@ -111,6 +111,13 @@ All notable changes to this project are documented here. The format follows
   the first's answer. With the fix, 0 short in 40 rounds under the same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
+- **`run_to_address` no longer leaves its watchdog's interrupt raised.** It was the one bounded
+  path that neither cleared the shared flag when it began nor consumed it when it ended, which
+  cost it nothing of its own -- it classifies by the watchdog's private flag -- and cost everything
+  else once the arrival record began reading the shared one: a single timed-out run left every
+  later wait declining to record a real initial break, and any live open still held pumping to its
+  bound for a target that had already stopped. All five paths that pump now clear on the way in,
+  and this one consumes on the way out.
 - **A live open a host interrupts now ends, instead of pumping through the break.** New:
   `DbgEngError::LiveTargetInterrupted`. The pumping this release introduces made an interrupt
   something the open ignored -- before it, a live open was a single `WaitForEvent`, so the break
