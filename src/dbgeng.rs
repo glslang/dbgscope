@@ -3903,43 +3903,48 @@ impl DebugEngine {
                 .map_err(DbgEngError::BreakpointFailed)?;
         }
 
-        // **Last, after every step that can fail** — which is what makes replacing safe rather than
-        // where in the middle it is least unsafe. Review found the caller's breakpoints destroyed
-        // by a later failure three times, at three different positions for this block, because each
-        // fix moved it past one fallible step and left the next one behind it. There is no position
-        // in the middle that works: the property wanted is "nothing is destroyed unless the
-        // replacement is certain", and only the end of the sequence has that.
-        //
-        // What that gives up is the ordering's original reason — that the address is never armed
-        // twice — and it is worth less than it sounds. The window is between `AddFlags` and this
-        // block, and the engine is not pumping in it: nothing here resumes the target, and a
-        // `DebugEngine` drives one engine from one thread, so the target cannot execute between
-        // those two statements. An unobservable double-arm against a caller permanently losing
-        // breakpoints is not a close trade.
-        //
-        // Best-effort, and `replaced` reports what was actually taken rather than what was
-        // intended. A failure here cannot be raised: the mutation this call exists for has
-        // *happened*, it is armed, and reporting a cleanup failure as the call failing is what
-        // gets a caller to retry and set a second breakpoint — the same rule the openers follow
-        // when a post-commit step fails. One that could not be removed is simply still in
-        // `breakpoints()` and absent from `replaced`, where the caller can see it.
-        let replaced = match (spec.on_existing, resolved) {
-            // Deferred resolves to `None`, so there is nothing to replace — the asymmetry `bp` has
-            // too: duplicates pile up exactly where the expression does not resolve.
-            (OnExisting::Replace, Some(address)) => {
-                match unsafe { breakpoint.breakpoint.GetId() } {
-                    Ok(id) => self.remove_breakpoints_at(address, id),
-                    Err(_) => Vec::new(),
-                }
-            }
-            _ => Vec::new(),
-        };
-
         // Read back through the same getters `breakpoints()` uses, so what is reported is what the
         // engine holds rather than an echo of the spec — the difference being whether the
         // expression resolved, and to what.
+        //
+        // Before the removal below, because it is fallible and the removal is destructive. It
+        // reports the new breakpoint's own fields, none of which the removal can change, so
+        // nothing is lost by asking early.
         let info = breakpoint_info(&breakpoint.breakpoint, "just set")?;
+        // The last thing that can fail is now behind us, so the breakpoint belongs to the session
+        // whatever happens next.
         breakpoint.keep();
+
+        // **After every step that can fail, and nothing fallible follows it** — which is what makes
+        // replacing safe, rather than the search for a position in the middle where it is least
+        // unsafe. Review found the caller's breakpoints destroyed by a later failure *four* times,
+        // at four positions for this block, because each fix moved it past one fallible step and
+        // left the next one behind it — the last of them past `AddFlags`, leaving it in front of
+        // this function's own read-back. The property wanted is "nothing is destroyed unless the
+        // replacement is certain", which is a statement about the end of the sequence; the only way
+        // to hold it is to have nothing after, and that is now checkable by looking rather than by
+        // reasoning: below this line there is no `?`.
+        //
+        // What that gives up is the ordering's original reason — that the address is never armed
+        // twice — and it is worth less than it sounds. The window is between `AddFlags` and here,
+        // and the engine is not pumping in it: nothing in this call resumes the target, and a
+        // `DebugEngine` drives one engine from one thread, so the target cannot execute across it.
+        // An unobservable double-arm against a caller permanently losing breakpoints is not a close
+        // trade.
+        //
+        // Best-effort, and `replaced` reports what was actually taken rather than what was
+        // intended. A failure here cannot be raised: the mutation this call exists for has
+        // *happened*, it is armed, and reporting a cleanup failure as the call failing is what gets
+        // a caller to retry and set a second breakpoint — the same rule the openers follow when a
+        // post-commit step fails. One that could not be removed is simply still in `breakpoints()`
+        // and absent from `replaced`, where the caller can see it.
+        let replaced = match (spec.on_existing, resolved) {
+            // Deferred resolves to `None`, so there is nothing to replace — the asymmetry `bp` has
+            // too: duplicates pile up exactly where the expression does not resolve.
+            (OnExisting::Replace, Some(address)) => self.remove_breakpoints_at(address, info.id),
+            _ => Vec::new(),
+        };
+
         Ok(BreakpointSet {
             breakpoint: info,
             replaced,
