@@ -2324,6 +2324,11 @@ impl DebugEngine {
     ///   wait answering `E_UNEXPECTED` in 37µs), so propagating is what keeps this from turning a
     ///   fast, accurate failure into a half-minute of pumping a session that has nothing in it.
     fn wait_for_live_target(&self, arrival: &Arrival) -> Result<(), DbgEngError> {
+        // Whatever was raised before this belongs to the last operation; the same line, for the
+        // same reason, as `execute_and_wait` and `settle`. Without it a stale flag would stop
+        // every stop here being recorded and leave the open pumping to its bound -- an answer that
+        // is still right and thirty seconds late.
+        self.interrupt_raised.store(false, Ordering::SeqCst);
         let deadline = Instant::now() + Duration::from_millis(u64::from(LIVE_WAIT_MS));
         let mut waited = false;
         loop {
@@ -2709,6 +2714,20 @@ impl DebugEngine {
     /// failure, and this is on the path of every wait in the crate, so none of them may fail
     /// one.
     fn note_where_it_stopped(&self) {
+        // A break somebody asked for is not this target's initial breakpoint. Both origins raise
+        // this flag -- the watchdog's deadline through `InterruptHandle::interrupt`, which is what
+        // `test_a_watchdog_forced_break_records_no_stop` holds, and a host through the same call
+        // -- so asking here covers every wait in the crate and no new one can forget it. That is
+        // why it is here rather than at the three call sites: it arrived as three review rounds,
+        // one door at a time.
+        //
+        // `load` and not `swap`, because `execute_and_wait` and its siblings consume this to build
+        // `Interruption::OnRequest`. The precondition is that a pump clears it when its operation
+        // begins, which those three and `wait_for_live_target` all do; a path that does not merely
+        // records less, which costs a pump rather than the postcondition.
+        if self.interrupt_raised.load(Ordering::SeqCst) {
+            return;
+        }
         let (Ok(id), Ok(held)) = (self.last_event_process(), self.session_processes()) else {
             return;
         };
@@ -2760,17 +2779,11 @@ impl DebugEngine {
         // that would let its guard report an initial-break wait that never happened. Standing
         // down costs a pump; recording it wrongly costs the postcondition.
         //
-        // **Both origins, because the target cannot tell them apart.** The watchdog's deadline and
-        // a host's `InterruptHandle` reach the engine through the same `SetInterrupt` and produce
-        // the same break; only the *advice* differs, which is what `Interruption`'s two variants
-        // are for and what the callers below use `by_watchdog` to decide. The question here is not
-        // which asked but whether anyone did, so it is one condition rather than two.
-        //
-        // `load` and not `swap`: those callers consume this flag to build
-        // [`Interruption::OnRequest`], and taking it here would report every host interrupt as a
-        // stop the target made on its own.
-        let synthetic = timed_out || self.interrupt_raised.load(Ordering::SeqCst);
-        if result.is_ok() && !synthetic {
+        // The forced break stands down inside [`Self::note_where_it_stopped`] rather than here,
+        // because a host's `InterruptHandle` produces the identical stop and the finite wait has
+        // the same exposure -- three rounds of review found that as three separate defects. All
+        // this site knows that the recorder does not is whether a wait produced an event at all.
+        if result.is_ok() {
             self.note_where_it_stopped();
         }
         (result, timed_out)
@@ -7533,6 +7546,52 @@ mod tests {
                 .unwrap_or_else(|err| err.into_inner())
                 .is_empty(),
             "a break a host asked for was recorded as the target arriving"
+        );
+    }
+
+    /// **The finite wait too**, which is the one a live open pumps with -- so of the three doors
+    /// onto this record it is the one where a false arrival reaches the guard directly.
+    ///
+    /// `execute_command("g")` sets the run state and returns; the target does not move until a
+    /// wait pumps it, and here that wait is the plain finite one rather than the bounded path the
+    /// other two tests take. A host break during it returns `S_OK`, so neither the error check nor
+    /// the `S_FALSE` check stands it down -- only the rule inside `note_where_it_stopped` does.
+    ///
+    /// The status assertion is what stops this passing vacuously: if the break never landed the
+    /// wait would expire with the target still running, record nothing, and satisfy the rest.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_host_requested_break_records_no_stop_on_the_finite_wait() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        e.launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        e.stopped_on
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+
+        unsafe { e.control.SetExecutionStatus(DEBUG_STATUS_GO) }.expect("could not set it running");
+        let handle = e.interrupt_handle();
+        let asked = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            handle.interrupt()
+        });
+        e.wait_for_event(10_000)
+            .expect("the wait should return on the break");
+        asked.join().expect("interrupting thread panicked").ok();
+
+        assert_eq!(
+            e.execution_status().ok(),
+            Some(DEBUG_STATUS_BREAK),
+            "the target is not stopped, so no break landed and nothing here is under test"
+        );
+        assert!(
+            e.stopped_on
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_empty(),
+            "a break a host asked for was recorded as an arrival by the finite wait"
         );
     }
 
