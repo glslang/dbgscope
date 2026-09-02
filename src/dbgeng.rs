@@ -5765,14 +5765,25 @@ mod tests {
 
     /// A launched target gets a console of its **own**, and that console has **no window**.
     ///
-    /// The two halves are one flag ([`CREATE_NO_WINDOW`]) and they fail in opposite directions.
-    /// Without a console, a console target's prints land in the *launching* process's stdout,
-    /// which for an MCP host is its JSON-RPC channel. With a console on the desktop — which is
-    /// `CREATE_NEW_CONSOLE`, what this passed until
-    /// [#129](https://github.com/glslang/dbgscope/issues/129) — every launch opens a window and
+    /// Three claims, because two of them are what an onlooker doubts about
+    /// [`CREATE_NO_WINDOW`]: that the target has a console *at all*, and that the console is not
+    /// this process's. They fail in opposite directions. With no console, a console target's
+    /// prints land in the *launching* process's stdout — which for an MCP host is its JSON-RPC
+    /// channel — and `GetConsoleMode`, `ReadConsole` and the rest fail outright. With a console on
+    /// the desktop, which is `CREATE_NEW_CONSOLE` and what this passed until
+    /// [#129](https://github.com/glslang/dbgscope/issues/129), every launch opens a window and
     /// takes the foreground.
     ///
-    /// The second half is a *negative*, so it is calibrated rather than asserted into the void: a
+    /// **The console is asked for by the target, not inferred here.** `mode con` is stock Windows
+    /// and queries `CON` directly, so its own stdout being redirected to a file says nothing about
+    /// which console answered: it prints a status with dimensions and a code page where there is
+    /// one, and fails where there is not. Measured against all four flags on this bench — no
+    /// flags, `CREATE_NEW_CONSOLE` and `CREATE_NO_WINDOW` all report `Status for device CON`, and
+    /// `DETACHED_PROCESS` writes nothing, which is what a process with genuinely no console looks
+    /// like and is a different flag from this one. That is the check `!ours.contains(&target)`
+    /// cannot make on its own, since a target with no console passes it too.
+    ///
+    /// The window claim is a *negative*, so it is calibrated rather than asserted into the void: a
     /// control spawned here with `CREATE_NEW_CONSOLE` has to show its window first, and only then
     /// is the debuggee — launched earlier, and by now stopped at its loader breakpoint — asked
     /// whether it has one. A desktop that shows no window at all (a session-0 service, a runner
@@ -5788,8 +5799,12 @@ mod tests {
     fn a_launched_target_has_a_console_of_its_own_and_no_window() {
         use std::os::windows::process::CommandExt;
 
+        let probe =
+            std::env::temp_dir().join(format!("dbgscope-console-probe-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&probe);
+
         let e = DebugEngine::new();
-        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+        e.launch_process(&format!("cmd.exe /c mode con > \"{}\"", probe.display()))
             .expect("launch failed");
         let target = e
             .current_process_system_id()
@@ -5829,6 +5844,19 @@ mod tests {
         let debuggee_has_one = has_a_visible_window(target);
         let _ = control.kill();
         let _ = control.wait();
+
+        // Let it run: the probe is written by the target, and the target has not run yet. Its
+        // ending is the expected outcome rather than a failure, and is reported as one.
+        let _ = e.execute_and_wait("g", 30_000);
+        let reported = std::fs::read_to_string(&probe).unwrap_or_default();
+        let _ = std::fs::remove_file(&probe);
+        assert!(
+            reported.contains("Status for device CON"),
+            "`mode con` in the debuggee reported no console (`{}`), so the target was launched \
+             with none at all rather than with one of its own — which is `DETACHED_PROCESS`, not \
+             this flag, and would take its console APIs with it",
+            reported.trim()
+        );
 
         if !calibrated {
             println!(
