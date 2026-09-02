@@ -5833,11 +5833,21 @@ mod tests {
         // The calibration: a window this desktop *does* show, spawned after the debuggee so that
         // by the time it appears the debuggee has had at least as long to open one.
         const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-        let mut control = std::process::Command::new("cmd.exe")
-            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+        let mut control = std::process::Command::new("ping.exe")
+            .args(["-n", "30", "127.0.0.1"])
+            // `ping.exe` itself rather than `cmd.exe /c ping`, because the control has to be
+            // *killable*. `kill` ends the process it spawned and nothing beneath it, so a `cmd`
+            // wrapper leaves the `ping` grandchild attached to the new console — and a console
+            // outlives its creator for as long as any client is still in it, so the window this
+            // test opens stays on the desktop for the rest of the thirty seconds, with ownership
+            // passing to `ping` as the remaining client. Measured before this: the window
+            // outlived a 0.36s run by 29.3s, which stacked one per run on a desktop this test
+            // exists to keep clear. Unwrapped, the control is its console's only client and
+            // killing it takes the window with it.
+            //
             // Its own handles, not ours: `Command` inherits by default, and this one is spawned
-            // by the test rather than by the engine — so without this its ping would print into
-            // the test's output and read exactly like a debuggee whose stdout leaked.
+            // by the test rather than by the engine — so without this its replies would print
+            // into the test's output and read exactly like a debuggee whose stdout leaked.
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
