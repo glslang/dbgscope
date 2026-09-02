@@ -236,6 +236,12 @@ pub struct InterruptHandle {
     /// `Execute` from a failed one *without* being the thread that asked. Without it an interrupt
     /// on request is indistinguishable from a command error, and the output captured up to the
     /// break is discarded with it — which is most of what an interrupted search is worth.
+    ///
+    /// **Shared with that engine, and not with another wrapper around the same client**, which is
+    /// the gap [`DebugEngine::stopped_on`] describes: `SetInterrupt` reaches the engine both
+    /// wrappers share, so a handle taken from one raises a break the other sees as a stop its
+    /// target made on its own -- and, since [`DebugEngine::note_where_it_stopped`] reads this to
+    /// decide, records as an arrival.
     raised: Arc<AtomicBool>,
 }
 // SAFETY: `control` is only ever handed to SetInterrupt, the one cross-thread-safe DbgEng call.
@@ -1492,6 +1498,26 @@ pub struct DebugEngine {
     ///
     /// It gains at most one entry per process the engine ever stops on, and a session holds a
     /// handful of processes, so there is nothing here to evict.
+    ///
+    /// **Per wrapper, where the fact is per client, and that is a known gap rather than a
+    /// decision.** Two `DebugEngine`s can be live around one `IDebugClient6` -- what
+    /// [`Self::from_client_interface`] is for, and what
+    /// `test_every_live_wrapper_sees_a_release_through_any_of_them` asserts -- and the target
+    /// identity was moved into a per-client registry ([`client_identities`]) precisely because a
+    /// view cached against the *session* must not be private to one wrapper. This is such a view
+    /// and is still a field. So a `wait_for_event` through wrapper B that pumps wrapper A's held
+    /// target to its initial break records it in B alone: A then reads [`Presence::Listed`], waits
+    /// again, and gets an unrelated event or `E_UNEXPECTED`. [`InterruptHandle`]'s flag has the
+    /// mirror of it.
+    ///
+    /// Not reachable through either consumer as they stand -- the extension wraps a borrowed
+    /// client for pool commands and never opens a target, so it never holds a guard, and
+    /// windbg-mcp runs one engine per worker process -- which is why this is written down rather
+    /// than fixed inside the change that introduced it. Fixing it is one `Arc<ClientState>` per
+    /// client holding both this and the interrupt flag, looked up by client pointer; a `Weak` map
+    /// would handle pointer reuse for free, where the identity registry needs `reissue_identity`
+    /// to. It is worth doing on its own, with its own review: it moves interrupt provenance that
+    /// four command paths read to decide whether a break was asked for.
     stopped_on: Mutex<std::collections::BTreeSet<(u32, u32)>>,
 }
 
