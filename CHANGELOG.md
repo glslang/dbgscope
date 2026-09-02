@@ -85,13 +85,21 @@ All notable changes to this project are documented here. The format follows
   (`examples/deferred_arrival.rs`, 40 rounds under CPU load): an `AttachProcess` break-in whose
   injected thread is slow to be scheduled lands a whole wait late, and the `launch_process` after
   it spends its only wait on that break — returning `Ok` with its process absent from the session,
-  3 times in 40, and 0 in 40 on a quiet machine. `PendingTarget::wait` now pumps until the session
-  holds the process the open created or claimed, within the same `LIVE_WAIT_MS` bound for the whole
-  open; the event is queued rather than lost, so it arrived on the very next wait every time it was
-  observed. A wait that cannot evaluate its own postcondition — a snapshot that would not read, a
-  session that has gone — returns as it did before, and one whose target is demonstrably still
-  missing at the bound answers the new `DbgEngError::LiveTargetTimeout` instead of a false success.
-  With the fix, 0 short in 40 rounds under the same load. Reported as
+  3 times in 40, and 0 in 40 on a quiet machine. `PendingTarget::wait` now pumps until the event it
+  stopped on belongs to the process the open created or claimed, within the same `LIVE_WAIT_MS`
+  bound for the whole open; the event is queued rather than lost, so it arrived on the very next
+  wait every time it was observed. **Membership in the session is not the terminal condition** —
+  `cpr` is an ignored filter, so a process is registered when its create event is processed and its
+  initial breakpoint arrives later, and a competing break in between would leave the open's process
+  listed but not where the open promised to leave it — so `presence_of` reads which process the
+  last event belongs to (`GetLastEventInformation`, by engine id, which
+  `test_the_last_event_names_its_process_by_engine_id` pins against `session_processes`). A wait
+  that cannot evaluate its own postcondition — a snapshot that would not read, a session that has
+  gone, an engine naming no event — returns as it did before, and one whose target demonstrably has
+  not got there by the bound answers the new `DbgEngError::LiveTargetTimeout` instead of a false
+  success. That names one case nothing named before: an attach whose break-in never arrives, which
+  was already paying the bound and then answering `Ok`. With the fix, 0 short in 40 rounds under the
+  same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
 - A `PendingTarget` **waited after something else pumped its target in** no longer waits for the

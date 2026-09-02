@@ -86,15 +86,20 @@ pub enum DbgEngError {
     )]
     KernelBreakTimeout,
 
-    /// A user-mode open whose process never joined the session.
+    /// A user-mode open whose process never joined the session and stopped.
     ///
     /// The sibling of [`Self::KernelBreakTimeout`], and it exists because what it replaces was a
     /// lie rather than a different error: a live open used to be one `WaitForEvent`, which is one
     /// *event* and not necessarily this target's, so an open could return `Ok` with its process
     /// absent from the session (dbgscope#128). Reported only when the session stayed readable and
-    /// the target was demonstrably not in it — an open that cannot evaluate its own postcondition
-    /// returns `Ok` exactly as it did before, rather than failing on a probe.
-    #[error("the process did not join the session within the open timeout")]
+    /// the target demonstrably had not got there — an open that cannot evaluate its own
+    /// postcondition returns `Ok` exactly as it did before, rather than failing on a probe.
+    ///
+    /// The case it now names that nothing named before is an **attach whose break-in never
+    /// arrives**: a process suspended or wedged past the point where the injected thread can run
+    /// left the wait sitting out its bound and then answering `Ok`, and the bound was already
+    /// being paid.
+    #[error("the process did not join the session and stop within the open timeout")]
     LiveTargetTimeout,
 
     #[error("Operation failed: {0}")]
@@ -2307,17 +2312,26 @@ impl DebugEngine {
         }
     }
 
-    /// Whether the target a live open is waiting for has joined the session yet.
+    /// Whether the target a live open is waiting for has joined the session **and stopped**.
+    ///
+    /// Membership alone is the weaker claim, and the difference is a real window rather than a
+    /// pedantic one: `cpr` is an ignored filter, so the engine registers a process when it
+    /// processes that process's create event and carries on — the initial breakpoint arrives later,
+    /// after the loader has done its early work. A competing target breaking in between the two
+    /// leaves this open's process listed and not yet where the open promised to leave it. So the
+    /// last event has to be **this** target's, which is what `sxe ibp` armed and what the doc
+    /// comments on both openers say they wait for.
     ///
     /// Every failure to *ask* answers [`Presence::Unknown`] rather than [`Presence::Absent`],
     /// which is the difference between a wait that ends where it always did and one that pumps an
-    /// engine holding nothing until it faults.
+    /// engine holding nothing until it faults. That includes the last event: an engine that cannot
+    /// name one is not evidence of a target still coming.
     fn presence_of(&self, arrival: &Arrival) -> Presence {
         let (Ok(true), Ok(held)) = (self.has_target(), self.session_processes()) else {
             return Presence::Unknown;
         };
-        let arrived = match arrival {
-            Arrival::Attached(pid) => held.iter().any(|(_, held)| held == pid),
+        let ours = match arrival {
+            Arrival::Attached(pid) => held.iter().find(|(_, held)| held == pid),
             // Nothing to eliminate against, so nothing can be concluded.
             Arrival::Launched(None) => return Presence::Unknown,
             Arrival::Launched(Some(before)) => {
@@ -2326,14 +2340,50 @@ impl DebugEngine {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 held.iter()
-                    .any(|entry| !before.contains(entry) && !attached.contains(&entry.1))
+                    .find(|entry| !before.contains(entry) && !attached.contains(&entry.1))
             }
         };
-        if arrived {
-            Presence::Arrived
-        } else {
-            Presence::Absent
+        let Some((id, _)) = ours else {
+            return Presence::Absent;
+        };
+        match self.last_event_process() {
+            Ok(stopped_on) if stopped_on == *id => Presence::Arrived,
+            Ok(_) => Presence::Absent,
+            Err(_) => Presence::Unknown,
         }
+    }
+
+    /// The **engine** process id the engine's last event belongs to.
+    ///
+    /// `GetLastEventInformation`, asked for that field alone: the description is text this crate
+    /// has no use for, and passing a buffer for it would be a second allocation on a call made
+    /// once per pump. It is the engine id rather than the system pid — measured against
+    /// [`Self::session_processes`], which answers both — so callers join it to that pairing rather
+    /// than to a pid.
+    ///
+    /// Fails on an engine that has seen no event, which is every engine before its first wait, and
+    /// that failure is an answer of "cannot say" rather than "no".
+    fn last_event_process(&self) -> Result<u32, DbgEngError> {
+        let mut kind = 0u32;
+        let mut process = 0u32;
+        let mut thread = 0u32;
+        unsafe {
+            self.control.GetLastEventInformation(
+                &mut kind,
+                &mut process,
+                &mut thread,
+                None,
+                0,
+                None,
+                None,
+                None,
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "reading which target the last event belongs to".into(),
+            source,
+        })?;
+        Ok(process)
     }
 
     /// Sets (replaces) the symbol search path.
@@ -4612,7 +4662,7 @@ enum WaitKind {
     KernelBreakIn,
 }
 
-/// The user-mode process a live open is waiting to see join the session.
+/// The user-mode process a live open is waiting to see join the session and stop.
 ///
 /// **One `WaitForEvent` is one *event*, and not necessarily this target's.** The spawn a
 /// `CreateProcessWide` defers is realised inside that wait, but so is everything else the session
@@ -4627,7 +4677,10 @@ enum WaitKind {
 /// missing process was there on the *next* wait every time, never later than that.
 ///
 /// **A launch is identified by elimination and an attach by name**, because `CreateProcessWide`
-/// hands back no pid — the process does not exist yet — while `AttachProcess` is given one.
+/// hands back no pid — the process does not exist yet — while `AttachProcess` is given one. Naming
+/// the process is only half of it: what ends the wait is the **last event belonging to it**, since
+/// membership is the weaker claim and the gap between the two is a window rather than an instant
+/// (`DebugEngine::presence_of`).
 ///
 /// **The elimination is exact for opens made one after another and ambiguous for two launches
 /// pending at once**, where the first arrival is new to both snapshots and so ends both waits —
@@ -4653,7 +4706,7 @@ enum Arrival {
     Attached(u32),
 }
 
-/// Whether the target a live open is waiting for has joined the session yet.
+/// Whether the target a live open is waiting for has joined the session and stopped yet.
 enum Presence {
     Arrived,
     Absent,
@@ -4743,8 +4796,8 @@ impl<'a> PendingTarget<'a> {
     ///
     /// For a kernel attach this can block **without bound** when the target never connects;
     /// see [`DebugEngine::attach_kernel`]. User-mode waits are bounded by `LIVE_WAIT_MS` — for the
-    /// whole open rather than per wait, since a live open pumps until its own target is in the
-    /// session (see [`Arrival`]) instead of returning on the first event to arrive.
+    /// whole open rather than per wait, since a live open pumps until the event it stopped on is
+    /// its own target's (see [`Arrival`]) instead of returning on the first event to arrive.
     pub fn wait(self) -> Result<(), DbgEngError> {
         match self.kind {
             WaitKind::Live(arrival) => self.engine.wait_for_live_target(&arrival),
@@ -7070,6 +7123,50 @@ mod tests {
             "the launched process is not in the session the wait said it had joined"
         );
         e.end_session().expect("end_session failed");
+    }
+
+    /// **The last event names its process by *engine* id**, which is the join `presence_of` makes.
+    ///
+    /// Measured rather than taken from the documentation, because the two numbers a process has
+    /// here are nothing alike and comparing against the wrong one fails *silently* in the worst
+    /// direction: no arrival would ever match, so every live open would pump to `LIVE_WAIT_MS` and
+    /// answer `LiveTargetTimeout` on a target sitting in front of it. In a two-process session the
+    /// engine ids are 0 and 1 while the pids are five digits, so this cannot agree by coincidence.
+    ///
+    /// The second assertion is the tightened terminal condition itself: in a session that also
+    /// holds an attached process, the wait `launch_process` makes ends on the **launched**
+    /// process's event and not the attached one's.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_the_last_event_names_its_process_by_engine_id() {
+        let _debuggee = one_debuggee();
+        let mut theirs = a_process_to_attach_to();
+        let e = DebugEngine::new();
+        e.attach_process(theirs.id()).expect("attach failed");
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+
+        let held = e
+            .session_processes()
+            .expect("could not list the session's processes");
+        let stopped_on = e
+            .last_event_process()
+            .expect("the engine names no last event after a launch");
+        let (_, pid) = held
+            .iter()
+            .find(|(id, _)| *id == stopped_on)
+            .unwrap_or_else(|| {
+                panic!("the last event's process {stopped_on} is no engine id in {held:?}")
+            });
+        assert_ne!(
+            *pid,
+            theirs.id(),
+            "the launch's wait ended on the attached process's event rather than its own: {held:?}"
+        );
+
+        e.end_session().expect("end_session failed");
+        let _ = theirs.kill();
+        let _ = theirs.wait();
     }
 
     /// Execution control with no debuggee is **refused**, because letting it reach DbgEng takes
