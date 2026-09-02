@@ -32,6 +32,14 @@
 //!   engine's one slot recording where it stopped — 29.4s and `E_UNEXPECTED` when the ask reads
 //!   that slot, µs when it reads a record written as each wait observed a stop. That is the
 //!   argument for `stopped_on` being a record rather than a reading.
+//! - **The two endings of an open cannot meet** (arm I). An expired finite wait really is `Ok` —
+//!   `S_FALSE`, which the wrapper flattens (300ms bound, returned at 311ms) — so a wait that
+//!   expires while the engine holds nothing would end an open successfully with no debuggee. It
+//!   cannot: a wait with no debuggee *fails* rather than expiring, `E_UNEXPECTED` in 200µs on a
+//!   fresh engine and 14µs on one whose session has ended, and the loop propagates that. Both
+//!   openers are `has_target` false until the wait that realises them, and an attach to a pid
+//!   nothing owns is refused at `begin` (`0x80070057`) rather than at the wait. So no open passes
+//!   through "returned `Ok`, holds nothing".
 //! - **Membership is not the same claim as the initial break** (arm G). A process is registered
 //!   when its create event is processed — `cpr` is ignored — and its loader breakpoint arrives
 //!   later, so a competing break in between would end a wait with the process listed and not
@@ -324,6 +332,68 @@ fn a_guard_whose_event_was_overwritten() {
     let _ = theirs.wait();
 }
 
+/// Arm I: the two endings of a live open, and whether they can meet. Review round 6 on #133 read
+/// them as meeting â a finite `WaitForEvent` that expires returns `S_FALSE`, which the wrapper
+/// maps to `Ok`, so an open whose target never joined would end successfully with no debuggee. The
+/// question is whether a wait can *expire* while the engine holds nothing, or only fail.
+fn what_a_wait_can_conclude() {
+    println!("=== I. what a wait can conclude ===");
+
+    fn wait_once(what: &str, e: &DebugEngine) {
+        let started = Instant::now();
+        let waited = e.wait_for_event(300);
+        println!(
+            "   {what}: wait(300) -> {:?} in {:?}; has_target {:?}",
+            waited.as_ref().map(|_| "Ok").map_err(|err| err.to_string()),
+            started.elapsed(),
+            e.has_target()
+        );
+    }
+
+    let e = DebugEngine::new();
+    wait_once("fresh engine, never had a target", &e);
+    drop(e);
+
+    let e = DebugEngine::new();
+    e.launch_process(LAUNCH).expect("launch failed");
+    e.end_session().expect("end_session failed");
+    wait_once("after end_session", &e);
+    drop(e);
+
+    for (what, opened) in [("launch", true), ("attach", false)] {
+        let mut theirs = a_process_to_attach_to();
+        {
+            let e = DebugEngine::new();
+            let begun = if opened {
+                e.launch_process_begin(LAUNCH).map(drop)
+            } else {
+                e.attach_process_begin(theirs.id()).map(drop)
+            };
+            println!(
+                "   pending {what}: begin {:?}, has_target before the wait {:?}",
+                begun.as_ref().map(|()| "Ok").map_err(|err| err.to_string()),
+                e.has_target()
+            );
+            wait_once(&format!("pending {what}"), &e);
+        }
+        let _ = theirs.kill();
+        let _ = theirs.wait();
+    }
+
+    let e = DebugEngine::new();
+    println!(
+        "   attach to a pid nothing owns: begin {:?}",
+        e.attach_process_begin(0x000f_4240)
+            .map(drop)
+            .map_err(|err| err.to_string())
+    );
+    drop(e);
+
+    let e = DebugEngine::new();
+    e.launch_process(LAUNCH).expect("launch failed");
+    wait_once("a stopped target, nothing left to report", &e);
+}
+
 /// Arm C: the failure a pump must not turn into a hang — a launch whose image does not exist.
 /// The spawn is deferred, so this fails *inside* the wait, and a fix that pumps until a process
 /// appears has to see that failure rather than wait out its whole deadline.
@@ -404,6 +474,7 @@ fn main() {
     a_guard_whose_event_was_overwritten();
     a_target_that_arrived_before_its_wait();
     listed_before_the_wait();
+    what_a_wait_can_conclude();
     a_launch_that_cannot_start();
     forced_by_interrupt(rounds.max(1));
     forced();

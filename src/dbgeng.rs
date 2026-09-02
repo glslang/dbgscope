@@ -2297,11 +2297,20 @@ impl DebugEngine {
     /// [`Arrival`] has the measurement and why one wait is not enough. Four things about the shape
     /// here, each of which is a way to get it wrong:
     ///
-    /// - **[`Presence::Unknown`] means different things either side of the first wait**, which is
-    ///   why `waited` exists. Before it, it is the ordinary state of every open — an engine whose
-    ///   target has not materialised has no debuggee to ask about, so treating it as an answer
-    ///   would end a fresh launch's wait before the process existed. After one, it is a session
-    ///   there is nothing left to ask, and pumping it is what faults.
+    /// - **[`Presence::Unknown`] is "could not ask", and it is not what a fresh open starts in.**
+    ///   An engine whose target has not materialised answers `has_target` `Ok(false)`, which is
+    ///   knowledge and so [`Presence::Absent`]; what reaches `Unknown` is a probe that failed and
+    ///   an [`Arrival::Launched`] with no snapshot to diff against. `waited` is what stops the
+    ///   latter ending a launch before it happened: in a *mixed* session the target already there
+    ///   answers `has_target` on its behalf, so returning on the first ask would leave the
+    ///   deferred spawn unrealised. One wait is all this can do about it, and then it stops.
+    /// - **A wait cannot expire on an engine with no debuggee**, which is what keeps those two
+    ///   endings from meeting. Measured: `WaitForEvent` there fails `E_UNEXPECTED` in 1.5ms on a
+    ///   fresh engine and 4µs on one whose session has ended, while a wait with a debuggee and
+    ///   nothing to report returns `Ok` at its timeout (312ms for a 300ms bound). So "the wait
+    ///   returned `Ok` and the engine holds nothing" is not a state an open passes through, and
+    ///   the `Ok(false)` arm of [`Self::presence_of`] is a mapping made honest rather than a road
+    ///   taken — raised as a false success on review round 6 of #133, and measured instead.
     /// - **Asking first is safe, and it is measured rather than assumed.** Neither opener puts its
     ///   process in the session's list before the wait that completes it (measured: a session at 1
     ///   process, `attach_process_begin`, still 1, the pid absent — 2 after the wait), so the
@@ -2372,7 +2381,16 @@ impl DebugEngine {
     /// which is the difference between a wait that ends where it always did and one that pumps an
     /// engine holding nothing until it faults.
     fn presence_of(&self, arrival: &Arrival) -> Presence {
-        let (Ok(true), Ok(held)) = (self.has_target(), self.session_processes()) else {
+        match self.has_target() {
+            Ok(true) => {}
+            // Asked, and answered: an engine holding no debuggee at all holds nothing this open
+            // was waiting for. That is knowledge, so it is `Absent` — the reverse of the mistake
+            // docs/unknown-not-absent.md is about, and the same reading `attach_kernel`'s tail
+            // already treats as a timeout rather than as a question it could not put.
+            Ok(false) => return Presence::Absent,
+            Err(_) => return Presence::Unknown,
+        }
+        let Ok(held) = self.session_processes() else {
             return Presence::Unknown;
         };
         let ours = match arrival {
@@ -4590,14 +4608,14 @@ impl DebugEngine {
         // teardown may leave the session live and still owing that read, so the buffers stay
         // — retaining a few bytes for the life of the engine beats a use-after-free.
         //
-        // `stopped_on` goes on the same condition, for a sharper version of the same reason:
-        // engine process ids are handed out from zero again for the next session, so a pair that
-        // outlives this one can be matched by a later process that inherited both numbers — which
-        // for two `attach_process` calls to the same pid on one engine is the ordinary case rather
-        // than a coincidence. `presence_of` would then answer `Arrived` on membership alone, which
-        // is the weaker claim this whole path exists to stop relying on. A teardown that failed
-        // may leave the session live, and its stops with it. (`detach_attached_processes` already
-        // takes the attach record; this is the other half of what a session owns.)
+        // `stopped_on` goes on the same condition, for a sharper version of the same reason: engine process ids are handed out from zero again for the next
+        // session, so a pair that outlives this one can be matched by a later process that
+        // inherited both numbers — which for two `attach_process` calls to the same pid on one
+        // engine is the ordinary case rather than a coincidence. `presence_of` would then answer
+        // `Arrived` on membership alone, which is the weaker claim this whole path exists to stop
+        // relying on. A teardown that failed may leave the session live, and its stops with it.
+        // (`detach_attached_processes` already takes the attach record; this is the other half of
+        // what a session owns.)
         if ended.is_ok() {
             self.release_deferred_inputs();
             self.stopped_on
@@ -4814,18 +4832,21 @@ enum Arrival {
 
 /// Whether the target a live open is waiting for has joined the session and stopped yet.
 enum Presence {
-    /// In the session, and the engine's last event is its own.
+    /// In the session, and this engine has been seen to stop on it.
     Arrived,
-    /// In the session, but the engine stopped on something else's event. Worth pumping for, and
-    /// **not** worth reporting as a missing target at the bound: the last event is one slot, so a
-    /// target that stopped before this guard was waited on reads the same as one still coming.
+    /// In the session, and not yet seen to stop. Worth pumping for, and **not** worth reporting as
+    /// a missing target at the bound: a process is registered when its create event is processed
+    /// and its initial break comes later, so this is as much "on its way" as it is "stopped while
+    /// nobody was recording".
     Listed,
-    /// Not in the session at all.
+    /// Not held by this session — including a session holding nothing at all, which is an answer
+    /// and not a failure to ask.
     Absent,
-    /// Not answerable: the session holds nothing to ask, or the ask itself failed. It ends the
-    /// wait where a single `WaitForEvent` used to end it, rather than pumping — driving an engine
-    /// that no longer has a debuggee is the fault [`DebugEngine::execute_command`] guards against,
-    /// and a probe that failed is no evidence the target is missing.
+    /// **Not answerable**, which is only ever the ask itself failing: `has_target` unreadable,
+    /// the process list unreadable, or a launch with no snapshot to diff its arrival against.
+    /// An empty session is [`Self::Absent`], not this. It ends the wait where a single
+    /// `WaitForEvent` used to end it, rather than pumping, because a probe that failed is no
+    /// evidence the target is missing.
     Unknown,
 }
 
@@ -7318,6 +7339,62 @@ mod tests {
 
         let _ = theirs.kill();
         let _ = theirs.wait();
+    }
+
+    /// **A wait cannot expire on an engine with no debuggee**, which is the fact that keeps a
+    /// live open from ever ending `Ok` with nothing behind it.
+    ///
+    /// Review round 6 on #133 read the two halves as meeting: a finite `WaitForEvent` that expires
+    /// returns `S_FALSE`, which the generated wrapper maps to `Ok`, and `presence_of` answering
+    /// `Unknown` for an empty session would then end the open successfully. The first half is
+    /// true â a 300ms wait on a target with nothing to report returns `Ok` at 312ms â and the
+    /// composite is not, because the wait *errors* rather than expiring once the debuggee is gone.
+    /// Pinned here rather than argued, since it is a claim about an engine build and the next one
+    /// is free to disagree; if it ever does, the arm below becomes a road rather than a mapping.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_wait_with_no_debuggee_fails_rather_than_expiring() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        assert!(
+            !e.has_target().expect("could not read the execution status"),
+            "a fresh engine reported a debuggee"
+        );
+        let started = Instant::now();
+        let waited = e.wait_for_event(300);
+        let took = started.elapsed();
+        assert!(
+            waited.is_err(),
+            "a wait on an engine with no debuggee returned {waited:?} instead of failing â if it              now expires, `presence_of`'s empty-session arm is reachable and wants a bound test"
+        );
+        assert!(
+            took < Duration::from_millis(300),
+            "the wait took {took:?}, which is the timeout rather than a failure"
+        );
+    }
+
+    /// **An empty session is an answer**, so `presence_of` calls it [`Presence::Absent`] and not
+    /// [`Presence::Unknown`].
+    ///
+    /// The two are indistinguishable at the top of the loop â both pump â and differ only at the
+    /// bound, where `Absent` is [`DbgEngError::LiveTargetTimeout`] and `Unknown` is `Ok`. So this
+    /// asserts the mapping rather than a behaviour: the state cannot be held at the bound while
+    /// the test above holds, and the point of writing it down is that the two are pinned together.
+    /// Both arrivals, because `has_target` is asked before either is looked at and a launch with
+    /// no snapshot must not reach its own `Unknown` by a different road.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_session_holding_nothing_is_absence_rather_than_a_question() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        assert!(
+            matches!(e.presence_of(&Arrival::Attached(4)), Presence::Absent),
+            "an engine with no debuggee could not say an attached pid was missing"
+        );
+        assert!(
+            matches!(e.presence_of(&Arrival::Launched(None)), Presence::Absent),
+            "an engine with no debuggee deferred to the launch snapshot it does not have"
+        );
     }
 
     /// **The last event names its process by *engine* id**, which is the join `presence_of` makes.
