@@ -105,11 +105,15 @@ All notable changes to this project are documented here. The format follows
   watchdog, and failed on the coverage job of a docs-only PR. Three things were wrong with it, and
   the first meant it was not testing the property at all: armed and disarmed back to back, the
   watchdog's thread usually had not run yet, so it saw the flag at the top of its loop and returned
-  without ever reaching a wait — **the test passed with the condvar reverted**. It now lets the
-  thread park first, bounds the disarm by `WATCHDOG_REPEAT` (the poll interval the condvar
-  replaced) halved rather than by an absolute 50ms, and takes the **fastest** of five rounds, since
-  a loaded runner makes some rounds slow while a watchdog that sleeps makes every round slow.
-  Checked both ways: it passes in 0.13s, and fails at 178.9ms against the reverted condvar.
+  without ever reaching a wait — **the test passed with the condvar reverted**. The timing is now
+  taken on a watchdog whose deadline has passed, after its own counter says it fired, so the parked
+  thread is a **reading rather than an assumption** (a fixed sleep only makes an unparked thread
+  unlikely, and a runner slow enough to matter is where that assumption fails). It bounds the
+  disarm by `WATCHDOG_REPEAT` — the poll interval the condvar replaced — halved, rather than by an
+  absolute 50ms, and takes the **median** of five rounds: the maximum measures the machine, and the
+  minimum lets one stray round excuse a regression. The never-fires half is asserted separately, on
+  a watchdog 30s from its deadline, where no handshake is available. Checked both ways: 0.13s
+  green, and red against the reverted condvar with all five rounds at 177-182ms.
 - `BreakpointInfo::expression`'s documentation described only what `bp` does. A breakpoint whose
   location was set through `SetOffsetExpression` **keeps** its expression beside a resolved address,
   where one set by `bp` has the text discarded once it resolves — so `None` there is not the

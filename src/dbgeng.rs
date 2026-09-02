@@ -4623,14 +4623,24 @@ enum WaitKind {
 /// made a test fail on its own guard rather than on the property it was written for.
 ///
 /// So the wait pumps instead, which is sound because the event is queued rather than lost:
-/// `examples/deferred_arrival.rs` under CPU load came up short 5 times across 90 rounds and the
+/// `examples/deferred_arrival.rs` under CPU load came up short 3 times in 40 rounds and the
 /// missing process was there on the *next* wait every time, never later than that.
 ///
 /// **A launch is identified by elimination and an attach by name**, because `CreateProcessWide`
-/// hands back no pid — the process does not exist yet — while `AttachProcess` is given one. The
-/// elimination is exact for opens made one after another, which is every caller this crate has and
-/// the shape the issue is about; two launches pending *at once* cannot be told apart by it, and
-/// either one ends both waits.
+/// hands back no pid — the process does not exist yet — while `AttachProcess` is given one.
+///
+/// **The elimination is exact for opens made one after another and ambiguous for two launches
+/// pending at once**, where the first arrival is new to both snapshots and so ends both waits —
+/// including, since the ask precedes the first wait, without waiting at all. Every caller this
+/// crate has makes its opens sequentially, `PendingTarget` describes holding a guard as a way to
+/// commit bookkeeping between the two halves of *one* open, and nothing here launches twice before
+/// waiting. Two fixes for it were weighed and both cost more than the ambiguity. Telling the
+/// launches apart needs the engine to *record* which arrivals earlier waits claimed — new
+/// engine-wide state, cleared everywhere a session is replaced and pruned for pid reuse the way
+/// `prune_dead_attachments` is, where a stale claim makes a legitimate launch wait out
+/// `LIVE_WAIT_MS` and fail. Refusing overlapping launch guards contradicts the split this type
+/// exists for and gives a legitimate call a new way to fail. What is not weighed against them is
+/// a regression, since one wait taking whatever arrived was ambiguous in this case too.
 enum Arrival {
     /// A process this engine launched: one the session did not hold when the launch was issued and
     /// that this engine did not attach to. The attach half of that is what keeps a launch and an
@@ -5591,12 +5601,19 @@ mod tests {
     /// on the coverage job of a docs-only PR), and the first is why it was not measuring the
     /// property at all.
     ///
-    /// It **settles first**. Armed and disarmed back to back, the flag is usually set before the
-    /// watchdog's thread has run at all, so it sees it at the top of its loop and returns without
-    /// ever reaching a wait — the disarm is then immediate whether it wakes a condvar or waits out
-    /// a nap. Checked by reverting the condvar (a `WATCHDOG_REPEAT` nap, `notify_all` removed):
-    /// the test passed, in 0.00s. So the sleep is what the timing below is *about*, and what makes
-    /// it safe is its direction — a slow machine parks that thread more surely, never less.
+    /// **A parked thread is observed, not waited for.** Armed and disarmed back to back, the flag
+    /// is usually set before the watchdog's thread has run at all, so it sees it at the top of its
+    /// loop and returns without ever reaching a wait — the disarm is then immediate whether it
+    /// wakes a condvar or waits out a nap. Checked by reverting the condvar (a `WATCHDOG_REPEAT`
+    /// nap, `notify_all` removed): the test passed, in 0.00s. A fixed sleep in front of the clock
+    /// would only make that unlikely, and on a runner slow enough to matter it is exactly the
+    /// assumption that fails. So the timing is taken on a watchdog whose deadline has **passed**,
+    /// after its own counter says it has fired: the thread has demonstrably run its loop and gone
+    /// into a `WATCHDOG_REPEAT` nap, and `SETTLE` then only has to be somewhere inside one. It is
+    /// the same condvar, woken by the same `stop`, so nothing is given up by measuring it there —
+    /// what is gained is that "parked" is a reading rather than a hope. The never-fires half is
+    /// asserted separately, on a watchdog 30s from its deadline, where nothing can say when the
+    /// thread got there.
     ///
     /// The bound is [`WATCHDOG_REPEAT`] halved rather than a number of milliseconds: it is the
     /// poll interval the condvar replaced, so it is the only figure here the property is actually
@@ -5604,36 +5621,64 @@ mod tests {
     /// Half of it, because the regression waits out a *whole* interval and being under half is
     /// therefore still an unambiguous verdict.
     ///
-    /// And it is the **fastest** of several rounds, which is what makes the bound about the code:
-    /// a loaded two-core runner makes *some* rounds slow, while a watchdog that sleeps makes
-    /// *every* round slow. There is no scheduling accident that makes a nap short, so taking the
-    /// minimum costs the test nothing and buys it a machine it does not have to own.
+    /// And it is the **median** of several rounds rather than one sample or the best of them. A
+    /// loaded two-core runner makes *some* rounds slow, so the maximum measures the machine; a
+    /// thread caught in the instant between firing and re-entering its wait makes one round fast
+    /// whatever the implementation, so the minimum lets a regression through on a single unlucky
+    /// round. The median needs three of five to agree, which neither a burst of load nor a stray
+    /// unparked round can produce on its own.
     #[cfg(not(miri))]
     #[test]
     fn a_watchdog_disarmed_before_its_deadline_costs_nothing() {
-        /// Long enough that the thread is parked in its wait before the clock starts, and far
-        /// short of the interval the bound is against.
-        const SETTLE: Duration = Duration::from_millis(25);
+        /// Somewhere inside a nap that has demonstrably started, and short of the interval itself
+        /// so the thread is still in the *same* one.
+        const SETTLE: Duration = WATCHDOG_REPEAT.checked_div(8).expect("a nonzero divisor");
         const ROUNDS: usize = 5;
 
-        let mut fastest = Duration::MAX;
+        // Never fires when it is disarmed first, which is the half no handshake can be had for.
+        let fires = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&fires);
+        let watchdog = Watchdog::arm(Duration::from_secs(30), move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(
+            !watchdog.disarm(),
+            "a watchdog 30s from its deadline reported firing"
+        );
+        assert_eq!(fires.load(Ordering::SeqCst), 0);
+
+        // And disarming a parked one wakes it rather than waiting out its nap.
+        let mut took = Vec::with_capacity(ROUNDS);
         for _ in 0..ROUNDS {
             let fires = Arc::new(AtomicU64::new(0));
             let counted = Arc::clone(&fires);
-            let watchdog = Watchdog::arm(Duration::from_secs(30), move || {
+            let watchdog = Watchdog::arm(Duration::ZERO, move || {
                 counted.fetch_add(1, Ordering::SeqCst);
             });
+            // The handshake: a zero deadline fires on the thread's first pass, so a count of one
+            // is that thread reporting it has run and is now napping.
+            let armed = Instant::now();
+            while fires.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    armed.elapsed() < Duration::from_secs(10),
+                    "a watchdog armed with no time at all never fired"
+                );
+                thread::yield_now();
+            }
             thread::sleep(SETTLE);
+
             let started = Instant::now();
             let fired = watchdog.disarm();
-            fastest = fastest.min(started.elapsed());
-            assert!(!fired, "a watchdog 30s from its deadline reported firing");
-            assert_eq!(fires.load(Ordering::SeqCst), 0);
+            took.push(started.elapsed());
+            assert!(fired, "a watchdog past its deadline reported not firing");
         }
+
+        took.sort_unstable();
+        let median = took[ROUNDS / 2];
         assert!(
-            fastest < WATCHDOG_REPEAT / 2,
-            "the fastest of {ROUNDS} disarms took {fastest:?}, against a {WATCHDOG_REPEAT:?} poll \
-             interval; it waits for a wake-up, not for a poll"
+            median < WATCHDOG_REPEAT / 2,
+            "the median of {ROUNDS} disarms was {median:?} ({took:?}), against a \
+             {WATCHDOG_REPEAT:?} poll interval; it waits for a wake-up, not for a poll"
         );
     }
 
