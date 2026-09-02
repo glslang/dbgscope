@@ -98,13 +98,17 @@ All notable changes to this project are documented here. The format follows
   than from that call in the moment: it is a single session-wide slot every later event
   overwrites, so read directly it answers the same way for a target still coming and for one that
   stopped before its guard was waited on. A wait that cannot evaluate its own postcondition — a
-  snapshot that would not read, a session that has gone — returns as it did before, and only a
-  process demonstrably not in the session by the bound answers the new
+  snapshot that would not read, a status or process list that would not answer — returns as it did
+  before, and only a process demonstrably not in the session by the bound answers the new
   `DbgEngError::LiveTargetTimeout`; one that is there but was never seen to stop ends the wait
-  `Ok`, because "not observed to stop" is not "never arrived". The record is cleared when the
-  session is replaced *and* when it is ended, since the next session hands engine ids out from zero
-  again — two `attach_process` calls to one pid on one engine would otherwise have the second
-  inherit the first's answer. With the fix, 0 short in 40 rounds under the same load. Reported as
+  `Ok`, because "not observed to stop" is not "never arrived". A session holding *nothing* is
+  absence rather than a question that could not be put, which is a mapping and not a road: a wait
+  with no debuggee fails (`E_UNEXPECTED`, 200µs) instead of expiring, so an open never reaches its
+  bound holding nothing — measured, and pinned alongside the mapping so that an engine which
+  starts expiring instead fails a test rather than a caller. The record is cleared when the session
+  is replaced *and* when it is ended, since the next session hands engine ids out from zero again
+  — two `attach_process` calls to one pid on one engine would otherwise have the second inherit
+  the first's answer. With the fix, 0 short in 40 rounds under the same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
 - A `PendingTarget` **waited after something else pumped its target in** no longer waits for the
