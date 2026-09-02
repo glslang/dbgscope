@@ -111,6 +111,22 @@ All notable changes to this project are documented here. The format follows
   the first's answer. With the fix, 0 short in 40 rounds under the same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
+- **A break nobody's target asked for is not an arrival, whichever origin raised it.** The
+  watchdog's deadline and a host's `InterruptHandle` reach the engine through the same
+  `SetInterrupt` and produce the same stop; only the advice differs, which is what `Interruption`'s
+  two variants are for. The record stood down for the first and not the second, so a host
+  interrupting an `execute_and_wait` that was pumping a mixed session could stop a deferred target
+  before its initial breakpoint and leave its guard reporting an arrival. It is one condition now
+  rather than two, and reads the flag rather than consuming it, since the callers still need it to
+  say which origin asked.
+- **A process that leaves a session takes its recorded stop with it.** `stopped_on` is keyed by
+  `(engine id, pid)`, and engine ids are reused immediately -- measured: detaching engine id 0 and
+  attaching another process hands the freed 0 straight back. So a session that `.detach`es one of
+  its processes through the raw hatch and attaches to the same pid again gets the whole pair back,
+  and `presence_of` would answer `Arrived` for a target whose initial breakpoint had not happened.
+  Pruned alongside the attach record it sits beside, at the two openers, which is the only cadence
+  it needs: nothing reads either record outside an open. `prune_dead_attachments` is
+  `prune_processes_that_left`, since it no longer prunes only attachments.
 - **A wait that stopped on nothing no longer records a stop.** `stopped_on` is written as each
   wait observes a stop, and two kinds of wait come back having observed none. A **watchdog-forced**
   Ctrl+Break was being recorded, which `wait_for_event_bounded` documents as something callers must
@@ -127,7 +143,7 @@ All notable changes to this project are documented here. The format follows
 - **What a teardown lets go of now turns on `EndSession`'s own outcome**, not on the value
   `end_session` returns. The two differ exactly when a detach fails: `end_session` reports that
   failure to its caller, and rightly, but a process this engine could not detach from is one left
-  attached and running â it does not keep the session alive. Gating on the combined result held
+  attached and running — it does not keep the session alive. Gating on the combined result held
   back both things the session owns on a session that had definitely gone: the deferred input
   buffers, where the cost is a leak, and the record of which processes this engine stopped on,
   where the cost is the stale entry the previous entry is about, reached by a second road. Found by

@@ -1473,7 +1473,7 @@ pub struct DebugEngine {
     ///
     /// A **pair**, so a target is not confused with a later process that inherited its engine id
     /// after it left; fooling that needs a pid reuse in the same instant, which is the residue
-    /// `prune_dead_attachments` already documents and lives with — but only **within** a session.
+    /// `prune_processes_that_left` already documents and lives with — but only **within** a session.
     /// Engine ids are handed out from zero again for the next one, so across a teardown the same
     /// pair is no coincidence at all: two `attach_process` calls to one pid on one engine produce
     /// it. Hence cleared both where a session is replaced
@@ -2660,7 +2660,7 @@ impl DebugEngine {
     pub fn wait_for_event(&self, timeout_ms: u32) -> Result<(), DbgEngError> {
         // Read through the vtable, for the reason [`Self::interrupted`] does: the generated
         // wrapper calls `HRESULT::ok()`, which maps `S_OK` and `S_FALSE` alike to `Ok(())`, and
-        // here those are opposite answers â an event arrived, against `timeout_ms` passing with
+        // here those are opposite answers — an event arrived, against `timeout_ms` passing with
         // none. Both are a success to the caller and only one is a stop, so only one may be
         // recorded; see [`Self::note_where_it_stopped`].
         let result = unsafe {
@@ -2754,12 +2754,23 @@ impl DebugEngine {
         // `execute_and_wait` and `run_to_address` as pumps that complete a target whose guard has
         // been dropped, and those two come through here rather than there.
         //
-        // **Not on a forced return**, which is what the paragraph above promises callers and what
-        // this one was quietly breaking: the watchdog's Ctrl+Break stops whatever was running, so
-        // in a mixed session it can stop a deferred target *before* its initial breakpoint, and
-        // recording that would let its guard report an initial-break wait that never happened.
-        // Standing down costs a pump; recording it wrongly costs the postcondition.
-        if result.is_ok() && !timed_out {
+        // **Not on a synthetic stop**, which is what the paragraph above promises callers and what
+        // this one was quietly breaking: a Ctrl+Break stops whatever was running, so in a mixed
+        // session it can stop a deferred target *before* its initial breakpoint, and recording
+        // that would let its guard report an initial-break wait that never happened. Standing
+        // down costs a pump; recording it wrongly costs the postcondition.
+        //
+        // **Both origins, because the target cannot tell them apart.** The watchdog's deadline and
+        // a host's `InterruptHandle` reach the engine through the same `SetInterrupt` and produce
+        // the same break; only the *advice* differs, which is what `Interruption`'s two variants
+        // are for and what the callers below use `by_watchdog` to decide. The question here is not
+        // which asked but whether anyone did, so it is one condition rather than two.
+        //
+        // `load` and not `swap`: those callers consume this flag to build
+        // [`Interruption::OnRequest`], and taking it here would report every host interrupt as a
+        // stop the target made on its own.
+        let synthetic = timed_out || self.interrupt_raised.load(Ordering::SeqCst);
+        if result.is_ok() && !synthetic {
             self.note_where_it_stopped();
         }
         (result, timed_out)
@@ -4423,8 +4434,8 @@ impl DebugEngine {
         command_line: &str,
     ) -> Result<PendingTarget<'_>, DbgEngError> {
         // Before the spawn, so a pid the operating system is about to hand this process cannot
-        // still be sitting in the record from an attach that ended. See `prune_dead_attachments`.
-        self.prune_dead_attachments();
+        // still be sitting in the record from an attach that ended. See `prune_processes_that_left`.
+        self.prune_processes_that_left();
         self.enable_initial_break()?;
         // What the launched process is told apart from, since the create hands back no pid: see
         // `Arrival`. Taken here rather than at the wait, because by then the process this open is
@@ -4474,7 +4485,7 @@ impl DebugEngine {
         // this returns a guard: from here on the process is ours to let go of properly, whether
         // or not the break-in wait below ever succeeds. A wait that fails still leaves a debugger
         // attached to somebody else's process.
-        self.prune_dead_attachments();
+        self.prune_processes_that_left();
         self.claim_attached(pid);
         // The attach completes during `WaitForEvent`, which breaks the target in.
         Ok(PendingTarget::new(
@@ -4552,7 +4563,22 @@ impl DebugEngine {
     /// a launched process outliving its session — a stray process, where the bug this whole path
     /// exists for was killing somebody else's. Handle lifetimes across four teardown paths are a
     /// worse risk than that.
-    fn prune_dead_attachments(&self) {
+    /// **[`Self::stopped_on`] is pruned here too, and its reuse hazard is the sharper one.** An
+    /// entry is a `(engine id, pid)` *pair*, so a stale one is only ever matched when both numbers
+    /// come back together — which sounds like a coincidence and is instead the ordinary shape of
+    /// detaching a process and attaching to it again: measured on this engine, detaching engine id
+    /// 0 and attaching another process hands the freed 0 straight back. So a session that
+    /// `.detach`es one of its processes through the raw hatch and reattaches the same pid gets the
+    /// old pair, and `presence_of` answers `Arrived` for a target whose initial breakpoint has not
+    /// happened — the postcondition this whole path exists to hold. Pruning cannot cost anything
+    /// it should keep, because the only entries it drops are ones no lookup could legitimately
+    /// match: `presence_of` reads the record for a process it has already found in the session.
+    ///
+    /// Here rather than at the departure, because there is nowhere else to put it — a `.detach`
+    /// arrives as raw command text — and nowhere else it needs to be: nothing reads either record
+    /// outside an open, and both openers prune before they wait.
+    ///
+    fn prune_processes_that_left(&self) {
         let Ok(held) = self.session_processes() else {
             return;
         };
@@ -4560,6 +4586,10 @@ impl DebugEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|pid| held.iter().any(|(_, held)| held == pid));
+        self.stopped_on
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|entry| held.contains(entry));
     }
 
     /// Forgets every recorded attach, and every process this engine had stopped on.
@@ -4861,7 +4891,7 @@ enum WaitKind {
 /// waiting. Two fixes for it were weighed and both cost more than the ambiguity. Telling the
 /// launches apart needs the engine to *record* which arrivals earlier waits claimed — new
 /// engine-wide state, cleared everywhere a session is replaced and pruned for pid reuse the way
-/// `prune_dead_attachments` is, where a stale claim makes a legitimate launch wait out
+/// `prune_processes_that_left` is, where a stale claim makes a legitimate launch wait out
 /// `LIVE_WAIT_MS` and fail. Refusing overlapping launch guards contradicts the split this type
 /// exists for and gives a legitimate call a new way to fail. What is not weighed against them is
 /// a regression, since one wait taking whatever arrived was ambiguous in this case too.
@@ -7394,7 +7424,7 @@ mod tests {
     /// Review round 6 on #133 read the two halves as meeting: a finite `WaitForEvent` that expires
     /// returns `S_FALSE`, which the generated wrapper maps to `Ok`, and `presence_of` answering
     /// `Unknown` for an empty session would then end the open successfully. The first half is
-    /// true â a 300ms wait on a target with nothing to report returns `Ok` at 312ms â and the
+    /// true — a 300ms wait on a target with nothing to report returns `Ok` at 312ms — and the
     /// composite is not, because the wait *errors* rather than expiring once the debuggee is gone.
     /// Pinned here rather than argued, since it is a claim about an engine build and the next one
     /// is free to disagree; if it ever does, the arm below becomes a road rather than a mapping.
@@ -7410,7 +7440,7 @@ mod tests {
         let waited = e.wait_for_event(300);
         assert!(
             waited.is_err(),
-            "a wait on an engine with no debuggee returned {waited:?} instead of failing â if it              now expires, `presence_of`'s empty-session arm is reachable and wants a bound test"
+            "a wait on an engine with no debuggee returned {waited:?} instead of failing — if it              now expires, `presence_of`'s empty-session arm is reachable and wants a bound test"
         );
     }
 
@@ -7463,6 +7493,108 @@ mod tests {
         );
     }
 
+    /// **Nor is a host-requested one**, which is the same break arriving through the other door.
+    ///
+    /// `InterruptHandle::interrupt` and the watchdog both reach the engine through `SetInterrupt`
+    /// and produce the same stop; only the advice to the caller differs, which is what
+    /// `Interruption`'s two variants carry. Gating on the watchdog's flag alone left this half
+    /// open -- the fix for the forced break, applied to one of its two origins.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_host_requested_break_records_no_stop() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        e.launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        e.stopped_on
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+
+        let handle = e.interrupt_handle();
+        let asked = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            handle.interrupt()
+        });
+        // Long enough that the watchdog cannot be what ends this: the assertion below is that the
+        // *host* origin stands down, and a deadline would satisfy the old gate as well.
+        let run = e
+            .execute_and_wait("g", 30_000)
+            .expect("the go should return");
+        asked.join().expect("interrupting thread panicked").ok();
+        assert!(
+            matches!(run.cut_short, Some(Interruption::OnRequest)),
+            "the run ended as {:?}, so no host-requested break was under test",
+            run.cut_short
+        );
+        assert!(
+            e.stopped_on
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_empty(),
+            "a break a host asked for was recorded as the target arriving"
+        );
+    }
+
+    /// **A process that left takes its stop with it**, or the pair outlives it and the next
+    /// process to inherit both numbers inherits the answer.
+    ///
+    /// Engine ids are reused immediately: measured on this engine, detaching engine id 0 and
+    /// attaching another process hands the freed 0 straight back. A `(engine id, pid)` pair
+    /// therefore comes back whole whenever a session detaches a process through the raw hatch and
+    /// attaches to it again -- and `presence_of` would answer `Arrived` for a target whose initial
+    /// breakpoint had not happened.
+    ///
+    /// The second process is what makes this a *detach* rather than a teardown: it keeps the
+    /// session alive, so nothing else clears the record. Asserted between the open and its wait,
+    /// because that is where the prune runs and where the stale pair would still be readable --
+    /// after the wait the reattached process records the same pair legitimately, and the two are
+    /// indistinguishable.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_process_that_left_takes_its_stop_with_it() {
+        let _debuggee = one_debuggee();
+        let mut leaves = a_process_to_attach_to();
+        let mut stays = a_process_to_attach_to();
+        {
+            let e = DebugEngine::new();
+            e.attach_process(leaves.id()).expect("first attach failed");
+            e.attach_process(stays.id()).expect("second attach failed");
+
+            let held = e.session_processes().expect("could not list the session");
+            let (id, _) = *held
+                .iter()
+                .find(|(_, pid)| *pid == leaves.id())
+                .expect("the first process is not in the session");
+            e.execute_command(&format!("|{id}s"))
+                .expect("could not select the process to detach");
+            e.execute_command(".detach").expect("could not detach it");
+            assert!(
+                e.stopped_on
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains(&(id, leaves.id())),
+                "the detached process was never recorded, so nothing here is under test"
+            );
+
+            let guard = e
+                .attach_process_begin(leaves.id())
+                .expect("reattach failed");
+            assert!(
+                !e.stopped_on
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains(&(id, leaves.id())),
+                "the departed process's stop survived the open that reclaimed its engine id"
+            );
+            guard.wait().expect("the reattach should complete");
+        }
+        for p in [&mut leaves, &mut stays] {
+            let _ = p.kill();
+            let _ = p.wait();
+        }
+    }
+
     /// **A watchdog-forced break is not an arrival**, which `wait_for_event_bounded` promises its
     /// callers two paragraphs above the call that was breaking it.
     ///
@@ -7505,7 +7637,7 @@ mod tests {
     /// **An empty session is an answer**, so `presence_of` calls it [`Presence::Absent`] and not
     /// [`Presence::Unknown`].
     ///
-    /// The two are indistinguishable at the top of the loop â both pump â and differ only at the
+    /// The two are indistinguishable at the top of the loop — both pump — and differ only at the
     /// bound, where `Absent` is [`DbgEngError::LiveTargetTimeout`] and `Unknown` is `Ok`. So this
     /// asserts the mapping rather than a behaviour: the state cannot be held at the bound while
     /// the test above holds, and the point of writing it down is that the two are pinned together.
