@@ -2776,9 +2776,12 @@ impl DebugEngine {
         // one door at a time.
         //
         // `load` and not `swap`, because `execute_and_wait` and its siblings consume this to build
-        // `Interruption::OnRequest`. The precondition is that a pump clears it when its operation
-        // begins, which those three and `wait_for_live_target` all do; a path that does not merely
-        // records less, which costs a pump rather than the postcondition.
+        // `Interruption::OnRequest`. The precondition is that every operation that pumps clears
+        // this when it begins and leaves none of its own behind when it ends -- and that sentence
+        // was written here one round before it was true: `run_to_address` did neither, so its
+        // watchdog's break stayed raised for good and every later wait declined to record a real
+        // initial break. A path that gets this wrong does not record less as a matter of taste; it
+        // leaves a held guard pumping to its bound for a target that has already stopped.
         if self.interrupt_raised.load(Ordering::SeqCst) {
             return;
         }
@@ -3128,6 +3131,12 @@ impl DebugEngine {
         address: u64,
         timeout_ms: u32,
     ) -> Result<RunToResult, DbgEngError> {
+        // Whatever was raised before this belongs to the last operation; the same line, for the
+        // same reason, as `execute_and_wait` and `settle`. This function is the one bounded path
+        // that had neither this nor the consume below, which stopped mattering to itself -- it
+        // classifies by the watchdog's own flag -- and started mattering to everyone else once
+        // `note_where_it_stopped` began reading the shared one.
+        self.interrupt_raised.store(false, Ordering::SeqCst);
         // Refuse when there's nothing to run: driving `g` with no debuggee faults DbgEng in a
         // way `catch_unwind` cannot trap — see `refuse_without_a_debuggee`.
         self.refuse_without_a_debuggee()?;
@@ -3167,6 +3176,13 @@ impl DebugEngine {
             } else {
                 waited.map_err(DbgEngError::CommandFailed)
             };
+            // Consumed rather than left standing. This is the half review round 12 was about: the
+            // watchdog raises the shared flag through `InterruptHandle::interrupt` like any host,
+            // and a `run_to_address` that timed out used to leave it set for good -- so the next
+            // `wait_for_event` read a stale interrupt, declined to record a real initial break,
+            // and left a held guard pumping. Nothing here reads the value; consuming it is the
+            // point.
+            self.interrupt_raised.store(false, Ordering::SeqCst);
             (waited, forced)
         } else {
             (Ok(()), false)
@@ -7600,6 +7616,44 @@ mod tests {
                 .unwrap_or_else(|err| err.into_inner())
                 .is_empty(),
             "a break a host asked for was recorded as the target arriving"
+        );
+    }
+
+    /// **No operation leaves an interrupt standing behind it**, which is the precondition
+    /// `note_where_it_stopped` reads the shared flag under.
+    ///
+    /// `run_to_address` was the one bounded path that neither cleared it on the way in nor
+    /// consumed it on the way out. That cost it nothing -- it classifies by the watchdog's own
+    /// flag -- right up until `note_where_it_stopped` began reading the shared one, at which point
+    /// a single timed-out `run_to_address` left every later wait declining to record a real
+    /// initial break, and any guard still held pumping to its bound for a target that had already
+    /// stopped. Round 12; the comment claiming this precondition held was written in round 9.
+    ///
+    /// `timeout_ms` of 0 is an immediate timeout by that function's own contract, so the watchdog
+    /// fires and raises the flag -- which the outcome assertion is here to confirm, since a run
+    /// that ended some other way would leave nothing to have been cleared and pass regardless.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_timed_out_run_leaves_no_interrupt_standing() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        e.launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        // The current pc: an address a breakpoint certainly takes, and one a resumed target does
+        // not immediately hit again, so the run reaches its deadline rather than the address.
+        let here = e
+            .instruction_pointer()
+            .expect("could not read the instruction pointer");
+
+        let run = e.run_to_address(here, 0).expect("run_to_address failed");
+        assert!(
+            matches!(run.outcome, RunToOutcome::Timeout),
+            "the run ended as {:?}, so its watchdog never raised the flag under test",
+            run.outcome
+        );
+        assert!(
+            !e.interrupt_raised.load(Ordering::SeqCst),
+            "a timed-out run left its watchdog's interrupt raised, so the next wait will decline              to record a real stop"
         );
     }
 
