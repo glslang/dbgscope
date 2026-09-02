@@ -2782,6 +2782,29 @@ impl DebugEngine {
         // watchdog's break stayed raised for good and every later wait declined to record a real
         // initial break. A path that gets this wrong does not record less as a matter of taste; it
         // leaves a held guard pumping to its bound for a target that has already stopped.
+        //
+        // **It is the request and not the provenance of the event that ended the wait**, which is
+        // deliberate and was declined once as a finding (round 13). A break asked for in the same
+        // window the target's own initial break wins the wait raises this flag, and the genuine
+        // arrival is dropped. The two errors are not the same size: dropping a real arrival costs
+        // a pump, and recording a synthetic one costs the postcondition six rounds of review were
+        // spent establishing. The conservative direction is the one this crate takes everywhere
+        // else, and it is the whole of docs/unknown-not-absent.md.
+        //
+        // The residual is narrower than it looks, and not where that finding put it. The open's
+        // own loop does not repump after an interrupt -- it terminates on `asked_to_stop`, which
+        // is a different round's fix -- so it answers `Ok` for a target that is in the session and
+        // really did stop. What pays is a guard completed by an *external* pump that raced an
+        // interrupt: its own `wait()` then finds `Listed`, pumps, and spends the bound waiting for
+        // an unrelated event. That is arm F of `examples/deferred_arrival.rs` with its result
+        // undone -- 29.36s against 8.6us.
+        //
+        // Closing it needs the provenance, and `GetInterrupt` is where to look before anything
+        // else: an interrupt that *ended* a wait has been consumed by the time it returns, and one
+        // still pending did not end it. That is engine state rather than event text, so it is a
+        // measurement rather than a guess -- but nothing should rely on it until the race can be
+        // constructed on purpose, because being wrong in that direction is the failure this gate
+        // exists for.
         if self.interrupt_raised.load(Ordering::SeqCst) {
             return;
         }
