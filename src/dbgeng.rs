@@ -2658,13 +2658,26 @@ impl DebugEngine {
 
     /// Waits for the target to break
     pub fn wait_for_event(&self, timeout_ms: u32) -> Result<(), DbgEngError> {
-        let result = unsafe { self.control.WaitForEvent(0, timeout_ms) };
-
+        // Read through the vtable, for the reason [`Self::interrupted`] does: the generated
+        // wrapper calls `HRESULT::ok()`, which maps `S_OK` and `S_FALSE` alike to `Ok(())`, and
+        // here those are opposite answers â an event arrived, against `timeout_ms` passing with
+        // none. Both are a success to the caller and only one is a stop, so only one may be
+        // recorded; see [`Self::note_where_it_stopped`].
+        let result = unsafe {
+            (Interface::vtable(&self.control).WaitForEvent)(
+                Interface::as_raw(&self.control),
+                0,
+                timeout_ms,
+            )
+        };
         if result.is_err() {
-            return Err(DbgEngError::CommandFailed(result.err().unwrap()));
+            return Err(DbgEngError::CommandFailed(
+                windows::core::Error::from_hresult(HRESULT(result.0)),
+            ));
         }
-
-        self.note_where_it_stopped();
+        if result == S_OK {
+            self.note_where_it_stopped();
+        }
         Ok(())
     }
 
@@ -2676,9 +2689,25 @@ impl DebugEngine {
     /// as [`Self::wait_for_live_target`]'s own pumping, or a guard waited afterwards reads its own
     /// arrival as a target still coming.
     ///
-    /// Best-effort throughout: an engine with no event to name, a dump, a wait that expired
-    /// without stopping. Every one of those means "nothing to add" rather than a failure, and this
-    /// is on the path of every wait in the crate, so none of them may fail one.
+    /// **Only from a wait that actually stopped on an event**, which is the callers' half and not
+    /// something the reading can check for itself: `GetLastEventInformation` answers about the
+    /// last event *the engine* saw, not about the wait that just returned. Both call sites gate
+    /// it, on the two ways a wait can come back having stopped on nothing — `S_FALSE` flattened
+    /// by the generated wrapper into the same `Ok` a stop gets, and a watchdog-forced Ctrl+Break.
+    ///
+    /// **The forced break is the one that was reaching here**, and it is a real misattribution:
+    /// the Ctrl+Break stops whatever is running, so in a mixed session it can stop a deferred
+    /// target before its initial breakpoint and hand its guard an arrival that never happened.
+    /// The expiry was not — an expired wait leaves the slot reporting `DEBUG_ANY_ID` rather than
+    /// the event before it (measured), so the join below already found nothing. That made the
+    /// safety incidental, resting on an undocumented sentinel in the one function a guard trusts
+    /// to end an initial-break wait early; the gate makes it deliberate, and
+    /// `test_an_expired_wait_records_no_stop` pins the sentinel so a change to it is visible.
+    ///
+    /// Best-effort within that: an engine with no event to name, a dump, an event belonging to no
+    /// process this session lists. Every one of those means "nothing to add" rather than a
+    /// failure, and this is on the path of every wait in the crate, so none of them may fail
+    /// one.
     fn note_where_it_stopped(&self) {
         let (Ok(id), Ok(held)) = (self.last_event_process(), self.session_processes()) else {
             return;
@@ -2718,13 +2747,22 @@ impl DebugEngine {
             let _ = handle.interrupt();
         });
         let result = unsafe { self.control.WaitForEvent(0, WAIT_INFINITE) };
+        // Disarmed before the record rather than after it, so that `timed_out` is known here and
+        // so that the watchdog cannot fire *into* the reads below.
+        let timed_out = watchdog.disarm();
         // Same reason as in `wait_for_event`, and it has to be both of them: `PendingTarget` names
         // `execute_and_wait` and `run_to_address` as pumps that complete a target whose guard has
         // been dropped, and those two come through here rather than there.
-        if result.is_ok() {
+        //
+        // **Not on a forced return**, which is what the paragraph above promises callers and what
+        // this one was quietly breaking: the watchdog's Ctrl+Break stops whatever was running, so
+        // in a mixed session it can stop a deferred target *before* its initial breakpoint, and
+        // recording that would let its guard report an initial-break wait that never happened.
+        // Standing down costs a pump; recording it wrongly costs the postcondition.
+        if result.is_ok() && !timed_out {
             self.note_where_it_stopped();
         }
-        (result, watchdog.disarm())
+        (result, timed_out)
     }
 
     /// Issues an execution-control command (`g`, `t`, `p`, `g-`, `t-`, `p-`, …) and
@@ -7369,16 +7407,98 @@ mod tests {
             !e.has_target().expect("could not read the execution status"),
             "a fresh engine reported a debuggee"
         );
-        let started = Instant::now();
         let waited = e.wait_for_event(300);
-        let took = started.elapsed();
         assert!(
             waited.is_err(),
             "a wait on an engine with no debuggee returned {waited:?} instead of failing â if it              now expires, `presence_of`'s empty-session arm is reachable and wants a bound test"
         );
+    }
+
+    /// **A wait that stopped on nothing records nothing** -- and today for a reason this test
+    /// does not control, which is why it asserts both halves.
+    ///
+    /// Review round 7 read the gate as missing: an expired `WaitForEvent` answers `S_FALSE`, the
+    /// generated wrapper flattens it into the same `Ok` a stop gets, and
+    /// `note_where_it_stopped` would then read the engine's *previous* event and join a stale
+    /// engine id to whatever process now holds it. The first three steps are exactly right. The
+    /// last is not: an expired wait leaves `GetLastEventInformation` reporting `DEBUG_ANY_ID`
+    /// rather than the event before it (measured), so the join finds no process and records
+    /// nothing. The bug was unreachable, and the safety was **incidental** -- resting on an
+    /// undocumented sentinel, in the one function whose output a guard trusts to end an
+    /// initial-break wait early.
+    ///
+    /// So the gate in [`DebugEngine::wait_for_event`] makes it deliberate, and this pins the fact
+    /// it stops depending on. It cannot fail for the gate being backed out, and saying so is the
+    /// point: the second assertion is the tripwire, and an engine that starts reporting the
+    /// previous event there is one where the gate has become the only thing holding.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_an_expired_wait_records_no_stop() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        // `ping.exe` and not `cmd.exe /c ping`, for the reason
+        // `test_a_launched_target_has_a_console_of_its_own_and_no_window` records: the passive
+        // end takes the process this engine launched and nothing beneath it, so the wrapper
+        // leaves a `ping` grandchild running for the rest of its thirty seconds.
+        e.launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        e.stopped_on
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+
+        e.wait_for_event(300)
+            .expect("the wait should expire, not fail");
         assert!(
-            took < Duration::from_millis(300),
-            "the wait took {took:?}, which is the timeout rather than a failure"
+            e.stopped_on
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_empty(),
+            "a wait that stopped on nothing recorded a stop, from the event before it"
+        );
+        assert_eq!(
+            e.last_event_process().ok(),
+            Some(DEBUG_ANY_ID),
+            "an expired wait now leaves a real process in the last-event slot, so the gate in              `wait_for_event` is the only thing keeping it out of `stopped_on` -- which it is              written for, but nothing else here would notice the change"
+        );
+    }
+
+    /// **A watchdog-forced break is not an arrival**, which `wait_for_event_bounded` promises its
+    /// callers two paragraphs above the call that was breaking it.
+    ///
+    /// The Ctrl+Break stops whatever was running, so in a mixed session it can stop a deferred
+    /// target *before* its initial breakpoint; recorded, that target's guard would report an
+    /// initial-break wait that never happened. `cut_short` is asserted first, or this passes by
+    /// the watchdog never firing -- the run has to be genuinely cut short for the rest to mean
+    /// anything.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_watchdog_forced_break_records_no_stop() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        // `ping.exe` and not `cmd.exe /c ping`, for the reason
+        // `test_a_launched_target_has_a_console_of_its_own_and_no_window` records: the passive
+        // end takes the process this engine launched and nothing beneath it, so the wrapper
+        // leaves a `ping` grandchild running for the rest of its thirty seconds.
+        e.launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        e.stopped_on
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+
+        let run = e.execute_and_wait("g", 300).expect("the go should return");
+        assert!(
+            matches!(run.cut_short, Some(Interruption::Deadline { .. })),
+            "the target stopped on its own ({:?}), so no forced break was under test",
+            run.cut_short
+        );
+        assert!(
+            e.stopped_on
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_empty(),
+            "the watchdog's own Ctrl+Break was recorded as the target arriving"
         );
     }
 
