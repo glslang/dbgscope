@@ -86,20 +86,22 @@ pub enum DbgEngError {
     )]
     KernelBreakTimeout,
 
-    /// A user-mode open whose process never joined the session and stopped.
+    /// A user-mode open whose process never joined the session.
     ///
     /// The sibling of [`Self::KernelBreakTimeout`], and it exists because what it replaces was a
     /// lie rather than a different error: a live open used to be one `WaitForEvent`, which is one
     /// *event* and not necessarily this target's, so an open could return `Ok` with its process
     /// absent from the session (dbgscope#128). Reported only when the session stayed readable and
-    /// the target demonstrably had not got there — an open that cannot evaluate its own
-    /// postcondition returns `Ok` exactly as it did before, rather than failing on a probe.
+    /// the process was demonstrably not in it — an open that cannot evaluate its own postcondition
+    /// returns `Ok` exactly as it did before, rather than failing on a probe.
     ///
-    /// The case it now names that nothing named before is an **attach whose break-in never
-    /// arrives**: a process suspended or wedged past the point where the injected thread can run
-    /// left the wait sitting out its bound and then answering `Ok`, and the bound was already
-    /// being paid.
-    #[error("the process did not join the session and stop within the open timeout")]
+    /// **Membership, not the initial break.** The wait *pumps* for this target's own event
+    /// ([`Presence`]) and gives up on it quietly, because the engine's last event is one slot that
+    /// later events overwrite: a target that stopped before its guard was waited on is
+    /// indistinguishable from one still coming, and an error would be claiming absence where the
+    /// truth is unknown. A process visibly in the session therefore ends the wait `Ok` at the
+    /// bound, and only a missing one is this.
+    #[error("the process did not join the session within the open timeout")]
     LiveTargetTimeout,
 
     #[error("Operation failed: {0}")]
@@ -2293,10 +2295,18 @@ impl DebugEngine {
         let deadline = Instant::now() + Duration::from_millis(u64::from(LIVE_WAIT_MS));
         let mut waited = false;
         loop {
-            match self.presence_of(arrival) {
+            let presence = self.presence_of(arrival);
+            match presence {
                 Presence::Arrived => return Ok(()),
+                // Before this call has pumped anything the last event is somebody else's news — it
+                // says where *they* stopped — so a target already in the session is the whole of
+                // what can honestly be asked here. Measured: without this, a guard waited after two
+                // targets had been pumped in takes 29.4s and `E_UNEXPECTED`, against 6µs for one
+                // waited after a single target. It cannot fire on an ordinary open, whose process
+                // is not in the session until a wait puts it there.
+                Presence::Listed if !waited => return Ok(()),
                 Presence::Unknown if waited => return Ok(()),
-                Presence::Absent | Presence::Unknown => {}
+                Presence::Listed | Presence::Absent | Presence::Unknown => {}
             }
             let left = u32::try_from(
                 deadline
@@ -2305,7 +2315,16 @@ impl DebugEngine {
             )
             .unwrap_or(LIVE_WAIT_MS);
             if left == 0 {
-                return Err(DbgEngError::LiveTargetTimeout);
+                return match presence {
+                    Presence::Absent => Err(DbgEngError::LiveTargetTimeout),
+                    // In the session, but this pump never saw its event. "Not observed" is not
+                    // "never arrived": the last event is one session-wide slot that a later event
+                    // overwrites, so a target that stopped for somebody else's pump before this
+                    // guard was waited on reads exactly like one that never got there. Reporting a
+                    // timeout on a process visibly in front of us would be claiming absence where
+                    // the truth is unknown — see docs/unknown-not-absent.md.
+                    _ => Ok(()),
+                };
             }
             self.wait_for_event(left)?;
             waited = true;
@@ -2321,6 +2340,13 @@ impl DebugEngine {
     /// leaves this open's process listed and not yet where the open promised to leave it. So the
     /// last event has to be **this** target's, which is what `sxe ibp` armed and what the doc
     /// comments on both openers say they wait for.
+    ///
+    /// **The three answers are three states, not a boolean with excuses**, and the middle one is
+    /// what keeps the strictness above from becoming a lie of its own. The last event is a single
+    /// session-wide slot that every later event overwrites, so it can say "not this target" both
+    /// for a target still on its way and for one that stopped before this guard was waited on.
+    /// [`Presence::Listed`] is that pair held apart: keep pumping for the event, but do not let its
+    /// absence be reported as the target's.
     ///
     /// Every failure to *ask* answers [`Presence::Unknown`] rather than [`Presence::Absent`],
     /// which is the difference between a wait that ends where it always did and one that pumps an
@@ -2348,7 +2374,7 @@ impl DebugEngine {
         };
         match self.last_event_process() {
             Ok(stopped_on) if stopped_on == *id => Presence::Arrived,
-            Ok(_) => Presence::Absent,
+            Ok(_) => Presence::Listed,
             Err(_) => Presence::Unknown,
         }
     }
@@ -4708,7 +4734,13 @@ enum Arrival {
 
 /// Whether the target a live open is waiting for has joined the session and stopped yet.
 enum Presence {
+    /// In the session, and the engine's last event is its own.
     Arrived,
+    /// In the session, but the engine stopped on something else's event. Worth pumping for, and
+    /// **not** worth reporting as a missing target at the bound: the last event is one slot, so a
+    /// target that stopped before this guard was waited on reads the same as one still coming.
+    Listed,
+    /// Not in the session at all.
     Absent,
     /// Not answerable: the session holds nothing to ask, or the ask itself failed. It ends the
     /// wait where a single `WaitForEvent` used to end it, rather than pumping — driving an engine
@@ -5654,15 +5686,22 @@ mod tests {
     /// on the coverage job of a docs-only PR), and the first is why it was not measuring the
     /// property at all.
     ///
-    /// **A parked thread is observed, not waited for.** Armed and disarmed back to back, the flag
-    /// is usually set before the watchdog's thread has run at all, so it sees it at the top of its
-    /// loop and returns without ever reaching a wait — the disarm is then immediate whether it
-    /// wakes a condvar or waits out a nap. Checked by reverting the condvar (a `WATCHDOG_REPEAT`
-    /// nap, `notify_all` removed): the test passed, in 0.00s. A fixed sleep in front of the clock
-    /// would only make that unlikely, and on a runner slow enough to matter it is exactly the
-    /// assumption that fails. So the timing is taken on a watchdog whose deadline has **passed**,
-    /// after its own counter says it has fired: the thread has demonstrably run its loop and gone
-    /// into a `WATCHDOG_REPEAT` nap, and `SETTLE` then only has to be somewhere inside one. It is
+    /// **The thread is shown to be running before it is timed.** Armed and disarmed back to back,
+    /// the flag is usually set before the watchdog's thread has run at all, so it sees it at the
+    /// top of its loop and returns without ever reaching a wait — the disarm is then immediate
+    /// whether it wakes a condvar or waits out a nap. Checked by reverting the condvar (a
+    /// `WATCHDOG_REPEAT` nap, `notify_all` removed): the test passed, in 0.00s. So the timing is
+    /// taken on a watchdog whose deadline has **passed**, after its own counter says it has fired.
+    ///
+    /// That counter is incremented inside the closure, which runs a few instructions *before* the
+    /// thread re-takes the lock and naps, so it says the thread is running its loop and not that it
+    /// is parked in the wait; `SETTLE` covers the rest, and here it is arithmetic rather than the
+    /// hope it replaced. A round is only misleading if the thread is descheduled across that gap
+    /// for longer than `SETTLE`, and the median then needs **three of five** rounds to be so —
+    /// while a regression pays `WATCHDOG_REPEAT - SETTLE`, half again the bound, on every round.
+    /// Measured against the reverted condvar: 177-182ms across all five, no fast outlier at all.
+    /// Closing the gap outright needs the watchdog to signal from inside the wait, which is
+    /// production surface added for a test bound, and this is the cheaper half of that trade. It is
     /// the same condvar, woken by the same `stop`, so nothing is given up by measuring it there —
     /// what is gained is that "parked" is a reading rather than a hope. The never-fires half is
     /// asserted separately, on a watchdog 30s from its deadline, where nothing can say when the
@@ -5683,9 +5722,10 @@ mod tests {
     #[cfg(not(miri))]
     #[test]
     fn a_watchdog_disarmed_before_its_deadline_costs_nothing() {
-        /// Somewhere inside a nap that has demonstrably started, and short of the interval itself
-        /// so the thread is still in the *same* one.
-        const SETTLE: Duration = WATCHDOG_REPEAT.checked_div(8).expect("a nonzero divisor");
+        /// Margin across the few instructions between the closure returning and the thread
+        /// parking, and short enough that a regression still pays `WATCHDOG_REPEAT - SETTLE` —
+        /// half again the bound below — on a round this does cover.
+        const SETTLE: Duration = WATCHDOG_REPEAT.checked_div(4).expect("a nonzero divisor");
         const ROUNDS: usize = 5;
 
         // Never fires when it is disarmed first, which is the half no handshake can be had for.
@@ -7083,6 +7123,12 @@ mod tests {
     /// happens next. Measured across this fix — **29.36s and `E_UNEXPECTED`** (the `ping` outran
     /// its own bound and took the target with it) against **8.6µs and `Ok`**.
     ///
+    /// Two phases, because the evidence a wait can consult is different in each. With one target
+    /// the engine's last event is still this one's; with a second target arrived since, it is not,
+    /// and the wait has only membership to go on. The rule that falls out — the last event governs
+    /// the pumping a wait does itself, and the ask it makes before pumping is membership — is the
+    /// one two rounds of review on this branch converged on.
+    ///
     /// The deterministic half of dbgscope#128, and the only half that is: the issue's own failure
     /// is a race that reproduces a few times in forty rounds under CPU load and never on a quiet
     /// machine, so it is `test_a_mixed_session_comes_apart_by_where_each_process_came_from` that
@@ -7123,6 +7169,35 @@ mod tests {
             "the launched process is not in the session the wait said it had joined"
         );
         e.end_session().expect("end_session failed");
+
+        // And again with the engine's last event no longer this target's. `GetLastEventInformation`
+        // is one session-wide slot, so a second target arriving overwrites the evidence that this
+        // one ever stopped — which is why the ask a wait makes *before* pumping is membership, and
+        // the last event governs only the pumping the wait does itself. Measured across that rule:
+        // 29.4s and `E_UNEXPECTED` without it, 5.4µs with.
+        let mut theirs = a_process_to_attach_to();
+        let e = DebugEngine::new();
+        let pending = e
+            .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+        e.wait_for_event(LIVE_WAIT_MS)
+            .expect("the outside pump failed");
+        e.attach_process(theirs.id()).expect("attach failed");
+
+        let started = Instant::now();
+        pending
+            .wait()
+            .expect("wait on an arrived target whose stop was overwritten failed");
+        let took = started.elapsed();
+
+        assert!(
+            took < Duration::from_millis(u64::from(LIVE_WAIT_MS / 10)),
+            "wait() took {took:?} on a target already in the session; a later target's event is \
+             not evidence that this one never arrived"
+        );
+        e.end_session().expect("end_session failed");
+        let _ = theirs.kill();
+        let _ = theirs.wait();
     }
 
     /// **The last event names its process by *engine* id**, which is the join `presence_of` makes.
