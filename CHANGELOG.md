@@ -91,15 +91,15 @@ All notable changes to this project are documented here. The format follows
   wait every time it was observed. **Membership in the session is not the terminal condition** —
   `cpr` is an ignored filter, so a process is registered when its create event is processed and its
   initial breakpoint arrives later, and a competing break in between would leave the open's process
-  listed but not where the open promised to leave it — so `presence_of` reads which process the
-  last event belongs to (`GetLastEventInformation`, by engine id, which
-  `test_the_last_event_names_its_process_by_engine_id` pins against `session_processes`). A wait
+  listed but not where the open promised to leave it — so the pump reads which process the last
+  event belongs to (`GetLastEventInformation`, by engine id, which
+  `test_the_last_event_names_its_process_by_engine_id` pins against `session_processes`). That
+  slot is session-wide and every later event overwrites it, so it is evidence only about a wait
+  **this call made**: the ask before pumping, and the answer at the bound, are membership. A wait
   that cannot evaluate its own postcondition — a snapshot that would not read, a session that has
-  gone, an engine naming no event — returns as it did before, and one whose target demonstrably has
-  not got there by the bound answers the new `DbgEngError::LiveTargetTimeout` instead of a false
-  success. That names one case nothing named before: an attach whose break-in never arrives, which
-  was already paying the bound and then answering `Ok`. With the fix, 0 short in 40 rounds under the
-  same load. Reported as
+  gone, an engine naming no event — returns as it did before, and only a process demonstrably not
+  in the session by the bound answers the new `DbgEngError::LiveTargetTimeout`. With the fix, 0
+  short in 40 rounds under the same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
 - A `PendingTarget` **waited after something else pumped its target in** no longer waits for the
@@ -108,7 +108,10 @@ All notable changes to this project are documented here. The format follows
   which resumes an arrived target and waits out whatever comes next. Measured across the fix:
   **29.36s and `E_UNEXPECTED`** — the debuggee outran the bound and took the session with it —
   against **8.6µs and `Ok`**. Neither opener lists its process before the wait that completes it
-  (measured), so the ordinary open still waits exactly once.
+  (measured), so the ordinary open still waits exactly once. The same measurement with a *second*
+  target arrived since — which overwrites the engine's record of where it stopped — is 29.4s and
+  `E_UNEXPECTED` against 5.4µs, and is what says that ask has to be membership rather than the last
+  event.
 - `a_watchdog_disarmed_before_its_deadline_costs_nothing` measured the machine rather than the
   watchdog, and failed on the coverage job of a docs-only PR. Three things were wrong with it, and
   the first meant it was not testing the property at all: armed and disarmed back to back, the

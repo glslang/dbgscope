@@ -25,9 +25,13 @@
 //! - **A pump must not swallow a real failure** (arm C). A launch whose image does not exist fails
 //!   *inside* the wait — `Err(0x80070002)` in 13ms, no debuggee behind it, a further wait
 //!   answering `E_UNEXPECTED` in 37µs — so the loop propagates rather than pumping on.
-//! - **A guard may ask before it waits** (arms E and F). Neither opener lists its process before
-//!   the wait that completes it, and a guard whose target arrived meanwhile took 29.36s and
-//!   `E_UNEXPECTED` before the fix against 8.6µs and `Ok` after.
+//! - **A guard may ask before it waits, and what it may ask is membership** (arms E, F and H).
+//!   Neither opener lists its process before the wait that completes it, so the ask cannot fire on
+//!   an ordinary open; a guard whose target arrived meanwhile took 29.36s and `E_UNEXPECTED` before
+//!   the fix against 8.6µs and `Ok` after. Arm H is the same guard with a *second* target arrived
+//!   since, which overwrites the engine's one record of where it stopped: asking the last event
+//!   there costs 29.4s and `E_UNEXPECTED` again, and asking membership costs 5.4µs. So the last
+//!   event is evidence about a wait this call made, and nothing else.
 //! - **Membership is not the same claim as the initial break** (arm G). A process is registered
 //!   when its create event is processed — `cpr` is ignored — and its loader breakpoint arrives
 //!   later, so a competing break in between would end a wait with the process listed and not
@@ -285,6 +289,41 @@ fn a_target_that_arrived_before_its_wait() {
     let _ = e.end_session();
 }
 
+/// Arm H: the case review raised against making the last event the terminal condition — a guard
+/// whose target stopped, and then a *second* target's event overwrote the one session-wide slot
+/// recording where the engine stopped. The launch guard cannot then tell its own arrival from one
+/// still coming, so it pumps; what it must not do is call that a missing process.
+fn a_guard_whose_event_was_overwritten() {
+    println!("\n=== H. wait() on a guard whose stop was overwritten by another target ===");
+    let mut theirs = a_process_to_attach_to();
+    {
+        let e = DebugEngine::new();
+        let launch = e.launch_process_begin(LAUNCH).expect("launch failed");
+        e.wait_for_event(WAIT_MS).expect("the launch pump failed");
+        let attach = e
+            .attach_process_begin(theirs.id())
+            .expect("attach begin failed");
+        e.wait_for_event(WAIT_MS).expect("the attach pump failed");
+        drop(attach);
+        let (count, text) = listed(&e);
+        println!(
+            "  {count} process(es); last stopped on pid {:?}, the launch is pid {:?}",
+            last_event_pid(&e),
+            created_pid(&text)
+        );
+        let started = Instant::now();
+        let waited = launch.wait();
+        println!(
+            "  launch.wait() -> {:?} in {:?}",
+            waited.as_ref().map(|_| "Ok").map_err(|err| err.to_string()),
+            started.elapsed()
+        );
+        let _ = e.end_session();
+    }
+    let _ = theirs.kill();
+    let _ = theirs.wait();
+}
+
 /// Arm C: the failure a pump must not turn into a hang — a launch whose image does not exist.
 /// The spawn is deferred, so this fails *inside* the wait, and a fix that pumps until a process
 /// appears has to see that failure rather than wait out its whole deadline.
@@ -362,6 +401,7 @@ fn main() {
         println!("(running under {spinners} CPU spinners)");
     }
     membership_against_the_break(rounds.max(1));
+    a_guard_whose_event_was_overwritten();
     a_target_that_arrived_before_its_wait();
     listed_before_the_wait();
     a_launch_that_cannot_start();
