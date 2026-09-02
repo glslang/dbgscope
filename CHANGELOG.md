@@ -91,15 +91,18 @@ All notable changes to this project are documented here. The format follows
   wait every time it was observed. **Membership in the session is not the terminal condition** —
   `cpr` is an ignored filter, so a process is registered when its create event is processed and its
   initial breakpoint arrives later, and a competing break in between would leave the open's process
-  listed but not where the open promised to leave it — so the pump reads which process the last
-  event belongs to (`GetLastEventInformation`, by engine id, which
-  `test_the_last_event_names_its_process_by_engine_id` pins against `session_processes`). That
-  slot is session-wide and every later event overwrites it, so it is evidence only about a wait
-  **this call made**: the ask before pumping, and the answer at the bound, are membership. A wait
-  that cannot evaluate its own postcondition — a snapshot that would not read, a session that has
-  gone, an engine naming no event — returns as it did before, and only a process demonstrably not
-  in the session by the bound answers the new `DbgEngError::LiveTargetTimeout`. With the fix, 0
-  short in 40 rounds under the same load. Reported as
+  listed but not where the open promised to leave it — so the pump waits for the process to have
+  **stopped**. That is read from a record the engine keeps (`stopped_on`, written by both waits
+  from `GetLastEventInformation`, by engine id, which
+  `test_the_last_event_names_its_process_by_engine_id` pins against `session_processes`) rather
+  than from that call in the moment: it is a single session-wide slot every later event
+  overwrites, so read directly it answers the same way for a target still coming and for one that
+  stopped before its guard was waited on. A wait that cannot evaluate its own postcondition — a
+  snapshot that would not read, a session that has gone — returns as it did before, and only a
+  process demonstrably not in the session by the bound answers the new
+  `DbgEngError::LiveTargetTimeout`; one that is there but was never seen to stop ends the wait
+  `Ok`, because "not observed to stop" is not "never arrived". With the fix, 0 short in 40 rounds
+  under the same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
 - A `PendingTarget` **waited after something else pumped its target in** no longer waits for the
@@ -109,9 +112,9 @@ All notable changes to this project are documented here. The format follows
   **29.36s and `E_UNEXPECTED`** — the debuggee outran the bound and took the session with it —
   against **8.6µs and `Ok`**. Neither opener lists its process before the wait that completes it
   (measured), so the ordinary open still waits exactly once. The same measurement with a *second*
-  target arrived since — which overwrites the engine's record of where it stopped — is 29.4s and
-  `E_UNEXPECTED` against 5.4µs, and is what says that ask has to be membership rather than the last
-  event.
+  target arrived since — which overwrites the one slot recording where the engine stopped — is
+  29.4s and `E_UNEXPECTED` when the ask reads that slot against single-digit µs when it reads the
+  record, and is the argument for `stopped_on` existing at all.
 - `a_watchdog_disarmed_before_its_deadline_costs_nothing` measured the machine rather than the
   watchdog, and failed on the coverage job of a docs-only PR. Three things were wrong with it, and
   the first meant it was not testing the property at all: armed and disarmed back to back, the
