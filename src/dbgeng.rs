@@ -86,6 +86,17 @@ pub enum DbgEngError {
     )]
     KernelBreakTimeout,
 
+    /// A user-mode open whose process never joined the session.
+    ///
+    /// The sibling of [`Self::KernelBreakTimeout`], and it exists because what it replaces was a
+    /// lie rather than a different error: a live open used to be one `WaitForEvent`, which is one
+    /// *event* and not necessarily this target's, so an open could return `Ok` with its process
+    /// absent from the session (dbgscope#128). Reported only when the session stayed readable and
+    /// the target was demonstrably not in it — an open that cannot evaluate its own postcondition
+    /// returns `Ok` exactly as it did before, rather than failing on a probe.
+    #[error("the process did not join the session within the open timeout")]
+    LiveTargetTimeout,
+
     #[error("Operation failed: {0}")]
     OperationFailed(windows::core::Error),
 
@@ -2251,6 +2262,80 @@ impl DebugEngine {
         Ok(())
     }
 
+    /// The user-mode tail of [`PendingTarget::wait`]: pump until `arrival` is in the session.
+    ///
+    /// [`Arrival`] has the measurement and why one wait is not enough. Four things about the shape
+    /// here, each of which is a way to get it wrong:
+    ///
+    /// - **[`Presence::Unknown`] means different things either side of the first wait**, which is
+    ///   why `waited` exists. Before it, it is the ordinary state of every open — an engine whose
+    ///   target has not materialised has no debuggee to ask about, so treating it as an answer
+    ///   would end a fresh launch's wait before the process existed. After one, it is a session
+    ///   there is nothing left to ask, and pumping it is what faults.
+    /// - **Asking first is safe, and it is measured rather than assumed.** Neither opener puts its
+    ///   process in the session's list before the wait that completes it (measured: a session at 1
+    ///   process, `attach_process_begin`, still 1, the pid absent — 2 after the wait), so the
+    ///   ordinary open still waits exactly once. What the ask buys is a guard waited *after*
+    ///   something else pumped its target in, which [`PendingTarget`] documents as a thing to do
+    ///   and which would otherwise wait out the whole bound for an event that had already come.
+    /// - **[`LIVE_WAIT_MS`] bounds the open, not each wait**, so pumping cannot multiply what a
+    ///   caller waits for by however many events happen to arrive.
+    /// - **An error from the wait ends it.** A launch whose image does not exist fails *inside*
+    ///   the wait (measured: `Err(0x80070002)` after 13ms, no debuggee behind it, and a further
+    ///   wait answering `E_UNEXPECTED` in 37µs), so propagating is what keeps this from turning a
+    ///   fast, accurate failure into a half-minute of pumping a session that has nothing in it.
+    fn wait_for_live_target(&self, arrival: &Arrival) -> Result<(), DbgEngError> {
+        let deadline = Instant::now() + Duration::from_millis(u64::from(LIVE_WAIT_MS));
+        let mut waited = false;
+        loop {
+            match self.presence_of(arrival) {
+                Presence::Arrived => return Ok(()),
+                Presence::Unknown if waited => return Ok(()),
+                Presence::Absent | Presence::Unknown => {}
+            }
+            let left = u32::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(LIVE_WAIT_MS);
+            if left == 0 {
+                return Err(DbgEngError::LiveTargetTimeout);
+            }
+            self.wait_for_event(left)?;
+            waited = true;
+        }
+    }
+
+    /// Whether the target a live open is waiting for has joined the session yet.
+    ///
+    /// Every failure to *ask* answers [`Presence::Unknown`] rather than [`Presence::Absent`],
+    /// which is the difference between a wait that ends where it always did and one that pumps an
+    /// engine holding nothing until it faults.
+    fn presence_of(&self, arrival: &Arrival) -> Presence {
+        let (Ok(true), Ok(held)) = (self.has_target(), self.session_processes()) else {
+            return Presence::Unknown;
+        };
+        let arrived = match arrival {
+            Arrival::Attached(pid) => held.iter().any(|(_, held)| held == pid),
+            // Nothing to eliminate against, so nothing can be concluded.
+            Arrival::Launched(None) => return Presence::Unknown,
+            Arrival::Launched(Some(before)) => {
+                let attached = self
+                    .attached_processes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                held.iter()
+                    .any(|entry| !before.contains(entry) && !attached.contains(&entry.1))
+            }
+        };
+        if arrived {
+            Presence::Arrived
+        } else {
+            Presence::Absent
+        }
+    }
+
     /// Sets (replaces) the symbol search path.
     pub fn set_symbol_path(&self, symbol_path: &str) -> Result<(), DbgEngError> {
         let path = CString::new(symbol_path).map_err(|_| DbgEngError::InvalidCommand)?;
@@ -4154,6 +4239,11 @@ impl DebugEngine {
         // still be sitting in the record from an attach that ended. See `prune_dead_attachments`.
         self.prune_dead_attachments();
         self.enable_initial_break()?;
+        // What the launched process is told apart from, since the create hands back no pid: see
+        // `Arrival`. Taken here rather than at the wait, because by then the process this open is
+        // waiting for may already be in the list and would be eliminated as one of its own
+        // predecessors.
+        let before = self.session_processes().ok();
         let mut wide = to_wide(command_line);
         unsafe {
             self.client.CreateProcessWide(
@@ -4170,7 +4260,10 @@ impl DebugEngine {
         // returns. With the initial-breakpoint filter enabled above, that wait stops at
         // the loader breakpoint.
         self.retain_deferred_input(TargetInput::Wide(wide));
-        Ok(PendingTarget::new(self, WaitKind::Live))
+        Ok(PendingTarget::new(
+            self,
+            WaitKind::Live(Arrival::Launched(before)),
+        ))
     }
 
     /// Attaches to an existing user-mode process by PID and waits for the break-in,
@@ -4197,7 +4290,10 @@ impl DebugEngine {
         self.prune_dead_attachments();
         self.claim_attached(pid);
         // The attach completes during `WaitForEvent`, which breaks the target in.
-        Ok(PendingTarget::new(self, WaitKind::Live))
+        Ok(PendingTarget::new(
+            self,
+            WaitKind::Live(Arrival::Attached(pid)),
+        ))
     }
 
     /// Opens a crash dump (`.dmp`) or a Time Travel Debugging trace (`.run`).
@@ -4508,12 +4604,54 @@ impl Drop for DebugEngine {
 }
 
 /// Which initial-break wait completes a [`PendingTarget`].
-#[derive(Clone, Copy)]
 enum WaitKind {
-    /// User-mode launch/attach: a finite `WaitForEvent`.
-    Live,
+    /// User-mode launch/attach: finite `WaitForEvent`s until the target named here is in the
+    /// session.
+    Live(Arrival),
     /// Kernel attach: the bounded INFINITE wait plus its INITIAL_BREAK bookkeeping.
     KernelBreakIn,
+}
+
+/// The user-mode process a live open is waiting to see join the session.
+///
+/// **One `WaitForEvent` is one *event*, and not necessarily this target's.** The spawn a
+/// `CreateProcessWide` defers is realised inside that wait, but so is everything else the session
+/// is holding, and an engine that already has a target can return from the wait on *that* target's
+/// event — measured (dbgscope#128): an `AttachProcess` break-in whose injected thread is slow to be
+/// scheduled lands a whole wait late, and the `launch_process` that follows spends its single wait
+/// on it. The launch then reported success with its process absent from the session, which is what
+/// made a test fail on its own guard rather than on the property it was written for.
+///
+/// So the wait pumps instead, which is sound because the event is queued rather than lost:
+/// `examples/deferred_arrival.rs` under CPU load came up short 5 times across 90 rounds and the
+/// missing process was there on the *next* wait every time, never later than that.
+///
+/// **A launch is identified by elimination and an attach by name**, because `CreateProcessWide`
+/// hands back no pid — the process does not exist yet — while `AttachProcess` is given one. The
+/// elimination is exact for opens made one after another, which is every caller this crate has and
+/// the shape the issue is about; two launches pending *at once* cannot be told apart by it, and
+/// either one ends both waits.
+enum Arrival {
+    /// A process this engine launched: one the session did not hold when the launch was issued and
+    /// that this engine did not attach to. The attach half of that is what keeps a launch and an
+    /// attach pending together from satisfying each other.
+    ///
+    /// `None` when the snapshot could not be read, which leaves the wait as it was — a
+    /// postcondition that cannot be evaluated must not be asserted.
+    Launched(Option<Vec<(u32, u32)>>),
+    /// A process this engine attached to, known by the pid the caller named.
+    Attached(u32),
+}
+
+/// Whether the target a live open is waiting for has joined the session yet.
+enum Presence {
+    Arrived,
+    Absent,
+    /// Not answerable: the session holds nothing to ask, or the ask itself failed. It ends the
+    /// wait where a single `WaitForEvent` used to end it, rather than pumping — driving an engine
+    /// that no longer has a debuggee is the fault [`DebugEngine::execute_command`] guards against,
+    /// and a probe that failed is no evidence the target is missing.
+    Unknown,
 }
 
 /// Input buffers DbgEng may still read *after* the target-creating call has returned,
@@ -4594,10 +4732,12 @@ impl<'a> PendingTarget<'a> {
     /// Waits for the target's initial break, completing the open.
     ///
     /// For a kernel attach this can block **without bound** when the target never connects;
-    /// see [`DebugEngine::attach_kernel`]. User-mode waits are bounded by `LIVE_WAIT_MS`.
+    /// see [`DebugEngine::attach_kernel`]. User-mode waits are bounded by `LIVE_WAIT_MS` — for the
+    /// whole open rather than per wait, since a live open pumps until its own target is in the
+    /// session (see [`Arrival`]) instead of returning on the first event to arrive.
     pub fn wait(self) -> Result<(), DbgEngError> {
         match self.kind {
-            WaitKind::Live => self.engine.wait_for_event(LIVE_WAIT_MS),
+            WaitKind::Live(arrival) => self.engine.wait_for_live_target(&arrival),
             WaitKind::KernelBreakIn => self.engine.wait_for_kernel_break_in(),
         }
     }
@@ -5445,25 +5585,55 @@ mod tests {
     /// The "at once" is the assertion that matters, and it is a regression test rather than a
     /// tautology: both bounded paths here used to poll a flag on a 200/300ms sleep, so `join` sat
     /// out the rest of that interval on every call — the tax that made a finite `WaitForEvent`
-    /// look like the cheaper option for user-mode targets, which is the bug this branch exists to
-    /// fix. The bound is deliberately loose (a CI runner is not a bench) and still an order of
-    /// magnitude under the old floor.
+    /// look like the cheaper option for user-mode targets, which is the bug the condvar fixed.
+    ///
+    /// **Three things keep it from measuring the machine instead** (dbgscope#128, where it failed
+    /// on the coverage job of a docs-only PR), and the first is why it was not measuring the
+    /// property at all.
+    ///
+    /// It **settles first**. Armed and disarmed back to back, the flag is usually set before the
+    /// watchdog's thread has run at all, so it sees it at the top of its loop and returns without
+    /// ever reaching a wait — the disarm is then immediate whether it wakes a condvar or waits out
+    /// a nap. Checked by reverting the condvar (a `WATCHDOG_REPEAT` nap, `notify_all` removed):
+    /// the test passed, in 0.00s. So the sleep is what the timing below is *about*, and what makes
+    /// it safe is its direction — a slow machine parks that thread more surely, never less.
+    ///
+    /// The bound is [`WATCHDOG_REPEAT`] halved rather than a number of milliseconds: it is the
+    /// poll interval the condvar replaced, so it is the only figure here the property is actually
+    /// about — "a wake-up, not a poll interval" is a comparison, and it was written as an absolute.
+    /// Half of it, because the regression waits out a *whole* interval and being under half is
+    /// therefore still an unambiguous verdict.
+    ///
+    /// And it is the **fastest** of several rounds, which is what makes the bound about the code:
+    /// a loaded two-core runner makes *some* rounds slow, while a watchdog that sleeps makes
+    /// *every* round slow. There is no scheduling accident that makes a nap short, so taking the
+    /// minimum costs the test nothing and buys it a machine it does not have to own.
     #[cfg(not(miri))]
     #[test]
     fn a_watchdog_disarmed_before_its_deadline_costs_nothing() {
-        let fires = Arc::new(AtomicU64::new(0));
-        let counted = Arc::clone(&fires);
-        let watchdog = Watchdog::arm(Duration::from_secs(30), move || {
-            counted.fetch_add(1, Ordering::SeqCst);
-        });
-        let started = Instant::now();
-        let fired = watchdog.disarm();
-        let took = started.elapsed();
-        assert!(!fired, "a watchdog 30s from its deadline reported firing");
-        assert_eq!(fires.load(Ordering::SeqCst), 0);
+        /// Long enough that the thread is parked in its wait before the clock starts, and far
+        /// short of the interval the bound is against.
+        const SETTLE: Duration = Duration::from_millis(25);
+        const ROUNDS: usize = 5;
+
+        let mut fastest = Duration::MAX;
+        for _ in 0..ROUNDS {
+            let fires = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&fires);
+            let watchdog = Watchdog::arm(Duration::from_secs(30), move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+            thread::sleep(SETTLE);
+            let started = Instant::now();
+            let fired = watchdog.disarm();
+            fastest = fastest.min(started.elapsed());
+            assert!(!fired, "a watchdog 30s from its deadline reported firing");
+            assert_eq!(fires.load(Ordering::SeqCst), 0);
+        }
         assert!(
-            took < Duration::from_millis(50),
-            "disarming took {took:?}; it waits for a wake-up, not for a poll interval"
+            fastest < WATCHDOG_REPEAT / 2,
+            "the fastest of {ROUNDS} disarms took {fastest:?}, against a {WATCHDOG_REPEAT:?} poll \
+             interval; it waits for a wake-up, not for a poll"
         );
     }
 
@@ -6804,6 +6974,57 @@ mod tests {
             let _ = theirs.kill();
             let _ = theirs.wait();
         }
+    }
+
+    /// **A guard whose target arrived before its `wait()` returns at once, not on the next event.**
+    ///
+    /// [`PendingTarget`] documents dropping a guard and letting the target materialize at the next
+    /// `WaitForEvent` from any source. A guard still *held* when that happens is the same
+    /// situation, and until [`Arrival`] the wait had no way to notice: it made its one
+    /// `WaitForEvent` regardless, which on an arrived target resumes it and waits for whatever
+    /// happens next. Measured across this fix — **29.36s and `E_UNEXPECTED`** (the `ping` outran
+    /// its own bound and took the target with it) against **8.6µs and `Ok`**.
+    ///
+    /// The deterministic half of dbgscope#128, and the only half that is: the issue's own failure
+    /// is a race that reproduces a few times in forty rounds under CPU load and never on a quiet
+    /// machine, so it is `test_a_mixed_session_comes_apart_by_where_each_process_came_from` that
+    /// carries it, exactly as it did when it found it. This asks the same question — does a live
+    /// open end when *its* target is in the session — of a state that can be built rather than
+    /// waited for.
+    ///
+    /// The bound is a tenth of the open's own, since what is being separated is "returned without
+    /// waiting" from "waited out the whole of `LIVE_WAIT_MS`", and there is three orders of
+    /// magnitude between them to spend on a slow runner.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_guard_whose_target_already_arrived_does_not_wait_for_another_event() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        let pending = e
+            .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+        // Somebody else's pump — `execute_and_wait`, `run_to_address`, another guard — brings the
+        // deferred spawn in before this guard is waited on.
+        e.wait_for_event(LIVE_WAIT_MS)
+            .expect("the outside pump failed");
+
+        let started = Instant::now();
+        pending.wait().expect("wait on an arrived target failed");
+        let took = started.elapsed();
+
+        assert!(
+            took < Duration::from_millis(u64::from(LIVE_WAIT_MS / 10)),
+            "wait() took {took:?} on a target already in the session; it waited for another event \
+             rather than asking whether its own had arrived"
+        );
+        assert_eq!(
+            e.session_processes()
+                .expect("could not list the session's processes")
+                .len(),
+            1,
+            "the launched process is not in the session the wait said it had joined"
+        );
+        e.end_session().expect("end_session failed");
     }
 
     /// Execution control with no debuggee is **refused**, because letting it reach DbgEng takes
