@@ -111,6 +111,19 @@ All notable changes to this project are documented here. The format follows
   the first's answer. With the fix, 0 short in 40 rounds under the same load. Reported as
   [dbgscope#128](https://github.com/glslang/dbgscope/issues/128), where it had been failing
   `test_a_mixed_session_comes_apart_by_where_each_process_came_from` on CI's coverage job.
+- **A wait that stopped on nothing no longer records a stop.** `stopped_on` is written as each
+  wait observes a stop, and two kinds of wait come back having observed none. A **watchdog-forced**
+  Ctrl+Break was being recorded, which `wait_for_event_bounded` documents as something callers must
+  not treat as a normal completion: it stops whatever was running, so an `execute_and_wait` or
+  `run_to_address` pumping a mixed session could stop a deferred target before its initial
+  breakpoint and leave that target's still-held guard reporting an initial-break wait that never
+  happened. The other is an **expiry**, which `WaitForEvent` reports as `S_FALSE` and the generated
+  wrapper flattens into the same `Ok` a stop gets; that one was never reaching the record, because
+  an expired wait leaves `GetLastEventInformation` reporting `DEBUG_ANY_ID` rather than the event
+  before it -- measured, and so the safety rested on an undocumented sentinel in the one function a
+  guard trusts to end its wait early. Both are now gated, the expiry by reading the raw `HRESULT`
+  through the vtable as `interrupted` already does, and the sentinel is pinned so that an engine
+  which stops supplying it fails a test rather than an open.
 - **What a teardown lets go of now turns on `EndSession`'s own outcome**, not on the value
   `end_session` returns. The two differ exactly when a detach fails: `end_session` reports that
   failure to its caller, and rightly, but a process this engine could not detach from is one left
