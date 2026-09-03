@@ -36,9 +36,21 @@
 //! D is the residue in the flesh — a request aimed at an operation that has already ended is
 //! readable afterwards, and it is the **next** operation that will be stopped by it.
 //!
+//! **C checks the interleaving it needs rather than assuming it**, which a review of this file was
+//! right to insist on. Nothing stops the first break unwinding the wait before the second
+//! `SetInterrupt` is issued — `interrupt()` releases its lock between the two, and the waiter is
+//! inside DbgEng where no lock of ours can hold it — so a run that got that ordering would be arm D
+//! wearing arm C's name. The arm compares when the wait returned against when the second request
+//! went and prints `INCONCLUSIVE` rather than a conclusion if it lost the race. Three runs, all of
+//! them with both requests in flight. (Note the observation discriminates too, which is why the
+//! first three runs were not simply wrong: had the second request landed late it would have
+//! survived and C would read `[true, …]` exactly as D does. The check is there so a future run
+//! says so instead of leaving that inference to a reader.)
+//!
 //! (C was first written as D by accident, with a 50 ms gap between the two requests that turned
 //! out to be far longer than the wait took to unwind. It measured a real thing and not the thing
-//! its name claimed, which is why they are now two arms with the gap stated in each.)
+//! its name claimed, which is why they are now two arms with the gap stated in each — and why the
+//! check above exists rather than a third careful comment.)
 //!
 //! **What this licenses, and what it does not.** C and D together are the useful pair: a post-wait
 //! `true` means *a request survives that this wait did not consume*, and the only thing it can
@@ -59,7 +71,7 @@
 //! Run: cargo run --example interrupt_provenance
 
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dbgscope::dbgeng::DebugEngine;
 
@@ -153,21 +165,36 @@ fn main() {
             // this asks whether a *second* request survives the wait that consumed the first.
             let first = handle.interrupt();
             let second = handle.interrupt();
-            (first, second)
+            (first, second, Instant::now())
         });
         let waited = e.wait_for_event(15_000);
-        let _ = asked.join().expect("the asking thread panicked");
+        let returned = Instant::now();
+        let (_, _, both_issued) = asked.join().expect("the asking thread panicked");
 
         let polls: Vec<bool> = (0..5).map(|_| e.interrupted().unwrap()).collect();
+        // **Checked, not assumed**, which a review of this file was right to insist on: nothing
+        // stops the first break unwinding the wait before the second `SetInterrupt` is issued --
+        // `interrupt()` releases its lock between the two, and the waiter is inside DbgEng where no
+        // lock of ours can hold it. Had that happened, this would be arm D wearing arm C's name.
+        // So the arm says which interleaving it got rather than presuming one.
+        let both_in_flight = returned >= both_issued;
         println!("C. two SetInterrupts back to back, both aimed at one wait");
         println!("   wait -> {waited:?}");
+        println!(
+            "   the wait returned {} the second request was issued",
+            if both_in_flight { "after" } else { "BEFORE" }
+        );
         println!("   five GetInterrupt polls afterwards: {polls:?}");
         println!(
             "   -> {}\n",
-            if polls == [false; 5] {
-                "a flag and not a counter: one wait consumes both, nothing survives"
-            } else {
-                "a second request survived the wait -- a survivor is not proof of a missed break"
+            match (both_in_flight, polls == [false; 5]) {
+                (true, true) =>
+                    "a flag and not a counter: one wait consumed both, nothing survives",
+                (true, false) =>
+                    "a second request survived the wait -- a survivor is not proof of a missed break",
+                (false, _) =>
+                    "INCONCLUSIVE: the wait was over before the second request went, so \
+                               this ran arm D and proves nothing about simultaneous requests",
             }
         );
 
