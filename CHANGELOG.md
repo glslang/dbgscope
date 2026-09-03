@@ -127,6 +127,17 @@ All notable changes to this project are documented here. The format follows
   that can say the attach cannot join. Not on an *interrupted* open, which says nothing about
   whether the attach is still coming.
 
+  And a fourth round, both halves of it about the register being shared where it used to be a
+  field. `Drop` tears the session down inline rather than calling `end_session`, so it never
+  inherited the line that forgets the pending opens — which cost nothing while each wrapper had its
+  own register and leaves a stale entry now, first in line for the next launch's stop through a
+  wrapper that outlived the owner. And a **claim** now stops excluding once its process leaves the
+  session: engine ids are handed back immediately, so a `.detach` and a reattach of the same pid
+  reproduce a pair exactly, and a stale claim made the reattach refuse its own stop as somebody
+  else's. That is the reuse the old record was pruned for, arriving from the opposite side — where
+  a stale entry there made a new open read `Arrived` for a target that had not stopped, a stale
+  claim makes it read `Absent` for one that had.
+
   No public API changes. Two tests are gone rather than passing, and the constructions that make
   them unreachable are named where they were:
   `test_ending_a_session_forgets_which_processes_it_stopped_on` had no record to forget, and
