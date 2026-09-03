@@ -3041,7 +3041,27 @@ impl DebugEngine {
             // pumping on spends the rest of the bound on an event nobody wants. Only a host can
             // raise one here today -- a finite bound arms no watchdog, and the engine thread is
             // inside this loop -- but the loop should not be the thing that has to know that.
-            asked_to_stop = self.pump(Bound::Finite(left), &operation)?.broke_in();
+            asked_to_stop = match self.pump(Bound::Finite(left), &operation) {
+                Ok(outcome) => outcome.broke_in(),
+                Err(err) => {
+                    // A pump that fails is an ending too, and the deferred record has to be let go
+                    // of on it for the same reason as at the bound -- otherwise an `AttachProcess`
+                    // the engine accepted for a process that exited before the first wait leaves
+                    // its pid recorded for the life of the session, since only a listing promotes
+                    // one. Raised in review on dbgscope#139 against a fix that covered the bound
+                    // alone.
+                    //
+                    // **Narrower than the bound's, deliberately.** A session holding *nothing* is
+                    // proof this attach produced no target; a wait that failed with a live session
+                    // says nothing about whether it is still coming, and retiring there would let
+                    // the teardown take somebody else's process -- which is the direction that
+                    // costs.
+                    if self.holds_nothing_at_all() {
+                        self.retire_deferred_attachment(registered);
+                    }
+                    return Err(err);
+                }
+            };
             waited = true;
         }
     }
@@ -3092,6 +3112,24 @@ impl DebugEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .presence(registered.id, &held, &attached)
+    }
+
+    /// Whether this session holds no target at all, which is the one ending that *proves* an
+    /// `AttachProcess` this engine accepted produced nothing.
+    ///
+    /// Narrower than [`Presence::Absent`] on purpose, and the difference is the evidence rather
+    /// than taste. At the bound an open has pumped for `LIVE_WAIT_MS`, so a pid still not listed is
+    /// one that is not coming; on a *failed* pump the open may have pumped nothing at all, and the
+    /// same reading would retire an attach the engine had not yet had a chance to process --
+    /// after which the teardown takes somebody else's process, which is the direction that costs.
+    ///
+    /// **The negative half is untested here and says so.** Constructing a pump that fails with a
+    /// live session is not something this bench can arrange: `WaitForEvent` failing is
+    /// `E_UNEXPECTED` for a session holding nothing, and a live target does not oblige. So the
+    /// predicate is pinned both ways on its own, and the branch that reads it is pinned only for
+    /// the ending that can be built.
+    fn holds_nothing_at_all(&self) -> bool {
+        matches!(self.has_target(), Ok(false))
     }
 
     /// Retires the record of an attachment a live open waited its whole bound for and never saw.
@@ -8645,6 +8683,72 @@ mod tests {
         let _ = theirs.wait();
     }
 
+    /// **What counts as proof that an attach produced nothing**, pinned both ways because the
+    /// branch that reads it can only be built one way.
+    ///
+    /// A pump that fails with a session holding nothing is the reviewer's scenario and is what
+    /// `test_a_failed_pump_retires_a_deferred_attachment` drives. A pump that fails with a live
+    /// session must *not* retire -- the open may have pumped nothing, so the engine has not had a
+    /// chance to process the attach -- and that ending is not constructible here. This is the half
+    /// of it that is.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_only_an_empty_session_proves_an_attach_produced_nothing() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        assert!(
+            e.holds_nothing_at_all(),
+            "a fresh engine holds a target, so nothing here means what it says"
+        );
+        e.launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        assert!(
+            !e.holds_nothing_at_all(),
+            "a session with a live target read as holding nothing, so a failed pump would retire              an attach the engine has not yet had a chance to process"
+        );
+        let _ = e.end_session();
+    }
+
+    /// **A failed pump retires the record too**, which is the ending the bound's version cannot
+    /// reach and the one the reviewer's scenario actually takes.
+    ///
+    /// `AttachProcess` is accepted, the target exits before the first `WaitForEvent`, and the
+    /// session then holds nothing -- so the pump fails `E_UNEXPECTED` rather than expiring
+    /// (`test_a_wait_with_no_debuggee_fails_rather_than_expiring`), the open returns through its
+    /// `?`, and the bound is never reached. Retiring only there left the pid recorded for the life
+    /// of the session. Raised in review on dbgscope#139.
+    ///
+    /// Fast, unlike the bound's version, because the failure is immediate: no debuggee, no wait.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_failed_pump_retires_a_deferred_attachment() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        // No target at all, which is what a session whose only process exited before its attach
+        // joined looks like -- and is what makes the pump fail instead of expiring.
+        assert!(
+            !e.has_target().expect("could not read the execution status"),
+            "this engine holds a target, so the pump will not fail and nothing is under test"
+        );
+        let absent = 0x7FFF_FFF0;
+        e.claim_attached(absent);
+        let waiting = registered(&e, Arrival::Attached(absent));
+
+        let outcome = e.wait_for_live_target(&waiting);
+        assert!(
+            matches!(outcome, Err(DbgEngError::CommandFailed(_))),
+            "the open answered {outcome:?} rather than failing, so it did not take the ending              this test is about"
+        );
+        assert!(
+            !e.state
+                .attached_processes
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .contains_key(&absent),
+            "a pump that failed with the session holding nothing left the record behind, so a              later process inheriting that pid is treated as one this engine only attached to"
+        );
+    }
+
     /// The end-to-end half of the test above: a live open really does retire the record when it
     /// waits out its bound.
     ///
@@ -9350,11 +9454,21 @@ mod tests {
             let launched = e
                 .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.1")
                 .expect("launch failed");
-            e.wait_for_event(LIVE_WAIT_MS)
-                .expect("the outside pump failed");
             let WaitKind::Live(registered) = &launched.kind else {
                 panic!("a launch guard is not a live open");
             };
+            // **Pumped until delivered, not once.** One `WaitForEvent` is one *event*, and this
+            // session already holds an attached process whose own events compete -- which is the
+            // whole of `Arrival` and of dbgscope#128. A single pump was enough on the bench and
+            // was not on the instrumented coverage runner, which is exactly the shape that finding
+            // is about.
+            for _ in 0..5 {
+                if matches!(e.presence_of(registered), Presence::Arrived) {
+                    break;
+                }
+                e.wait_for_event(LIVE_WAIT_MS)
+                    .expect("the outside pump failed");
+            }
             assert!(
                 matches!(e.presence_of(registered), Presence::Arrived),
                 "the launch was not delivered its process, so nothing here is under test"
