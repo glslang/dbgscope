@@ -80,15 +80,31 @@ All notable changes to this project are documented here. The format follows
   pid reuse" — which was the cost of the record it would have joined, and is the cost this shape
   does not have.
 
+  **A claim outlives the open that made it**, for as long as anything is still waiting: when a
+  guard goes, the process it was given is inherited by the opens that remain. Without it the
+  ambiguity above is closed only while both guards are held: the first launch's target stops
+  again, nobody has it claimed any more, and it is absent from the second launch's snapshot because
+  it did not exist when that snapshot was taken. Not a lifecycle creeping back in: the claim goes
+  when the opens holding it do, where the record this replaces lived for the whole session.
+
   **The state is per client rather than per wrapper**, in a new `ClientState` held by `Arc` and
   keyed by client pointer in a `Weak` map. Two `DebugEngine`s can be live around one
   `IDebugClient6`, and a `wait_for_event` through one used to complete an open held by the other in
-  its own copy of the record alone — the other then read `Listed`, waited again, and spent its whole
-  bound on an event that had already happened. That was written down as a known gap for two
+  its own copy of the record alone — the other then read `Listed`, waited again, and spent its
+  whole bound on an event that had already happened. That was written down as a known gap for two
   releases; the interrupt scope from stage 2 had the mirror of it and moves into the same `Arc`,
   because it is the same field. A `Weak` map needs no equivalent of `reissue_identity`: a dead entry
   identifies itself, where a stale *identity* costs only a re-read and a stale *arrival* would
   answer `Arrived` for a target that never stopped.
+
+  **`attached_processes` moves with them**, which was not planned and is the sharper of the two
+  gaps that placement had. Delivery reads it to keep an attach's process from being claimed by a
+  pending launch, and a pump through a second wrapper read an empty set; but an `end_session`
+  through a wrapper that did not perform the attach also saw no attachment to detach, so its
+  passive end **killed** somebody else's process — the exact failure that record exists to
+  prevent, reached through the wrapper boundary. The sentence that used to defend the old
+  placement argued that sharing would put the decision "behind an eviction policy" -- true of the
+  identity cache, and not of a `Weak` map whose entry dies with the last wrapper holding it.
 
   No public API changes. Two tests are gone rather than passing, and the constructions that make
   them unreachable are named where they were:
