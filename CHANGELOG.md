@@ -58,6 +58,48 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **A break request names the operation it is for.** `InterruptHandle::interrupt` answers a
+  `BreakRequest` — `Raised { operation }` or `NothingRunning` — instead of `Result<(), _>`, and
+  files the request against the bounded operation the engine is running **under the same lock it
+  delivers `SetInterrupt` on**. `DebugEngine::begin_operation` opens one; its guard discards an
+  unread request when it drops. Stage 2 of
+  [#136](https://github.com/glslang/dbgscope/issues/136), closing
+  [#135](https://github.com/glslang/dbgscope/issues/135).
+
+  What it replaced was an engine-wide `AtomicBool` answering *has an interrupt been requested*,
+  where every reader wanted *was **this** operation asked to stop*. Six operations cleared it as
+  they opened, so a request lodged between an operation's clear and its wait was **erased while its
+  break was still on the way** — and the synthetic Ctrl+Break that arrived next was then reported
+  as the target's own stop, up to and including being recorded in `stopped_on` as a target's
+  initial break, which is the exact misattribution that record's gate exists to prevent, reached
+  around it rather than through it. That is #135 half A. Half B — a request outliving the wait it
+  ended — was closed by stage 1, which made every pump *take* what it read.
+
+  **The lock is the fix, not the identity.** A generation counter does not close it: if
+  `interrupt()` bumps and the operation samples after the bump but before `SetInterrupt`, the
+  request is erased exactly as before. The window is between two writes, not between two values, so
+  what closes it is making the record and the operation boundary mutually exclusive. The id earns
+  its place elsewhere — operations **nest**, since `wait_for_kernel_break_in` holds one across an
+  `absorb_initial_break_artifact` that runs a whole `execute_and_wait`, so `running` is a stack and
+  `asked` a set and a `bool` could not express either.
+
+  Two consequences. **Delivery stays engine-wide and only attribution is scoped**: `SetInterrupt`
+  cannot be aimed, so the break is issued unconditionally — that is what lets a host abort a long
+  unbounded `execute_command` that no bounded operation covers — and `NothingRunning` is the
+  honest answer when nothing will report it. And **the watchdog files nothing**, reaching the engine
+  through a private `break_in_only`, which deletes the `by_watchdog | flag` reconciliation from five
+  sites: a deadline and a host request are now independent signals rather than two readings of one
+  bit.
+
+  **The residue is named rather than closed.** A break aimed at operation N that lands on N+1 —
+  because N ended between the host reading what was running and the break arriving — stops N+1,
+  which sees no request of its own. No bookkeeping reaches that. `examples/interrupt_provenance.rs`
+  is the measurement #136 asked for before anything relies on one: a request that *ended* a wait is
+  consumed before the wait returns (`[false; 5]`), one that did not is still readable
+  (`[true, false, …]`), two back to back are one flag rather than two, and one lodged after the
+  wait it was too late for belongs to the next operation. So a post-wait `GetInterrupt` is a
+  **forward** signal, which is stage 3's to use.
+
 - **A wait returns what it did.** `DebugEngine::wait_for_event` answers a `WaitOutcome` —
   `Stopped { process }`, `Expired`, `Deadline` or `OnRequest` — instead of `Result<(), _>`, and
   every wait in the crate now goes through one private `pump(bound)` that produces that value

@@ -230,19 +230,15 @@ pub struct InterruptHandle {
     /// moment a host reaches for it. The refcount costs nothing and makes the lifetime a fact
     /// rather than a convention.
     control: IDebugControl4,
-    /// Set whenever this handle raises an interrupt, and cleared by the command that finds it.
-    ///
-    /// Shared with the engine so [`DebugEngine::execute_command_bounded`] can tell an aborted
-    /// `Execute` from a failed one *without* being the thread that asked. Without it an interrupt
-    /// on request is indistinguishable from a command error, and the output captured up to the
-    /// break is discarded with it — which is most of what an interrupted search is worth.
+    /// The engine's operation bookkeeping, so a request this handle raises is recorded **against
+    /// the operation it will stop** rather than against the engine at large. See [`BreakScope`].
     ///
     /// **Shared with that engine, and not with another wrapper around the same client**, which is
     /// the gap [`DebugEngine::stopped_on`] describes: `SetInterrupt` reaches the engine both
     /// wrappers share, so a handle taken from one raises a break the other sees as a stop its
-    /// target made on its own -- and, since [`DebugEngine::pump`] takes this to attribute its
-    /// [`WaitOutcome`], records as an arrival.
-    raised: Arc<AtomicBool>,
+    /// target made on its own -- and, since [`DebugEngine::pump`] takes the request to attribute
+    /// its [`WaitOutcome`], records as an arrival.
+    scope: Arc<Mutex<BreakScope>>,
 }
 // SAFETY: `control` is only ever handed to SetInterrupt, the one cross-thread-safe DbgEng call.
 // The other cross-thread touch is the `Release` on drop, which rests on the same assumption
@@ -253,7 +249,8 @@ unsafe impl Send for InterruptHandle {}
 unsafe impl Sync for InterruptHandle {}
 
 impl InterruptHandle {
-    /// Asks the engine this came from to break out of whatever it is running.
+    /// Asks the engine this came from to break out of whatever it is running, and says what that
+    /// was.
     ///
     /// Returns as soon as the request is lodged, not when the engine acts on it: a long command
     /// polls for the flag exactly as it does for a human's Ctrl+Break, so the operation ends at
@@ -261,17 +258,195 @@ impl InterruptHandle {
     /// engine, both of them properties of `SetInterrupt` rather than of this: a command that never
     /// polls is not reached, and neither is a live-kernel wait whose target has not yet connected
     /// (see [`Bound::Watchdog`]).
-    pub fn interrupt(&self) -> Result<(), DbgEngError> {
-        // Stored *before* the call, so the flag can never become visible later than the break it
-        // explains — a bounded command reads it after `Execute` returns, and one that read `false`
-        // there would report the abort it caused as a debugger error.
-        self.raised.store(true, Ordering::SeqCst);
+    ///
+    /// **Delivery is engine-wide and attribution is scoped, and they are different questions.**
+    /// `SetInterrupt` stops whatever is inside `WaitForEvent` — it carries no notion of an
+    /// operation and cannot be aimed — so the break is issued unconditionally, which is what lets
+    /// a host abort a long unbounded [`DebugEngine::execute_command`] that no bounded operation
+    /// covers. What is scoped is the *record*: the request is filed against the operation running
+    /// at this instant, and only that operation can report it as
+    /// [`Interruption::OnRequest`]. [`BreakRequest::NothingRunning`] is the honest answer when
+    /// there is no such operation — the break still goes, and DbgEng discards a pending request
+    /// when the next `Execute` begins (measured; see `test_stale_interrupt_effect_on_the_next_command`).
+    ///
+    /// **Both halves happen under one lock, and that is the fix rather than a detail**
+    /// (dbgscope#135 half A). The old shape stored an engine-wide flag and then called
+    /// `SetInterrupt`, with each operation clearing the flag as it opened; a request lodged
+    /// between an operation's clear and its wait was therefore *erased* while its break was still
+    /// on the way, and the resulting synthetic stop was reported as the target's own — up to and
+    /// including being recorded in [`DebugEngine::stopped_on`] as a target's initial break. No
+    /// ticket or generation counter closes that: the window is between two writes, not between two
+    /// values. Holding the lock across the record *and* the delivery closes it by construction,
+    /// because an operation cannot begin or end in the middle.
+    pub fn interrupt(&self) -> Result<BreakRequest, DbgEngError> {
+        let mut scope = self.scope.lock().unwrap_or_else(|e| e.into_inner());
+        let against = scope.innermost();
+        // Delivered before it is recorded, which the lock makes safe and which the old ordering
+        // could not afford: nothing can observe the interim state, so a `SetInterrupt` that fails
+        // records nothing rather than leaving an operation to report a break that was never sent.
+        unsafe { self.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "requesting a debugger interrupt".into(),
+                source,
+            }
+        })?;
+        match against {
+            Some(operation) => {
+                scope.record(operation);
+                Ok(BreakRequest::Raised { operation })
+            }
+            None => Ok(BreakRequest::NothingRunning),
+        }
+    }
+
+    /// Breaks the engine out **without** recording a request against anything — this crate's own
+    /// watchdogs, whose deadline is already scoped to the operation they were armed around.
+    ///
+    /// The watchdog used to reach the engine through [`Self::interrupt`], so one deadline produced
+    /// *two* representations of itself — the watchdog's private flag and the engine-wide request —
+    /// and every classify site had to OR them together and then trust the private one to say which
+    /// it was. A watchdog that records nothing leaves one signal per origin, so
+    /// [`WaitOutcome::Deadline`] and [`WaitOutcome::OnRequest`] are read from different places and
+    /// cannot be confused for one another.
+    fn break_in_only(&self) -> Result<(), DbgEngError> {
         unsafe { self.control.SetInterrupt(DEBUG_INTERRUPT_ACTIVE) }.map_err(|source| {
             DbgEngError::Context {
                 operation: "requesting a debugger interrupt".into(),
                 source,
             }
         })
+    }
+}
+
+/// One bounded engine operation — a `WaitForEvent`, an `Execute` under a watchdog, a symbolic
+/// breakpoint resolve — and the identity a break request names.
+///
+/// Opaque, and minted only by [`DebugEngine::begin_operation`]. Ids are never reused, so one that
+/// names an operation which has ended matches nothing later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OperationId(u64);
+
+/// What [`InterruptHandle::interrupt`] did.
+///
+/// The break itself is issued either way; this says whether anything will *report* it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakRequest {
+    /// Filed against the operation the engine was running, which will report
+    /// [`Interruption::OnRequest`] when it ends.
+    Raised { operation: OperationId },
+    /// The engine was between bounded operations. The break was still delivered — it can abort a
+    /// long unbounded [`DebugEngine::execute_command`], which is a real thing to want — but no
+    /// operation will claim it, and nothing here will report it.
+    NothingRunning,
+}
+
+/// Which operations the engine is running, and which of them a host has asked to break.
+///
+/// **The whole of dbgscope#136 stage 2 is that these two facts live under one lock.** They used to
+/// be one engine-wide `AtomicBool` answering *has an interrupt been requested*, where every reader
+/// wanted *was **this** operation asked to stop*. Six operations cleared it as they opened, so a
+/// request could be erased between being lodged and being delivered (#135 half A), and a reader
+/// could be charged for a request aimed at its predecessor.
+///
+/// Nothing here is clever. `running` is a stack because operations **nest** — a kernel attach's
+/// `absorb_initial_break_artifact` runs an `execute_and_wait` inside
+/// [`DebugEngine::wait_for_kernel_break_in`], which is the case a single slot silently got wrong
+/// and a `bool` could not have expressed at all. `asked` is a set for the same reason: with an
+/// outer operation asked and an inner one begun since, two requests are outstanding at once.
+#[derive(Debug, Default)]
+struct BreakScope {
+    /// Ids handed out so far. Never reused.
+    minted: u64,
+    /// The operations the engine is inside, outermost first. Empty between operations.
+    running: Vec<OperationId>,
+    /// Operations a host has asked to break, and that have not yet accounted for it. An entry
+    /// leaves when its operation takes it, or when that operation ends without having.
+    asked: std::collections::BTreeSet<OperationId>,
+}
+
+impl BreakScope {
+    /// Opens an operation and returns its id.
+    fn begin(&mut self) -> OperationId {
+        self.minted += 1;
+        let id = OperationId(self.minted);
+        self.running.push(id);
+        id
+    }
+
+    /// The operation a break issued *now* would stop: the innermost one running.
+    fn innermost(&self) -> Option<OperationId> {
+        self.running.last().copied()
+    }
+
+    /// Files a request against `operation`.
+    fn record(&mut self, operation: OperationId) {
+        self.asked.insert(operation);
+    }
+
+    /// Takes the request filed against `operation`, if any.
+    fn take(&mut self, operation: OperationId) -> bool {
+        self.asked.remove(&operation)
+    }
+
+    /// Closes `operation`, discarding a request it never read.
+    ///
+    /// By id rather than by popping, so an out-of-order close cannot leave a stale id behind for a
+    /// later request to be filed against. Guards are lexical here and nesting is two deep, so this
+    /// costs nothing and removes a panic path.
+    fn end(&mut self, operation: OperationId) {
+        self.running.retain(|running| *running != operation);
+        self.asked.remove(&operation);
+    }
+}
+
+/// A bounded operation, open for as long as this guard lives.
+///
+/// A break a host raises while this exists is filed against **this** operation and no other, and
+/// is gone when the guard drops whether it was read or not. That is the whole of what replaced
+/// clearing an engine-wide flag at six call sites: there is nothing to clear, so there is nothing
+/// a request can be erased by.
+struct Operation<'a> {
+    engine: &'a DebugEngine,
+    id: OperationId,
+}
+
+impl Operation<'_> {
+    /// Takes the break request a host filed against this operation, if any.
+    ///
+    /// Taken and not read, because the request belongs to this operation: left standing it would
+    /// be charged to whatever ran next, which is #135 half B.
+    fn took_break_request(&self) -> bool {
+        self.engine
+            .break_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(self.id)
+    }
+
+    /// What cut this operation short, for a bound of `after_ms`, when it is **not** a pump.
+    ///
+    /// [`WaitOutcome::cut_short`] is the same question for the paths that wait. `by_watchdog` and
+    /// the host's request are now genuinely independent signals rather than two readings of one
+    /// flag — the watchdog goes through [`InterruptHandle::break_in_only`] and records nothing —
+    /// so the watchdog wins only where both are true, and that is a real coincidence rather than
+    /// a disambiguation.
+    fn cut_short_by(&self, by_watchdog: bool, after_ms: u32) -> Option<Interruption> {
+        let asked = self.took_break_request();
+        match (by_watchdog, asked) {
+            (true, _) => Some(Interruption::Deadline { after_ms }),
+            (false, true) => Some(Interruption::OnRequest),
+            (false, false) => None,
+        }
+    }
+}
+
+impl Drop for Operation<'_> {
+    fn drop(&mut self) {
+        self.engine
+            .break_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .end(self.id);
     }
 }
 
@@ -457,9 +632,9 @@ pub enum Interruption {
 /// the four are invisible from outside the wait: `S_OK` and `S_FALSE` are flattened into one
 /// `Ok(())` by the generated wrapper, and a break has already been serviced by the time anything
 /// downstream could look. So a wait answering `Result<(), _>` left its outcome to be reconstructed
-/// afterwards, out of shared mutable state, by whoever needed it — [`DebugEngine::interrupt_raised`]
-/// read twice, the session's process list read twice, and the one fact only the waiting call knew
-/// (the `HRESULT`) gone. dbgscope#136 has the derivation: 15 of the 22 findings on one review were
+/// afterwards, out of shared mutable state, by whoever needed it — an engine-wide interrupt flag
+/// read twice (since scoped to an operation, [`BreakScope`]), the session's process list read
+/// twice, and the one fact only the waiting call knew (the `HRESULT`) gone. dbgscope#136 has the derivation: 15 of the 22 findings on one review were
 /// downstream of that.
 ///
 /// Attribution *at* the wait is sound because waits are single-threaded here: nothing can overwrite
@@ -1530,20 +1705,20 @@ pub struct DebugEngine {
     /// re-read the buffer (drive `.restart` after a `launch_process`) is what would make a
     /// tighter release safe.
     deferred_inputs: Mutex<Vec<TargetInput>>,
-    /// Whether an interrupt has been raised on this engine and not yet accounted for. Shared with
-    /// every [`InterruptHandle`] this engine hands out; see there for what it buys.
+    /// Which bounded operations this engine is running, and which of them a host has asked to
+    /// break. Shared with every [`InterruptHandle`] it hands out; see [`BreakScope`].
     ///
-    /// **Three access sites, and no fourth**: [`Self::clear_break_requests`] at the start of any
-    /// operation that bounds or pumps, [`Self::pump`] taking it to attribute a [`WaitOutcome`], and
-    /// [`Self::cut_short_by`] taking it for the two bounded operations that do not wait. Every
-    /// other reader takes the *value* one of those produced. It was thirteen sites, and the ones
-    /// that mattered were the reads that disagreed — see [`WaitOutcome`].
+    /// **Every access goes through [`Self::begin_operation`] and the [`Operation`] guard it
+    /// returns**, plus [`InterruptHandle::interrupt`] on the other side of the lock. Nothing reads
+    /// this field directly, and nothing clears it: a request names the operation it is for, so
+    /// there is nothing for a later operation to be charged with and nothing for an earlier one to
+    /// erase.
     ///
-    /// It is still a **level** where the design wants an edge with identity: this says a break was
-    /// asked for, not which operation it was asked of, so a request racing the operation boundary
-    /// can be erased before delivery or outlive the wait it ended. Both halves of dbgscope#135, and
-    /// #136 stage 2 is scoping it.
-    interrupt_raised: Arc<AtomicBool>,
+    /// It replaced an engine-wide `AtomicBool` that answered *has an interrupt been requested*
+    /// where every reader wanted *was **this** operation asked to stop* — a level where the design
+    /// needs an edge with identity, which is both halves of dbgscope#135 and what #136 stage 2
+    /// scoped.
+    break_scope: Arc<Mutex<BreakScope>>,
     /// The system pids of live user-mode processes this engine **attached** to rather than
     /// created — the ones ending the session must let go of rather than take with it.
     ///
@@ -1767,7 +1942,7 @@ impl DebugEngine {
             // go through here, and only `new()` (which calls `DebugCreate`) sets this.
             owns_session: false,
             deferred_inputs: Mutex::new(Vec::new()),
-            interrupt_raised: Arc::new(AtomicBool::new(false)),
+            break_scope: Arc::new(Mutex::new(BreakScope::default())),
             attached_processes: Mutex::new(std::collections::HashSet::new()),
             stopped_on: Mutex::new(std::collections::BTreeSet::new()),
         }
@@ -1800,7 +1975,7 @@ impl DebugEngine {
             symbols,
             owns_session: false,
             deferred_inputs: Mutex::new(Vec::new()),
-            interrupt_raised: Arc::new(AtomicBool::new(false)),
+            break_scope: Arc::new(Mutex::new(BreakScope::default())),
             attached_processes: Mutex::new(std::collections::HashSet::new()),
             stopped_on: Mutex::new(std::collections::BTreeSet::new()),
         })
@@ -1814,8 +1989,30 @@ impl DebugEngine {
     pub fn interrupt_handle(&self) -> InterruptHandle {
         InterruptHandle {
             control: self.control.clone(),
-            raised: Arc::clone(&self.interrupt_raised),
+            scope: Arc::clone(&self.break_scope),
         }
+    }
+
+    /// Opens a bounded operation: a break a host raises from here until the guard drops is filed
+    /// against **this** operation and nothing else.
+    ///
+    /// Every bounded or pumping path opens one, and that is what replaced clearing an engine-wide
+    /// flag at each of their heads. The clear *was* the erasure in dbgscope#135 half A — a request
+    /// lodged between an operation's clear and its wait was wiped while its break was still on the
+    /// way — and it is gone rather than fixed: a request that names an operation cannot be charged
+    /// to a later one, so there is nothing that needs clearing.
+    ///
+    /// **They nest**, which a single slot would silently get wrong:
+    /// [`Self::wait_for_kernel_break_in`]'s `absorb_initial_break_artifact` runs a whole
+    /// [`Self::execute_and_wait`] inside it, and that inner operation used to clear the outer one's
+    /// request as it opened.
+    fn begin_operation(&self) -> Operation<'_> {
+        let id = self
+            .break_scope
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin();
+        Operation { engine: self, id }
     }
 
     /// A value that identifies the target this engine currently holds.
@@ -2418,11 +2615,12 @@ impl DebugEngine {
     /// it wants an error of its own, [`DbgEngError::LiveTargetInterrupted`]'s opposite number,
     /// which is a decision about the API rather than about this wait — dbgscope#136 stage 2.
     fn wait_for_kernel_break_in(&self) -> Result<(), DbgEngError> {
-        // The precondition every other pumping path already kept, and this one did not: a request
-        // left standing by an earlier operation is not about this attach, and `pump` takes what it
-        // reads rather than leaving it for the next one.
-        self.clear_break_requests();
-        let pumped = self.pump(Bound::Watchdog(KERNEL_ATTACH_WAIT_MS));
+        // Held across `absorb_initial_break_artifact` below, which runs an `execute_and_wait` and
+        // so opens an operation *inside* this one. That is the nesting `BreakScope` keeps a stack
+        // for: before it, the inner operation's open cleared this one's request as a matter of
+        // course.
+        let operation = self.begin_operation();
+        let pumped = self.pump(Bound::Watchdog(KERNEL_ATTACH_WAIT_MS), &operation);
         self.clear_initial_break();
         let outcome = pumped?;
         // If the watchdog forced the wait to return, the target never reached its
@@ -2471,17 +2669,21 @@ impl DebugEngine {
     ///   wait answering `E_UNEXPECTED` in 37µs), so propagating is what keeps this from turning a
     ///   fast, accurate failure into a half-minute of pumping a session that has nothing in it.
     fn wait_for_live_target(&self, arrival: &Arrival) -> Result<(), DbgEngError> {
-        // Whatever was raised before this belongs to the last operation; the same line, for the
-        // same reason, as `execute_and_wait` and `settle`. Without it a stale flag would stop
-        // every stop here being recorded and leave the open pumping to its bound -- an answer that
-        // is still right and thirty seconds late.
-        self.clear_break_requests();
+        // One operation for the whole loop, not one per pump: `LIVE_WAIT_MS` bounds the open and
+        // not each wait, so a break a host asks for anywhere inside it belongs to the open.
+        //
+        // This is the path #135 half A cost the most. The clear that used to stand here could wipe
+        // a request that had been lodged and not yet delivered, and the synthetic Ctrl+Break that
+        // then arrived was recorded in `stopped_on` as a target's initial break -- so a guard's
+        // `wait()` answered `Ok` for a process that never reached one, and the false entry lasted
+        // the session. There is no clear now, and a request names this operation.
+        let operation = self.begin_operation();
         let deadline = Instant::now() + Duration::from_millis(u64::from(LIVE_WAIT_MS));
         let mut waited = false;
-        // Carried from the pump that saw it rather than re-read from the flag each time round.
-        // Before a first pump there is nothing to have seen: a request raised in the window
-        // between the clear above and the wait below is what ends that wait, and the pump reports
-        // it — one iteration later than the old read, and from the call that observed it.
+        // Carried from the pump that saw it rather than re-read each time round. Before a first
+        // pump there is nothing to have seen: a request raised between this operation opening and
+        // the wait below is what ends that wait, and the pump reports it -- from the call that
+        // observed it.
         let mut asked_to_stop = false;
         loop {
             let presence = self.presence_of(arrival);
@@ -2526,7 +2728,7 @@ impl DebugEngine {
             // pumping on spends the rest of the bound on an event nobody wants. Only a host can
             // raise one here today -- a finite bound arms no watchdog, and the engine thread is
             // inside this loop -- but the loop should not be the thing that has to know that.
-            asked_to_stop = self.pump(Bound::Finite(left))?.broke_in();
+            asked_to_stop = self.pump(Bound::Finite(left), &operation)?.broke_in();
             waited = true;
         }
     }
@@ -2762,10 +2964,10 @@ impl DebugEngine {
         let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
 
-        // Whatever was raised before this command belongs to the last one. A request that arrives
-        // from here on is about what runs below; one left standing from an earlier operation would
-        // otherwise make the *next* command swallow a genuine error as though it had been aborted.
-        self.clear_break_requests();
+        // A request that arrives from here on names this operation and only this one; one aimed at
+        // an earlier operation is invisible to it, so there is nothing to clear and nothing that
+        // could make this command swallow a genuine error as though it had been aborted.
+        let operation = self.begin_operation();
 
         let mut output_buffer = Vec::<u8>::with_capacity(4096);
         let output_callbacks = OutputCallbacks::new(&mut output_buffer);
@@ -2778,11 +2980,12 @@ impl DebugEngine {
 
         // Arm a watchdog that Ctrl+Breaks the engine after `timeout_ms` so a long `Execute`
         // returns instead of hanging the engine thread. Mirrors [`Bound::Watchdog`], which is the
-        // same arrangement around a wait rather than around an `Execute`.
+        // same arrangement around a wait rather than around an `Execute` -- `break_in_only`
+        // included, so the deadline is not also filed as a request against this operation.
         let watchdog = (timeout_ms > 0).then(|| {
             let handle = self.interrupt_handle();
             Watchdog::arm(Duration::from_millis(u64::from(timeout_ms)), move || {
-                let _ = handle.interrupt();
+                let _ = handle.break_in_only();
             })
         });
 
@@ -2799,9 +3002,9 @@ impl DebugEngine {
         }
 
         // Either origin aborts the command the same way, so both take the recovery below; only the
-        // note is the watchdog's alone. Nothing here waited, so the answer comes from
-        // `cut_short_by` rather than from a [`WaitOutcome`] — one rule, two places to read it from.
-        let cut_short = self.cut_short_by(by_watchdog, timeout_ms);
+        // note is the watchdog's alone. Nothing here waited, so the answer comes from the
+        // operation rather than from a [`WaitOutcome`] — one rule, two places to read it from.
+        let cut_short = operation.cut_short_by(by_watchdog, timeout_ms);
         let interrupted = cut_short.is_some();
         if interrupted {
             // The watchdog may have raised `SetInterrupt` right as `Execute` finished (or fired
@@ -2856,7 +3059,12 @@ impl DebugEngine {
     /// why the outcome is public: a pump that completes somebody else's held target leaves the same
     /// record behind as that guard's own wait would have.
     pub fn wait_for_event(&self, timeout_ms: u32) -> Result<WaitOutcome, DbgEngError> {
-        self.pump(Bound::Finite(timeout_ms))
+        // An operation of its own, so a break a host asks for during this pump is attributed to it
+        // and is gone afterwards. This is the path dbgscope#135 half B is written about: the public
+        // pump used only to *read* the engine-wide flag, so a request that ended it stayed raised
+        // and the next wait declined to record a real initial break.
+        let operation = self.begin_operation();
+        self.pump(Bound::Finite(timeout_ms), &operation)
     }
 
     /// One `WaitForEvent`, bounded as `bound` says, **attributing its own outcome** before
@@ -2865,7 +3073,7 @@ impl DebugEngine {
     /// This is the whole of dbgscope#136 stage 1. What it replaces was two waits that each
     /// answered `Result<(), _>` (plus, for the bounded one, a bare `bool`), so the four endings
     /// were reconstructed afterwards by three parties out of shared mutable state — the
-    /// last-event slot, the session's process list and [`Self::interrupt_raised`] each read more
+    /// last-event slot, the session's process list and an engine-wide interrupt flag each read more
     /// than once, and the `HRESULT` only the waiting call ever saw thrown away. Fifteen of the
     /// twenty-two findings on the review that produced that issue were one of those reads moving.
     ///
@@ -2878,29 +3086,38 @@ impl DebugEngine {
     ///   [`Self::wait_for_event`] propagated regardless. Narrow in practice — `SetInterrupt` ends a
     ///   wait with `S_OK`, so the pair needs the target to fail in the same window — but it is one
     ///   rule now instead of three.
-    /// - **The watchdog is read before the flag**, because it reaches the engine through the same
-    ///   `SetInterrupt` and raises the same flag (that is what [`InterruptHandle::interrupt`] does).
-    ///   Reading the flag alone reports this crate's own deadline as "a host asked".
-    /// - **The request is *taken*, not read.** It belongs to this wait; left standing it is charged
-    ///   to the next operation, which is the defect `test_a_timed_out_run_leaves_no_interrupt_standing`
-    ///   was written for. Callers take the value instead of swapping the flag again, so the
-    ///   precondition that used to be spread over five sites — clear it going in, leave none behind
-    ///   — is now one line each way.
+    /// - **The watchdog is read first, and the two signals are now independent.** They used to be
+    ///   two readings of one flag, because the watchdog reached the engine through
+    ///   [`InterruptHandle::interrupt`] like any host; since stage 2 it goes through
+    ///   [`InterruptHandle::break_in_only`] and records nothing, so `by_watchdog` and the
+    ///   operation's request answer different questions. The order still matters, but only for the
+    ///   genuine coincidence of a deadline and a host arriving in one window.
+    /// - **The request is *taken*, not read**, and it names **this operation**. It belongs to this
+    ///   wait; left standing it would be charged to whatever ran next, which is the defect
+    ///   `test_a_timed_out_run_leaves_no_interrupt_standing` was written for and dbgscope#135
+    ///   half B. Since stage 2 the taking is scoped: a request filed against another operation is
+    ///   invisible here rather than merely already consumed.
     /// - **Only [`WaitOutcome::Stopped`] records**, which is what makes the two gates that cost
     ///   nine review findings unreachable rather than guarded: an expiry and a forced break are
     ///   different arms, not the same arm with `if`s in front of it.
     ///
     /// **It is the request, and not the provenance of the event that ended the wait**, which is
     /// deliberate and was declined once as a finding (round 13 of #133). A break asked for in the
-    /// same window as the target's own initial break raises the flag, and the genuine arrival is
-    /// reported as [`WaitOutcome::OnRequest`]. The two errors are not the same size: dropping a real
-    /// arrival costs a pump, and recording a synthetic one costs the postcondition six rounds of
-    /// review were spent establishing — the conservative direction, and the whole of
-    /// docs/unknown-not-absent.md. Closing it needs provenance, and `GetInterrupt` is where to look
-    /// first: an interrupt that *ended* a wait has been consumed by the time it returns, and one
-    /// still pending did not end it. That is stage 2's, and nothing should rely on it until the
-    /// race can be constructed on purpose.
-    fn pump(&self, bound: Bound) -> Result<WaitOutcome, DbgEngError> {
+    /// same window as the target's own initial break is filed against this operation, and the
+    /// genuine arrival is reported as [`WaitOutcome::OnRequest`]. The two errors are not the same
+    /// size: dropping a real arrival costs a pump, and recording a synthetic one costs the
+    /// postcondition six rounds of review were spent establishing — the conservative direction, and
+    /// the whole of docs/unknown-not-absent.md.
+    ///
+    /// **What stage 2 leaves, and what would close it.** A break aimed at operation N that lands on
+    /// N+1 — because N ended between the host reading what was running and the break arriving —
+    /// stops N+1, which sees no request of its own and reports a normal stop. Bookkeeping cannot
+    /// close that: `SetInterrupt` is engine-wide and cannot be aimed. `GetInterrupt` can, and
+    /// `examples/interrupt_provenance.rs` is the measurement #136 asked for before anything relies
+    /// on it: a request that *ended* a wait is consumed before the wait returns, and one that did
+    /// not is still readable afterwards — so a post-wait poll is a **forward** signal, warning the
+    /// next operation that a break is coming for it. That is stage 3's to use.
+    fn pump(&self, bound: Bound, operation: &Operation<'_>) -> Result<WaitOutcome, DbgEngError> {
         let (result, arrived, by_watchdog) = match bound {
             Bound::Finite(timeout_ms) => {
                 // Read through the vtable, for the reason [`Self::interrupted`] does: the generated
@@ -2926,10 +3143,12 @@ impl DebugEngine {
             Bound::Watchdog(timeout_ms) => {
                 let handle = self.interrupt_handle();
                 // Ctrl+Break a connected target so the engine thread's WaitForEvent returns with a
-                // stop.
+                // stop. `break_in_only`, so the deadline is *not* also filed as a request against
+                // this operation: `watchdog.disarm()` already says it fired, and one event with two
+                // representations is what every classify site used to have to reconcile.
                 let watchdog =
                     Watchdog::arm(Duration::from_millis(u64::from(timeout_ms)), move || {
-                        let _ = handle.interrupt();
+                        let _ = handle.break_in_only();
                     });
                 let result = unsafe { self.control.WaitForEvent(0, WAIT_INFINITE) };
                 // Disarmed before anything is read, so the watchdog cannot fire *into* the reads
@@ -2940,7 +3159,8 @@ impl DebugEngine {
                 (result, arrived, by_watchdog)
             }
         };
-        let asked = self.interrupt_raised.swap(false, Ordering::SeqCst);
+        // Taken whatever the outcome, so nothing this operation was asked for outlives it.
+        let asked = operation.took_break_request();
         if by_watchdog {
             return Ok(WaitOutcome::Deadline);
         }
@@ -2985,36 +3205,6 @@ impl DebugEngine {
         Some(entry)
     }
 
-    /// Clears any break request left standing by an earlier operation, at the start of one that
-    /// pumps or bounds.
-    ///
-    /// A request that arrives from here on is about what this operation runs; one left over from
-    /// the last would otherwise make this one swallow a genuine error as though it had been
-    /// aborted, or — since [`Self::pump`] takes the flag to attribute its outcome — stand down from
-    /// recording a real stop and leave a held guard pumping to its bound.
-    fn clear_break_requests(&self) {
-        self.interrupt_raised.store(false, Ordering::SeqCst);
-    }
-
-    /// What cut short a bounded operation that is **not** a pump — an `Execute`, a symbolic
-    /// breakpoint resolve — taking the standing request as it reads it.
-    ///
-    /// [`WaitOutcome::cut_short`] is the same question for the paths that wait, and the split is
-    /// where the answer comes from rather than a difference in the rule: there the value carries
-    /// it, here there is nothing but the watchdog's own flag and the shared one. `by_watchdog`
-    /// decides the variant for the reason [`Self::pump`] reads it first — the watchdog raises the
-    /// shared flag too, so the flag alone reports this crate's deadline as "a host asked".
-    fn cut_short_by(&self, by_watchdog: bool, after_ms: u32) -> Option<Interruption> {
-        // Swapped rather than read, so a request that arrived while this operation ran is
-        // accounted for here and cannot be charged to the next one.
-        let asked = self.interrupt_raised.swap(false, Ordering::SeqCst);
-        match (by_watchdog, asked) {
-            (true, _) => Some(Interruption::Deadline { after_ms }),
-            (false, true) => Some(Interruption::OnRequest),
-            (false, false) => None,
-        }
-    }
-
     /// Issues an execution-control command (`g`, `t`, `p`, `g-`, `t-`, `p-`, …) and
     /// drives it to the next stop.
     ///
@@ -3044,9 +3234,8 @@ impl DebugEngine {
         command: &str,
         timeout_ms: u32,
     ) -> Result<CommandRun, DbgEngError> {
-        // Whatever was raised before this belongs to the last operation; see
-        // `execute_command_bounded`, which clears it for the same reason.
-        self.clear_break_requests();
+        // A break asked for from here on names this operation; see `execute_command_bounded`.
+        let operation = self.begin_operation();
         // Nothing to run against is refused up front rather than driven into DbgEng, which
         // faults the process on it — see `refuse_without_a_debuggee`. It is also what makes the
         // check *after* the wait mean what it says: a debuggee missing there left during this
@@ -3071,7 +3260,9 @@ impl DebugEngine {
             self.control
                 .Execute(DEBUG_OUTCTL_THIS_CLIENT, cmd, DEBUG_EXECUTE_ECHO)
         };
-        let pumped = exec.is_ok().then(|| self.pump(Bound::Watchdog(timeout_ms)));
+        let pumped = exec
+            .is_ok()
+            .then(|| self.pump(Bound::Watchdog(timeout_ms), &operation));
 
         unsafe {
             let _ = self.client.SetOutputCallbacks(None);
@@ -3081,17 +3272,18 @@ impl DebugEngine {
         // `execute_command_bounded` — and for the same reason the output must survive it, since a
         // `go` stopped on request has still moved the target and the caller needs to see where to.
         //
-        // **The origin is the pump's answer, not a second reading of `interrupt_raised`**, which
-        // the watchdog sets too (that is what `InterruptHandle::interrupt` does). The flag alone
-        // reports this crate's own deadline as "a host asked" — which it did on the live-kernel
-        // path for as long as that path was the only bounded one.
+        // **The origin is the pump's answer**, and since stage 2 the watchdog no longer files a
+        // request of its own, so there is no second reading to reconcile it with. Before that, one
+        // deadline had two representations and reading the shared one alone reported it as "a host
+        // asked" — which it did on the live-kernel path for as long as that path was the only
+        // bounded one.
         let (waited, cut_short) = match pumped {
             Some(Ok(outcome)) => (Ok(()), outcome.cut_short(timeout_ms)),
             Some(Err(err)) => (Err(err), None),
             // `Execute` failed, so no pump ran and nothing has attributed anything. A request a
-            // host raised while the command was being issued is still standing, and it is this
-            // operation's to account for rather than the next one's.
-            None => (Ok(()), self.cut_short_by(false, timeout_ms)),
+            // host raised while the command was being issued is still filed against this
+            // operation, and it is this one's to account for rather than the next one's.
+            None => (Ok(()), operation.cut_short_by(false, timeout_ms)),
         };
         let interrupted = cut_short.is_some();
         // Asked before either error is propagated, because the target running out is what makes
@@ -3211,9 +3403,8 @@ impl DebugEngine {
         if !self.is_running()? {
             return Ok(None);
         }
-        // Whatever was raised before this belongs to the last operation; see
-        // `execute_command_bounded`, which clears it for the same reason.
-        self.clear_break_requests();
+        // A break asked for from here on names this operation; see `execute_command_bounded`.
+        let operation = self.begin_operation();
 
         // Captured, because the pump is where the interesting output is: the command that set the
         // run state printed only its own echo, and the breakpoint banner, module loads and stop
@@ -3227,15 +3418,15 @@ impl DebugEngine {
                 .map_err(DbgEngError::CommandFailed)?;
         }
 
-        let pumped = self.pump(Bound::Watchdog(timeout_ms));
+        let pumped = self.pump(Bound::Watchdog(timeout_ms), &operation);
 
         unsafe {
             let _ = self.client.SetOutputCallbacks(None);
         }
 
         // The same three-way origin as `execute_and_wait`, and now for the same reason as well as
-        // by the same rule: the pump attributed it, so nothing here re-reads the flag the watchdog
-        // shares with every host.
+        // by the same rule: the pump attributed it, and the watchdog no longer shares a channel
+        // with a host for anything here to re-read.
         let (waited, cut_short) = match pumped {
             Ok(outcome) => (Ok(()), outcome.cut_short(timeout_ms)),
             Err(err) => (Err(err), None),
@@ -3296,12 +3487,12 @@ impl DebugEngine {
         address: u64,
         timeout_ms: u32,
     ) -> Result<RunToResult, DbgEngError> {
-        // Whatever was raised before this belongs to the last operation; the same line, for the
-        // same reason, as `execute_and_wait` and `settle`. This function is the one bounded path
-        // that had neither this nor a consume on the way out, which stopped mattering to itself --
-        // it classified by the watchdog's own flag -- and started mattering to everyone else once
-        // the recorder began reading the shared one. The consume is now the pump's.
-        self.clear_break_requests();
+        // A break asked for from here on names this operation. This function is the one bounded
+        // path that had neither a clear on the way in nor a consume on the way out, which stopped
+        // mattering to itself -- it classified by the watchdog's own flag -- and started mattering
+        // to everyone else once the recorder began reading the shared one. Both are now properties
+        // of the operation rather than lines here.
+        let operation = self.begin_operation();
         // Refuse when there's nothing to run: driving `g` with no debuggee faults DbgEng in a
         // way `catch_unwind` cannot trap — see `refuse_without_a_debuggee`.
         self.refuse_without_a_debuggee()?;
@@ -3334,12 +3525,15 @@ impl DebugEngine {
         // no current process/thread, and no interrupt afterwards recovers it, because the
         // engine is no longer pumping events.
         //
-        // The pump takes the request it read, which is the half review round 12 of #133 was about:
-        // the watchdog raises the shared flag through `InterruptHandle::interrupt` like any host,
-        // and a `run_to_address` that timed out used to leave it set for good -- so the next wait
-        // read a stale interrupt, declined to record a real initial break, and left a held guard
-        // pumping. That consume used to be a line here and is now a property of every pump.
-        let pumped = exec.is_ok().then(|| self.pump(Bound::Watchdog(timeout_ms)));
+        // The pump takes the request filed against this operation, which is the half review round
+        // 12 of #133 was about: the watchdog used to raise the shared flag through
+        // `InterruptHandle::interrupt` like any host, and a `run_to_address` that timed out left it
+        // set for good -- so the next wait read a stale interrupt, declined to record a real
+        // initial break, and left a held guard pumping. Since stage 2 the watchdog files nothing
+        // and a request cannot outlive the operation it names, so neither half can recur.
+        let pumped = exec
+            .is_ok()
+            .then(|| self.pump(Bound::Watchdog(timeout_ms), &operation));
         // A break's error is the break's, not the target's, so only a genuine failure propagates.
         // A host's counts as well as the watchdog's now, where before only the watchdog's did:
         // narrow -- `SetInterrupt` ends a wait with `S_OK`, so it takes the target failing in the
@@ -3348,9 +3542,9 @@ impl DebugEngine {
             Some(Ok(outcome)) => (Ok(()), outcome.cut_short(timeout_ms)),
             Some(Err(err)) => (Err(err), None),
             // No pump ran, so the request a failing `Execute` may have been aborted by is still
-            // standing. Nothing below reads it -- this outcome has no `cut_short` field -- but it
+            // filed here. Nothing below reads it -- this outcome has no `cut_short` field -- but it
             // is this operation's to take, and it was the one path that left one behind.
-            None => (Ok(()), self.cut_short_by(false, timeout_ms)),
+            None => (Ok(()), operation.cut_short_by(false, timeout_ms)),
         };
         // "The watchdog fired": a host's break leaves the target stopped somewhere, which the
         // instruction-pointer read below reports as it always did.
@@ -4536,14 +4730,15 @@ impl DebugEngine {
             BreakpointAt::Expression(expression) => {
                 let text =
                     CString::new(expression.as_str()).map_err(|_| DbgEngError::InvalidCommand)?;
-                // Same shape as `execute_command_bounded`: clear whatever was raised for an
-                // earlier operation, arm, run, then account for a break by either origin. Without
-                // the clear, a request left standing would be charged to this resolve.
-                self.clear_break_requests();
+                // Same shape as `execute_command_bounded`: open an operation, arm, run, then
+                // account for a break by either origin. A request aimed at an earlier operation is
+                // invisible to this resolve, which is what the clear that used to stand here was
+                // for -- and, unlike the clear, it cannot erase one still on its way.
+                let operation = self.begin_operation();
                 let watchdog = (timeout_ms > 0).then(|| {
                     let handle = self.interrupt_handle();
                     Watchdog::arm(Duration::from_millis(u64::from(timeout_ms)), move || {
-                        let _ = handle.interrupt();
+                        let _ = handle.break_in_only();
                     })
                 });
                 let result = unsafe {
@@ -4552,9 +4747,10 @@ impl DebugEngine {
                         .SetOffsetExpression(PCSTR::from_raw(text.as_ptr().cast()))
                 };
                 let by_watchdog = watchdog.is_some_and(Watchdog::disarm);
-                // Nothing here waited, so this is `cut_short_by` rather than a [`WaitOutcome`] —
-                // the same rule, read from the only two things a non-pumping bound has.
-                let cut_short = self.cut_short_by(by_watchdog, timeout_ms);
+                // Nothing here waited, so this is the operation's `cut_short_by` rather than a
+                // [`WaitOutcome`] — the same rule, read from the only two things a non-pumping
+                // bound has.
+                let cut_short = operation.cut_short_by(by_watchdog, timeout_ms);
                 let interrupted = cut_short.is_some();
                 if interrupted {
                     // Consume a break that may still be pending, exactly as the bounded command
@@ -5499,6 +5695,115 @@ mod tests {
     };
 
     use super::*;
+
+    /// **A request names an operation, and only that operation can be charged with it.**
+    ///
+    /// This is dbgscope#135 half A as a value rather than as a race. The old shape was an
+    /// engine-wide `AtomicBool` that six operations cleared as they opened, so *whose* request it
+    /// was could not be asked — a request lodged for the operation running was indistinguishable
+    /// from one left over by its predecessor, and the clear was how the difference was papered
+    /// over. `BreakScope` is the whole of the fix and none of it needs an engine, so this runs
+    /// under Miri too.
+    #[test]
+    fn test_a_break_request_names_the_operation_it_is_for() {
+        let mut scope = BreakScope::default();
+
+        // Nothing running: a break would stop nobody, and filing one would leave it for whatever
+        // came next -- the "erased or left standing" pair, from the other end.
+        assert_eq!(scope.innermost(), None, "an idle scope named an operation");
+
+        let first = scope.begin();
+        assert_eq!(scope.innermost(), Some(first));
+        scope.record(first);
+        assert!(scope.take(first), "the operation asked for did not see it");
+        assert!(
+            !scope.take(first),
+            "a request was taken twice, so it could be charged to two operations"
+        );
+
+        // The successor sees nothing of its predecessor's, which is what makes the clear at each
+        // operation's head unnecessary rather than merely absent.
+        scope.record(first);
+        scope.end(first);
+        let second = scope.begin();
+        assert!(
+            !scope.take(second),
+            "a request filed against {first:?} was answered for {second:?}"
+        );
+        scope.end(second);
+        assert!(
+            scope.running.is_empty() && scope.asked.is_empty(),
+            "closing every operation left {scope:?} behind"
+        );
+    }
+
+    /// **Operations nest, and a break belongs to the innermost.**
+    ///
+    /// Not hypothetical: `wait_for_kernel_break_in` holds one across
+    /// `absorb_initial_break_artifact`, which runs a whole `execute_and_wait` -- so before this
+    /// there was an inner operation clearing the outer one's request as a matter of course, which
+    /// is #135 half A reached from inside the crate rather than by a host.
+    ///
+    /// A single slot would answer the first two assertions and fail the third; a `bool` could not
+    /// express any of them.
+    #[test]
+    fn test_a_nested_operation_does_not_take_its_parents_request() {
+        let mut scope = BreakScope::default();
+        let outer = scope.begin();
+        scope.record(outer);
+
+        let inner = scope.begin();
+        assert_eq!(
+            scope.innermost(),
+            Some(inner),
+            "a break raised now would stop the inner operation, so it must be filed against it"
+        );
+        assert!(
+            !scope.take(inner),
+            "the inner operation was handed the outer one's request"
+        );
+
+        scope.end(inner);
+        assert_eq!(
+            scope.innermost(),
+            Some(outer),
+            "the outer operation did not resume when the inner one ended"
+        );
+        assert!(
+            scope.take(outer),
+            "the outer operation's request did not survive an inner operation"
+        );
+        scope.end(outer);
+    }
+
+    /// **A request the engine hands out is scoped to what is running when it is asked for**, which
+    /// is the half of the fix that lives on the engine rather than in the bookkeeping.
+    ///
+    /// Asserted through [`DebugEngine::begin_operation`] and [`Operation`] rather than on
+    /// `BreakScope` directly, because the guard's `Drop` is what makes "nothing left standing" a
+    /// property of every path rather than a line each of them has to remember.
+    ///
+    /// No debuggee: `SetInterrupt` is not called here, so this is the bookkeeping seen through the
+    /// engine's own API and nothing that needs a target.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_an_operations_request_dies_with_it() {
+        let e = DebugEngine::new();
+        {
+            let operation = e.begin_operation();
+            e.break_scope
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .record(operation.id);
+            // Deliberately not taken: an operation that ends without reading its request is the
+            // ordinary case on the paths where a break arrives too late to end anything.
+        }
+        let scope = e.break_scope.lock().unwrap_or_else(|err| err.into_inner());
+        assert!(
+            scope.running.is_empty() && scope.asked.is_empty(),
+            "an operation that never read its request left {scope:?} for the next one"
+        );
+    }
 
     /// A spec is born **armed**, which is the opposite of what the engine does and the whole
     /// reason this type exists.
@@ -7844,9 +8149,11 @@ mod tests {
     /// and any guard still held pumping to its bound for a target that had already stopped. Round
     /// 12 of #133; the comment claiming this precondition held was written in round 9.
     ///
-    /// The consume is now the pump's own -- it *takes* the request it reads, because the request
-    /// belongs to the wait it ended -- so this asserts a property of every pumping path rather
-    /// than a line in one of them.
+    /// It is now two properties of every bounded path rather than a line in one of them. The pump
+    /// *takes* the request filed against its operation, because the request belongs to the wait it
+    /// ended; and the operation's guard closes the scope on the way out whether it was read or not.
+    /// So this asserts the scope is **empty** — nothing running and nothing asked — rather than
+    /// that one flag came back down.
     ///
     /// `timeout_ms` of 0 is an immediate timeout by that function's own contract, so the watchdog
     /// fires and raises the flag -- which the outcome assertion is here to confirm, since a run
@@ -7870,9 +8177,10 @@ mod tests {
             "the run ended as {:?}, so its watchdog never raised the flag under test",
             run.outcome
         );
+        let scope = e.break_scope.lock().unwrap_or_else(|err| err.into_inner());
         assert!(
-            !e.interrupt_raised.load(Ordering::SeqCst),
-            "a timed-out run left its watchdog's interrupt raised, so the next wait will decline              to record a real stop"
+            scope.running.is_empty() && scope.asked.is_empty(),
+            "a timed-out run left {scope:?} behind, so the next operation inherits it"
         );
     }
 
