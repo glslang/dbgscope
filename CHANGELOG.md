@@ -119,6 +119,14 @@ All notable changes to this project are documented here. The format follows
   (`Attachment::Deferred` / `Joined`), promoted wherever the engine lists the session on its own
   account: the prune, and the pump.
 
+  And a third round on the state that introduced: `Deferred` is kept because a deferred attach has
+  not arrived and so cannot have left, but only a listing promotes one — so an `AttachProcess` the
+  engine accepted for a process that then exited before the first `WaitForEvent` left a pid
+  recorded for the life of the session, where the prune used to bound it. A live open that waits
+  out `LIVE_WAIT_MS` and never sees its process now retires the record, which is the only party
+  that can say the attach cannot join. Not on an *interrupted* open, which says nothing about
+  whether the attach is still coming.
+
   No public API changes. Two tests are gone rather than passing, and the constructions that make
   them unreachable are named where they were:
   `test_ending_a_session_forgets_which_processes_it_stopped_on` had no record to forget, and

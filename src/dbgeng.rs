@@ -559,6 +559,17 @@ impl Arrivals {
         id
     }
 
+    /// The pid an [`Arrival::Attached`] open is waiting for, where `id` names one.
+    fn attached_pid(&self, id: ArrivalId) -> Option<u32> {
+        self.pending
+            .iter()
+            .find(|pending| pending.id == id)
+            .and_then(|pending| match pending.what {
+                Arrival::Attached(pid) => Some(pid),
+                Arrival::Launched(_) => None,
+            })
+    }
+
     /// Forgets an open, when its guard is dropped — **handing its claim to the opens still
     /// waiting**.
     ///
@@ -2982,7 +2993,17 @@ impl DebugEngine {
             if left == 0 || asked_to_stop {
                 return match presence {
                     Presence::Absent if asked_to_stop => Err(DbgEngError::LiveTargetInterrupted),
-                    Presence::Absent => Err(DbgEngError::LiveTargetTimeout),
+                    Presence::Absent => {
+                        // This open pumped for its whole bound and its process never joined, so
+                        // the attach cannot complete: retire the record before it can be matched
+                        // by a later process that inherits the pid. Not on the interrupted branch
+                        // above -- an open the host cut short says nothing about whether the
+                        // attach is still coming.
+                        if waited {
+                            self.retire_deferred_attachment(registered);
+                        }
+                        Err(DbgEngError::LiveTargetTimeout)
+                    }
                     // In the session, and never seen to stop. "Not observed to stop" is not "never
                     // arrived", and reporting a timeout on a process visibly in front of us would
                     // be claiming absence where the truth is unknown — see
@@ -3046,6 +3067,46 @@ impl DebugEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .presence(registered.id, &held, &attached)
+    }
+
+    /// Retires the record of an attachment a live open waited its whole bound for and never saw.
+    ///
+    /// **`Attachment::Deferred` is kept until something says the attach cannot join**, and without
+    /// this there is nothing that ever says so: only a successful listing promotes a record, so an
+    /// `AttachProcess` the engine accepted for a process that then exited before the first
+    /// `WaitForEvent` left a pid recorded for the life of the session. If Windows handed that
+    /// number to a process this engine went on to launch, the launch's own stop was excluded from
+    /// delivery as somebody else's and its teardown *detached* from it instead of taking it --
+    /// a launched process outliving its session. Raised in review on dbgscope#139, and a widening
+    /// of an existing residue rather than a new one: before an attachment could be deferred, the
+    /// next opener's prune dropped any pid the session did not hold.
+    ///
+    /// **Only `Deferred`**, so an attachment that joined and has merely left is left to the prune,
+    /// which is the function that knows about departures.
+    ///
+    /// The residue that is left is an attach that never joins whose guard was **abandoned without
+    /// waiting** — nothing then waits the bound, so nothing reaches here. That is the documented
+    /// hand-off (`PendingTarget` says a dropped guard's target materialises at the next wait from
+    /// any source), and the pid is held against a pid reuse that the crate already lives with; see
+    /// [`Self::prune_processes_that_left`], which names a retained handle as the real answer.
+    fn retire_deferred_attachment(&self, registered: &Registered<'_>) {
+        let pid = self
+            .state
+            .arrivals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attached_pid(registered.id);
+        let Some(pid) = pid else {
+            return;
+        };
+        let mut attached = self
+            .state
+            .attached_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if attached.get(&pid) == Some(&Attachment::Deferred) {
+            attached.remove(&pid);
+        }
     }
 
     /// A copy of the pids this engine attached to, taken rather than borrowed so that no lock is
@@ -8376,6 +8437,119 @@ mod tests {
             Some(STILL_RUNNING),
             "the process this engine launched (pid {pid}) outlived its session"
         );
+    }
+
+    /// **An attachment that can never join is retired**, or its pid is held against a later process
+    /// for the life of the session.
+    ///
+    /// `Attachment::Deferred` is kept precisely because a deferred attach has not arrived and so
+    /// cannot have left — but only a successful listing promotes one, so an `AttachProcess` the
+    /// engine accepted for a process that then exited before the first `WaitForEvent` left a pid
+    /// recorded for good. If Windows handed that number to a process this engine went on to launch,
+    /// the launch's own stop was excluded from delivery as somebody else's and its teardown
+    /// *detached* from it instead of taking it. Raised in review on dbgscope#139.
+    ///
+    /// Asserted here on the rule rather than end to end, because reaching it through a real open
+    /// costs `LIVE_WAIT_MS` — thirty seconds — and
+    /// `test_an_open_that_waits_out_its_bound_retires_a_deferred_attachment` is the `#[ignore]`d
+    /// end-to-end half.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_only_a_deferred_attachment_is_retired() {
+        let _debuggee = one_debuggee();
+        let mut theirs = a_process_to_attach_to();
+        {
+            let e = DebugEngine::new();
+            let attaching = e.attach_process_begin(theirs.id()).expect("attach failed");
+            let WaitKind::Live(registered) = &attaching.kind else {
+                panic!("an attach guard is not a live open");
+            };
+
+            // Joined is the prune's business, not this one's: the attachment is there and may
+            // simply have left, which is a different question.
+            e.state
+                .attached_processes
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert(theirs.id(), Attachment::Joined);
+            e.retire_deferred_attachment(registered);
+            assert!(
+                e.state
+                    .attached_processes
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains_key(&theirs.id()),
+                "a joined attachment was retired, so its teardown will take somebody else's process"
+            );
+
+            // Deferred is this one's: the open waited its bound and the process never arrived.
+            e.state
+                .attached_processes
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert(theirs.id(), Attachment::Deferred);
+            e.retire_deferred_attachment(registered);
+            assert!(
+                !e.state
+                    .attached_processes
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .contains_key(&theirs.id()),
+                "an attachment that can never join was kept, so a later process inheriting its                  pid is treated as one this engine only attached to"
+            );
+
+            drop(attaching);
+            let _ = e.end_session();
+        }
+        let _ = theirs.kill();
+        let _ = theirs.wait();
+    }
+
+    /// The end-to-end half of the test above: a live open really does retire the record when it
+    /// waits out its bound.
+    ///
+    /// `#[ignore]`d because it costs `LIVE_WAIT_MS` -- thirty seconds of pumping for a process that
+    /// will never arrive -- which is the shape every other test here goes out of its way to avoid.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_an_open_that_waits_out`
+    #[test]
+    #[cfg(not(miri))]
+    #[ignore = "waits out LIVE_WAIT_MS; run manually with --ignored"]
+    fn test_an_open_that_waits_out_its_bound_retires_a_deferred_attachment() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        // A target, so the pump has a session to run against: a wait on an engine with no debuggee
+        // *fails* rather than expiring, which ends the open before it reaches its bound
+        // (`test_a_wait_with_no_debuggee_fails_rather_than_expiring`).
+        e.launch_process("ping.exe -n 60 127.0.0.1")
+            .expect("launch failed");
+        // A pid this session does not hold, recorded as if an attach to it had been accepted: the
+        // open below pumps its whole bound and never sees it.
+        let absent = e
+            .session_processes()
+            .expect("could not list the session")
+            .iter()
+            .map(|(_, pid)| *pid)
+            .max()
+            .unwrap_or(4)
+            + 1000;
+        e.claim_attached(absent);
+        let waiting = registered(&e, Arrival::Attached(absent));
+
+        let outcome = e.wait_for_live_target(&waiting);
+        assert!(
+            matches!(outcome, Err(DbgEngError::LiveTargetTimeout)),
+            "the open answered {outcome:?} rather than timing out, so it did not reach the branch              that retires the record"
+        );
+        assert!(
+            !e.state
+                .attached_processes
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .contains_key(&absent),
+            "the open waited its whole bound and left the record behind"
+        );
+
+        let _ = e.end_session();
     }
 
     /// **A prune does not take an attachment that has not joined yet**, which it did, and which
