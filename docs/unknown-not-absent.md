@@ -301,7 +301,7 @@ const KERNEL_ATTACH_WAIT_MS: u32 = 60_000;
 A live kernel requires `WaitForEvent(INFINITE)`; a finite timeout returns `E_NOTIMPL`. So the
 watchdog is the only bound, and it is a partial one. The honest thing is not to hide that
 behind a constant named like a guarantee. The same limitation is restated on
-`InterruptHandle::interrupt` and on `wait_for_event_bounded`, because those are where a caller
+`InterruptHandle::interrupt` and on `Bound::Watchdog`, because those are where a caller
 meets it.
 
 ### `run_to_address` names four endings, not two
@@ -433,9 +433,11 @@ describe the reading instead of the thing.
 
 The rule also binds *inside* the crate, which is the other half of the same round. §4 says a
 forced break is reported as a forced break — and the consumer that has to honour that is not
-always a caller. `wait_for_event_bounded` records where each wait stopped, for a live open's
+always a caller. The bounded wait recorded where each wait stopped, for a live open's
 postcondition, and recorded the watchdog's own Ctrl+Break along with the real ones: a rule stated
-on the way out and dropped on the way in.
+on the way out and dropped on the way in. It is now `WaitOutcome`, whose `Deadline` and `Stopped`
+are different arms of one value the waiting call produces -- so the rule has nowhere left to be
+dropped rather than a second place to be stated.
 
 ---
 

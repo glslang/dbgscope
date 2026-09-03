@@ -58,6 +58,41 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **A wait returns what it did.** `DebugEngine::wait_for_event` answers a `WaitOutcome` —
+  `Stopped { process }`, `Expired`, `Deadline` or `OnRequest` — instead of `Result<(), _>`, and
+  every wait in the crate now goes through one private `pump(bound)` that produces that value
+  before anything downstream can look. `Bound` says how a pump is bounded: `Finite(ms)` is a plain
+  `WaitForEvent(ms)` whose expiry leaves the target running, and `Watchdog(ms)` is
+  `WaitForEvent(INFINITE)` with the Ctrl+Break watchdog the old private
+  `wait_for_event_bounded` provided. Stage 1 of
+  [#136](https://github.com/glslang/dbgscope/issues/136).
+
+  The engine offers four endings and three of them were invisible from outside the wait: `S_OK` and
+  `S_FALSE` are flattened into one `Ok(())` by the generated wrapper, and a break has been serviced
+  by the time anything else could look. So the outcome used to be reconstructed *afterwards*, by
+  three parties, out of shared mutable state — the last-event slot and the session's process list
+  each read twice, the interrupt flag read twice, and the `HRESULT` only the waiting call ever saw
+  discarded. #136's evidence that this is one root rather than twenty defects: **15 of the 22
+  findings** on the [#133](https://github.com/glslang/dbgscope/pull/133) review were one of
+  those reads moving, and **9** of them were a single question — may this writer record a stop?
+  — asked once per writer. Those nine are now unreachable rather than guarded: an expiry and a
+  break are *arms* of the value, and only `Stopped` reaches the recorder.
+
+  Behaviour is otherwise unchanged, with two deliberate exceptions, both of them one rule replacing
+  three. **A break outranks the wait's own error**, either origin's — which `execute_and_wait` and
+  `settle` already did ("a break makes both of these fail"), `run_to_address` did for the watchdog's
+  break alone, and `wait_for_event` did not do at all. Narrow in practice, since `SetInterrupt` ends
+  a wait with `S_OK`: it takes the target failing in the same window. And **the request is taken
+  rather than read**, by the pump, so no path can leave one standing for the next operation to be
+  charged with; `run_to_address` had a line for that and `wait_for_kernel_break_in` had neither that
+  nor the clear on the way in.
+
+  `examples/deferred_arrival.rs` is the measurement #133 is held to and it is unmoved: arm A 0 short
+  in 40 rounds under load, arm F 4.2 µs, arm H 5.6 µs (x64 bench, Windows 11 26200, 24 spinners).
+  `examples/session_fuzz.rs` is clean over seeds 1, 2, 7 and 13. One thing #136 makes visible
+  without changing: a **host's** break during a kernel attach is still reported as a clean break-in
+  rather than as a timeout, because naming it wants an error of its own — stage 2's.
+
 - `launch_process` launches with `CREATE_NO_WINDOW` instead of `CREATE_NEW_CONSOLE`, so a launched
   console target no longer opens a window on the desktop and takes the foreground with it. The
   guarantee the old flag was there for is unchanged and is what `CREATE_NO_WINDOW` also provides:

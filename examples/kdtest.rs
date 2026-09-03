@@ -240,7 +240,7 @@ fn end_session_leaves_target_running(e: &DebugEngine, target: &Target) -> bool {
 /// watchdog-forced return that becomes `KernelBreakTimeout` — by dialing an unreachable
 /// target, which needs no VM. **It does not work, and this probe is what shows why.**
 ///
-/// `wait_for_event_bounded` documents the reason: `SetInterrupt` can only unblock a wait
+/// `Bound::Watchdog` documents the reason: `SetInterrupt` can only unblock a wait
 /// once the target is *connected*. A dial that never connects blocks in the transport, like
 /// `kd` on a dead connection, and the watchdog's Ctrl+Break at `KERNEL_ATTACH_WAIT_MS` (60s)
 /// cannot reach it. Measured 2026-08-02 against the in-box dbgeng on Windows 11 26200:
@@ -251,7 +251,7 @@ fn end_session_leaves_target_running(e: &DebugEngine, target: &Target) -> bool {
 /// break in (wrong/absent debug mode, a wedged target), which needs real hardware. This probe
 /// stays as the executable record of the limitation: run it, watch it hang, Ctrl+C. If it
 /// ever prints `KernelBreakTimeout`, the engine's behaviour changed and the doc comment on
-/// `wait_for_event_bounded` is stale.
+/// `Bound::Watchdog` is stale.
 fn timeout_probe() {
     let e = DebugEngine::new();
     println!("=== deliberate timeout: dial {DEAD_CONN}; nothing will ever answer ===");
@@ -270,7 +270,7 @@ fn timeout_probe() {
             match pending.wait() {
                 Err(DbgEngError::KernelBreakTimeout) => println!(
                     "[!] wait() -> KernelBreakTimeout after {:?} — the bound fired, which it did \
-                     not when this was measured; wait_for_event_bounded's doc comment is stale",
+                     not when this was measured; Bound::Watchdog's doc comment is stale",
                     waited.elapsed()
                 ),
                 Ok(()) => println!(

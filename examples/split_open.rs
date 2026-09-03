@@ -103,7 +103,7 @@ fn main() {
     }
     // The deferred spawn happens here, reading a buffer whose guard died above.
     match e.wait_for_event(30_000) {
-        Ok(()) => println!("post-drop wait OK — deferred spawn completed"),
+        Ok(outcome) => println!("post-drop wait {outcome:?} — the deferred spawn completed"),
         Err(err) => println!("post-drop wait ERR: {err}"),
     }
     show(&e, "|");

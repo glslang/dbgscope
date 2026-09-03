@@ -336,6 +336,11 @@ fn a_guard_whose_event_was_overwritten() {
 /// them as meeting â a finite `WaitForEvent` that expires returns `S_FALSE`, which the wrapper
 /// maps to `Ok`, so an open whose target never joined would end successfully with no debuggee. The
 /// question is whether a wait can *expire* while the engine holds nothing, or only fail.
+///
+/// The wrapper no longer flattens the two (dbgscope#136): the wait answers a `WaitOutcome`, so
+/// this arm prints the distinction rather than inferring it from a duration. The measurement is
+/// unchanged -- what changed is that `Expired` and `Stopped` are separate answers from the call
+/// that knew.
 fn what_a_wait_can_conclude() {
     println!("=== I. what a wait can conclude ===");
 
@@ -344,7 +349,10 @@ fn what_a_wait_can_conclude() {
         let waited = e.wait_for_event(300);
         println!(
             "   {what}: wait(300) -> {:?} in {:?}; has_target {:?}",
-            waited.as_ref().map(|_| "Ok").map_err(|err| err.to_string()),
+            waited
+                .as_ref()
+                .map(|outcome| format!("{outcome:?}"))
+                .map_err(|err| err.to_string()),
             started.elapsed(),
             e.has_target()
         );
