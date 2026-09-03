@@ -138,6 +138,14 @@ All notable changes to this project are documented here. The format follows
   a stale entry there made a new open read `Arrived` for a target that had not stopped, a stale
   claim makes it read `Absent` for one that had.
 
+  A fifth round on the retirement above: it covered the *bound* and not the ending the scenario
+  actually takes. When the target exits before the first `WaitForEvent` the session holds nothing,
+  so the pump **fails** rather than expiring and the open returns through its `?` without ever
+  reaching the bound. The error ending retires too, on the narrower condition that the session
+  holds nothing at all — at the bound an open has pumped for `LIVE_WAIT_MS`, so a pid still not
+  listed is not coming, where on a failed pump it may have pumped nothing and the same reading
+  would retire an attach the engine had not yet had a chance to process.
+
   No public API changes. Two tests are gone rather than passing, and the constructions that make
   them unreachable are named where they were:
   `test_ending_a_session_forgets_which_processes_it_stopped_on` had no record to forget, and
