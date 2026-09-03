@@ -91,9 +91,18 @@ All notable changes to this project are documented here. The format follows
   sites: a deadline and a host request are now independent signals rather than two readings of one
   bit.
 
-  **The residue is named rather than closed.** A break aimed at operation N that lands on N+1 —
-  because N ended between the host reading what was running and the break arriving — stops N+1,
-  which sees no request of its own. No bookkeeping reaches that. `examples/interrupt_provenance.rs`
+  **The residue is named rather than closed**, and it is two shapes of one fact — `SetInterrupt`
+  is engine-wide, so which operation a break *lands* on is not this crate's to decide. A break
+  aimed at operation N can land on N+1, because N ended between the host reading what was running
+  and the break arriving; and a request can be filed against N *after* N's last read of one, since
+  an operation accepts requests for slightly longer than it reads them. Neither is reportable. What
+  the second one gets is a **drain**: an operation closing on a request nobody read consumes the
+  engine's own pending break, so it cannot go on to stop the next operation with nothing to explain
+  it — the policy `execute_and_wait`, `settle` and the bounded command path already applied
+  wherever a break belonged to no operation, generalised to the one window with no site to put it
+  at. `BreakRequest::Raised` says which operation a request was filed against and deliberately does
+  not promise that operation will report it: whether the engine thread has a read left is not
+  knowable to the calling thread. `examples/interrupt_provenance.rs`
   is the measurement #136 asked for before anything relies on one: a request that *ended* a wait is
   consumed before the wait returns (`[false; 5]`), one that did not is still readable
   (`[true, false, …]`), two back to back are one flag rather than two, and one lodged after the

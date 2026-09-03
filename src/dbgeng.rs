@@ -331,8 +331,14 @@ pub struct OperationId(u64);
 /// The break itself is issued either way; this says whether anything will *report* it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakRequest {
-    /// Filed against the operation the engine was running, which will report
-    /// [`Interruption::OnRequest`] when it ends.
+    /// Filed against the operation the engine was running at that instant.
+    ///
+    /// **Which is not a promise that the operation will report it.** An operation accepts requests
+    /// for slightly longer than it reads them — see [`Operation`] — so one filed after its last
+    /// read is discarded when it closes, and the break, having been delivered, is drained there
+    /// rather than left to stop whatever runs next. Nothing on this side can close that window:
+    /// whether the engine thread has a read left is not knowable to the calling thread at the
+    /// moment it asks.
     Raised { operation: OperationId },
     /// The engine was between bounded operations. The break was still delivered — it can abort a
     /// long unbounded [`DebugEngine::execute_command`], which is a real thing to want — but no
@@ -388,14 +394,17 @@ impl BreakScope {
         self.asked.remove(&operation)
     }
 
-    /// Closes `operation`, discarding a request it never read.
+    /// Closes `operation`, and answers whether it left a request unread.
     ///
     /// By id rather than by popping, so an out-of-order close cannot leave a stale id behind for a
     /// later request to be filed against. Guards are lexical here and nesting is two deep, so this
     /// costs nothing and removes a panic path.
-    fn end(&mut self, operation: OperationId) {
+    ///
+    /// The answer matters because a request nobody read is one the engine is still holding: see
+    /// [`Operation::drop`].
+    fn end(&mut self, operation: OperationId) -> bool {
         self.running.retain(|running| *running != operation);
-        self.asked.remove(&operation);
+        self.asked.remove(&operation)
     }
 }
 
@@ -405,6 +414,15 @@ impl BreakScope {
 /// is gone when the guard drops whether it was read or not. That is the whole of what replaced
 /// clearing an engine-wide flag at six call sites: there is nothing to clear, so there is nothing
 /// a request can be erased by.
+///
+/// **An operation accepts requests for longer than it reads them**, which is a real window and not
+/// a tidy one. [`Self::took_break_request`] is the last read on most paths, and everything after it
+/// — the rest of [`DebugEngine::pump`], the caller assembling its result, this guard dropping — is
+/// time in which [`InterruptHandle::interrupt`] still names this operation and still answers
+/// [`BreakRequest::Raised`]. It cannot be closed at the take, because
+/// [`DebugEngine::wait_for_live_target`] pumps repeatedly inside one operation and a request
+/// arriving between two of its pumps is one the next pump legitimately reads. What [`Self::drop`]
+/// does about it is below.
 struct Operation<'a> {
     engine: &'a DebugEngine,
     id: OperationId,
@@ -441,12 +459,33 @@ impl Operation<'_> {
 }
 
 impl Drop for Operation<'_> {
+    /// Closes the operation — and **drains the engine's own pending request** if it is closing on
+    /// one nobody read.
+    ///
+    /// A request filed after this operation's last read has no reader: this discards the record,
+    /// and without the drain the `SetInterrupt` behind it would still be pending, free to break
+    /// into whatever ran next with nothing to explain it. Draining is the policy this crate already
+    /// applies wherever a break belongs to no operation — `execute_and_wait`, `settle` and the
+    /// bounded command path all consume "anything the engine did not, so the next operation starts
+    /// clean" — generalised to the one window that had no site to put it at.
+    ///
+    /// **Only when a record is discarded**, which is what keeps it from consuming a request some
+    /// other operation is entitled to. A request this operation *read* is already accounted for;
+    /// its call site drains as it always did, and a second drain on a flag is harmless anyway.
+    ///
+    /// Outside the lock, because it is a COM call and holding a mutex across one buys nothing here.
+    /// Best-effort: this runs on unwind paths, so it has nowhere to report a failure and must not
+    /// panic.
     fn drop(&mut self) {
-        self.engine
+        let unread = self
+            .engine
             .break_scope
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .end(self.id);
+        if unread {
+            let _ = self.engine.interrupted();
+        }
     }
 }
 
@@ -3109,10 +3148,18 @@ impl DebugEngine {
     /// postcondition six rounds of review were spent establishing — the conservative direction, and
     /// the whole of docs/unknown-not-absent.md.
     ///
-    /// **What stage 2 leaves, and what would close it.** A break aimed at operation N that lands on
-    /// N+1 — because N ended between the host reading what was running and the break arriving —
-    /// stops N+1, which sees no request of its own and reports a normal stop. Bookkeeping cannot
-    /// close that: `SetInterrupt` is engine-wide and cannot be aimed. `GetInterrupt` can, and
+    /// **What stage 2 leaves, and what would close it.** Two shapes, both of them the same fact —
+    /// `SetInterrupt` is engine-wide and cannot be aimed, so which operation a break *lands* on is
+    /// not the crate's to decide.
+    ///
+    /// - A break aimed at operation N that lands on N+1, because N ended between the host reading
+    ///   what was running and the break arriving. N+1 sees no request of its own and reports a
+    ///   normal stop.
+    /// - A request filed against N *after* N's last read of one, which is the window
+    ///   [`Operation`] describes. Nobody reports it; [`Operation::drop`] at least drains the
+    ///   engine's own pending break so it does not become the first shape.
+    ///
+    /// Bookkeeping cannot close either. `GetInterrupt` could, and
     /// `examples/interrupt_provenance.rs` is the measurement #136 asked for before anything relies
     /// on it: a request that *ended* a wait is consumed before the wait returns, and one that did
     /// not is still readable afterwards — so a post-wait poll is a **forward** signal, warning the
@@ -5803,6 +5850,63 @@ mod tests {
             scope.running.is_empty() && scope.asked.is_empty(),
             "an operation that never read its request left {scope:?} for the next one"
         );
+    }
+
+    /// **A request nobody read takes the engine's pending break with it**, or the `SetInterrupt`
+    /// behind it stops whatever runs next with nothing to explain it.
+    ///
+    /// An operation accepts requests for slightly longer than it reads them -- everything from its
+    /// last `took_break_request` to its guard dropping -- and that window cannot be closed from
+    /// this side, because whether the engine thread has a read left is not knowable to the calling
+    /// thread. What *can* be done is what every other site in this crate already does when a break
+    /// belongs to no operation: drain it. `Operation::drop` does that, and only when it is
+    /// discarding a record nobody read.
+    ///
+    /// **Paired against a control**, or the assertion is unfalsifiable: `GetInterrupt` is itself a
+    /// consuming read, so "reads `false`" needs a case in the same test that reads `true` to say
+    /// the probe works at all. That control is the first half -- a request filed against nothing,
+    /// which no guard discards and no drain touches.
+    ///
+    /// Ignored for the reason the other `GetInterrupt` tests are: it needs a live debuggee.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_a_discarded_request`
+    #[test]
+    #[cfg(not(miri))]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn test_a_discarded_request_drains_the_engines_pending_break() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c exit").expect("launch failed");
+
+        // Control: nothing running, so nothing discards a record and nothing drains.
+        let filed = e.interrupt_handle().interrupt().expect("interrupt failed");
+        assert_eq!(
+            filed,
+            BreakRequest::NothingRunning,
+            "an engine between operations filed the request as {filed:?}"
+        );
+        assert!(
+            e.interrupted().expect("GetInterrupt failed"),
+            "the engine holds no pending request, so this test cannot tell a drain from a no-op"
+        );
+
+        // The case: filed against an operation that closes without reading it.
+        {
+            let operation = e.begin_operation();
+            let filed = e.interrupt_handle().interrupt().expect("interrupt failed");
+            assert_eq!(
+                filed,
+                BreakRequest::Raised {
+                    operation: operation.id
+                },
+                "the request was not filed against the operation that was running"
+            );
+        }
+        assert!(
+            !e.interrupted().expect("GetInterrupt failed"),
+            "an operation closed on a request nobody read and left the engine's own break pending, \
+             so the next operation is stopped by it with nothing to say why"
+        );
+
+        let _ = e.end_session();
     }
 
     /// A spec is born **armed**, which is the opposite of what the engine does and the whole
