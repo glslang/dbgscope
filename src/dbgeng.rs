@@ -408,7 +408,25 @@ struct ClientState {
     /// did not perform the attach saw no attachment to detach, so its passive end **killed**
     /// somebody else's process — the exact failure this record exists to prevent, reached through
     /// the wrapper boundary. Which processes a session attached to is a property of the session.
-    attached_processes: Mutex<HashSet<u32>>,
+    attached_processes: Mutex<HashMap<u32, Attachment>>,
+}
+
+/// How far an attachment has got, which is what tells a *deferred* one from a *departed* one.
+///
+/// `AttachProcess` joins the process to the session at the next `WaitForEvent`, not at the call --
+/// measured, and printed by `examples/deferred_arrival.rs` arm E: the pid is not listed before the
+/// wait. So a pid recorded by [`DebugEngine::claim_attached`] is legitimately absent from
+/// `session_processes` for a while, and [`DebugEngine::prune_processes_that_left`] -- whose whole
+/// subject is a pid that no longer names anything -- would drop it. Raised in review on
+/// dbgscope#139, and worth knowing that it costs more than a missed exclusion: a record dropped
+/// there makes the teardown treat somebody else's process as one this engine launched, and take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attachment {
+    /// Attached, and not yet seen in the session. Nothing may prune it: it has not arrived, so it
+    /// cannot have left.
+    Deferred,
+    /// Seen in the session at least once, so its absence now means it is gone.
+    Joined,
 }
 
 /// Every client this process has live state for, keyed by COM pointer.
@@ -500,7 +518,15 @@ impl Pending {
     /// it also covers an attach whose guard has been dropped, whose process joins the session with
     /// no registration left to name it.
     fn wants(&self, entry: (u32, u32), others: &[&Pending], attached: &HashSet<u32>) -> bool {
-        if self.inherited.contains(&entry) {
+        // Somebody else has it, either still (`arrived`) or by an inheritance left behind when
+        // their guard went (`inherited`). Asked here rather than in `deliver` alone, because
+        // `presence` asks the same question and would otherwise call another open's delivered
+        // process evidence that *this* one is `Listed` -- and `Listed` is not `Absent`, so a
+        // second launch interrupted before its own process joined answered `Ok(())` instead of
+        // `LiveTargetInterrupted`. Raised in review on dbgscope#139.
+        if self.inherited.contains(&entry)
+            || others.iter().any(|other| other.arrived == Some(entry))
+        {
             return false;
         }
         match &self.what {
@@ -573,17 +599,11 @@ impl Arrivals {
     /// distinguishable: the arrival is offered in registration order and claimed by one open, so
     /// the second launch is still waiting when the next one comes.
     ///
-    /// A process already claimed is offered to nobody. A target stops more than once in a session
-    /// — every later break is a stop on the same process — and a second delivery would hand an
-    /// open that arrived after this one an event belonging to a target it never asked about.
+    /// A process already claimed is offered to nobody, which [`Pending::wants`] enforces for every
+    /// caller rather than this one alone: a target stops more than once in a session -- every later
+    /// break is a stop on the same process -- and a second delivery would hand an open still
+    /// waiting an event belonging to a target it never asked about.
     fn deliver(&mut self, entry: (u32, u32), attached: &HashSet<u32>) {
-        if self
-            .pending
-            .iter()
-            .any(|pending| pending.arrived == Some(entry))
-        {
-            return;
-        }
         let Some(index) = self.pending.iter().position(|pending| {
             let others: Vec<&Pending> = self
                 .pending
@@ -3035,7 +3055,9 @@ impl DebugEngine {
             .attached_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// The **engine** process id the engine's last event belongs to.
@@ -3450,7 +3472,10 @@ impl DebugEngine {
         let (Ok(id), Ok(held)) = (self.last_event_process(), self.session_processes()) else {
             return None;
         };
-        let entry = held.into_iter().find(|(held, _)| *held == id)?;
+        // Every stop is a listing of the session, and the only one that happens between an
+        // attach's wait and the next opener's prune -- see `note_attachments_present`.
+        self.note_attachments_present(&held);
+        let entry = held.iter().copied().find(|(held, _)| *held == id)?;
         let attached = self.attached_pids();
         self.state
             .arrivals
@@ -5225,12 +5250,16 @@ impl DebugEngine {
 
     /// Records that `pid` is a process this engine attached to, so the teardown detaches from it
     /// instead of taking it.
+    ///
+    /// [`Attachment::Deferred`], because `AttachProcess` joins the process at the next
+    /// `WaitForEvent` rather than here; [`Self::prune_processes_that_left`] promotes it once it has
+    /// been seen.
     fn claim_attached(&self, pid: u32) {
         self.state
             .attached_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(pid);
+            .insert(pid, Attachment::Deferred);
     }
 
     /// Forgets recorded attachments this session no longer holds.
@@ -5274,11 +5303,39 @@ impl DebugEngine {
         let Ok(held) = self.session_processes() else {
             return;
         };
+        self.note_attachments_present(&held);
+        // A pid the session does not hold has either left -- `Joined`, so drop it, which is what
+        // this function is for -- or not yet joined, which is `Deferred` and must be kept: it
+        // cannot have left a session it has never been in.
         self.state
             .attached_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|pid| held.iter().any(|(_, held)| held == pid));
+            .retain(|pid, state| {
+                *state == Attachment::Deferred || held.iter().any(|(_, held)| held == pid)
+            });
+    }
+
+    /// Promotes every recorded attachment this listing shows to [`Attachment::Joined`].
+    ///
+    /// **Called wherever the session is listed on the engine's own account**, which is the prune
+    /// and the pump. The prune alone is not enough and the failing test says why: an attach
+    /// completes at its wait, and nothing lists the session again until the *next* opener prunes --
+    /// by which time a `.detach` may have taken the process, leaving a pid that has joined and left
+    /// still marked `Deferred` and so kept for ever. The pump lists the session on every stop, so
+    /// promoting there closes the gap without a listing of its own.
+    fn note_attachments_present(&self, held: &[(u32, u32)]) {
+        for (pid, state) in self
+            .state
+            .attached_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+        {
+            if held.iter().any(|(_, held)| held == pid) {
+                *state = Attachment::Joined;
+            }
+        }
     }
 
     /// Forgets every recorded attach, and every open still waiting on the session being replaced.
@@ -5326,7 +5383,7 @@ impl DebugEngine {
         !attached.is_empty()
             && self
                 .session_processes()
-                .is_ok_and(|held| held.iter().any(|(_, pid)| attached.contains(pid)))
+                .is_ok_and(|held| held.iter().any(|(_, pid)| attached.contains_key(pid)))
     }
 
     /// Ends the current debug session without destroying the client, so it can be
@@ -5451,7 +5508,7 @@ impl DebugEngine {
         // `.detach` took it — is simply not in this list. So a stale entry costs nothing and needs
         // no separate check.
         for (id, pid) in self.session_processes()? {
-            if !attached.contains(&pid) {
+            if !attached.contains_key(&pid) {
                 continue;
             }
             if let Err(e) = unsafe {
@@ -8319,6 +8376,66 @@ mod tests {
             Some(STILL_RUNNING),
             "the process this engine launched (pid {pid}) outlived its session"
         );
+    }
+
+    /// **A prune does not take an attachment that has not joined yet**, which it did, and which
+    /// costs somebody else's process.
+    ///
+    /// `AttachProcess` joins its process at the next `WaitForEvent`, not at the call -- measured,
+    /// and printed by `examples/deferred_arrival.rs` arm E. So between `attach_process_begin` and
+    /// the wait that completes it, the pid is recorded and the session does not list it; a
+    /// `launch_process_begin` in that window prunes on "is it held", finds it is not, and drops the
+    /// record. The launch then has no reason to exclude that process, and -- worse -- the teardown
+    /// has no reason to detach from it, so the passive end takes a process this engine only
+    /// attached to. Raised in review on dbgscope#139.
+    ///
+    /// `Attachment::Deferred` is what separates "has not arrived" from "has left". The assertion is
+    /// on the ending rather than on the record, because the record is the mechanism and the process
+    /// surviving is the point.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_prune_does_not_take_an_attachment_that_has_not_joined() {
+        let _debuggee = one_debuggee();
+        let mut theirs = a_process_to_attach_to();
+        {
+            let e = DebugEngine::new();
+            // Begun and *not* waited, so the attach is still deferred: the pid is recorded and the
+            // session does not list it yet.
+            let attaching = e.attach_process_begin(theirs.id()).expect("attach failed");
+            assert!(
+                !e.session_processes()
+                    .expect("could not list the session")
+                    .iter()
+                    .any(|(_, pid)| *pid == theirs.id()),
+                "the attached process is already listed, so this window does not exist here and                  the test is asserting nothing"
+            );
+
+            // The opener that prunes, in that window.
+            let launching = e
+                .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.1")
+                .expect("launch failed");
+            assert_eq!(
+                e.state
+                    .attached_processes
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .get(&theirs.id()),
+                Some(&Attachment::Deferred),
+                "the prune took a record of an attachment that had not joined yet, so the                  teardown will treat somebody else's process as one this engine launched"
+            );
+
+            attaching.wait().expect("the attach should complete");
+            launching.wait().expect("the launch should complete");
+            let _ = e.end_session();
+        }
+        assert_eq!(
+            exit_code_of(theirs.id()),
+            Some(STILL_RUNNING),
+            "the attached process was taken by the session it was only being looked at from"
+        );
+
+        let _ = theirs.kill();
+        let _ = theirs.wait();
     }
 
     /// **An engine is reusable, so where its target came from is answered by the last opener and
