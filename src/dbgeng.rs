@@ -595,6 +595,31 @@ impl Arrivals {
         }
     }
 
+    /// Drops every claim and inherited exclusion naming a process the session no longer holds.
+    ///
+    /// **The reuse hazard the record this replaced was pruned for, arriving from the other side.**
+    /// Engine ids are handed back immediately — measured, detaching id 0 and attaching another
+    /// process hands the freed 0 straight back — so a `.detach` and a reattach of the same pid
+    /// reproduce a `(engine id, pid)` pair exactly. Where a stale entry in the old set made a new
+    /// open read `Arrived` for a target that had not stopped, a stale *claim* here makes it read
+    /// the opposite: the pair is spoken for, so the reattach's own stop is refused as somebody
+    /// else's and its `wait()` times out on a target sitting in front of it. Raised in review on
+    /// dbgscope#139.
+    ///
+    /// Clearing `arrived` rather than only the exclusion is deliberate and is what the old prune
+    /// did: an open whose target has left the session has not arrived anywhere its caller can use,
+    /// and [`Self::presence`] should say `Absent` rather than `Arrived` about a process that is
+    /// gone.
+    fn forget_departed(&mut self, held: &[(u32, u32)]) {
+        let still_here = |entry: &(u32, u32)| held.contains(entry);
+        for pending in &mut self.pending {
+            if pending.arrived.is_some_and(|entry| !still_here(&entry)) {
+                pending.arrived = None;
+            }
+            pending.inherited.retain(still_here);
+        }
+    }
+
     /// Forgets every open, when the session they were waiting on is replaced.
     ///
     /// A guard held across that keeps its id; the id then names nothing, and
@@ -5365,6 +5390,13 @@ impl DebugEngine {
             return;
         };
         self.note_attachments_present(&held);
+        // The same question of the arrival register: a claim on a process that has left must stop
+        // excluding the next one to inherit its numbers. See `Arrivals::forget_departed`.
+        self.state
+            .arrivals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_departed(&held);
         // A pid the session does not hold has either left -- `Joined`, so drop it, which is what
         // this function is for -- or not yet joined, which is `Deferred` and must be kept: it
         // cannot have left a session it has never been in.
@@ -5397,6 +5429,18 @@ impl DebugEngine {
                 *state = Attachment::Joined;
             }
         }
+    }
+
+    /// Forgets every open still waiting on a session that has ended.
+    ///
+    /// Shared by [`Self::end_session`] and by `Drop`, which tears down inline rather than calling
+    /// it -- so this is the one line both have to run and only one of them used to.
+    fn forget_pending_opens(&self) {
+        self.state
+            .arrivals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_all();
     }
 
     /// Forgets every recorded attach, and every open still waiting on the session being replaced.
@@ -5509,11 +5553,7 @@ impl DebugEngine {
         // buffers is a leak and for the opens is a guard left waiting on a session that has gone.
         if session_ended {
             self.release_deferred_inputs();
-            self.state
-                .arrivals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .forget_all();
+            self.forget_pending_opens();
         }
         ended
     }
@@ -5650,7 +5690,9 @@ impl Drop for DebugEngine {
         // Don't leave a live kernel frozen at a break if we're torn down without an
         // explicit end_session (e.g. the process exits): resume + actively detach.
         if self.is_live_kernel() {
-            let _ = self.resume_and_detach_live_kernel();
+            if self.resume_and_detach_live_kernel().is_ok() {
+                self.forget_pending_opens();
+            }
             return;
         }
         // And don't take somebody else's process down with us — the same asymmetry as the kernel
@@ -5660,8 +5702,16 @@ impl Drop for DebugEngine {
         // attached to, and the session still has to be ended for the rest.
         let _ = self.detach_attached_processes();
         // Best-effort teardown; ignore errors (e.g. when no session is active).
-        unsafe {
-            let _ = self.client.EndSession(DEBUG_END_PASSIVE);
+        let ended = unsafe { self.client.EndSession(DEBUG_END_PASSIVE) };
+        // The session's pending opens go with it, exactly as `end_session` does it and gated on
+        // the same fact -- `EndSession`'s own outcome. Since the register is per *client*, a guard
+        // held by another wrapper outlives this drop, and one left registered against a session
+        // that has ended is first in line to claim the next launch's stop through that wrapper,
+        // leaving the new guard to time out on a target that stopped. Raised in review on
+        // dbgscope#139; `Drop` tears down inline rather than calling `end_session`, so it did not
+        // inherit that line.
+        if ended.is_ok() {
+            self.forget_pending_opens();
         }
     }
 }
@@ -6163,6 +6213,45 @@ mod tests {
             arrivals.presence(first, &[(0, 100)], &none),
             Presence::Absent,
             "a forgotten open still answered about a process"
+        );
+    }
+
+    /// **A claim stops excluding once its process leaves**, or a reattach is refused its own stop.
+    ///
+    /// Engine ids are handed back immediately -- measured, detaching id 0 and attaching another
+    /// process hands the freed 0 straight back -- so a `.detach` and a reattach of the same pid
+    /// reproduce a `(engine id, pid)` pair exactly. That is the reuse the record this replaced was
+    /// pruned for, and it arrives here from the other side: a stale entry in the old set made a
+    /// new open read `Arrived` for a target that had not stopped, where a stale *claim* makes it
+    /// read the opposite. Raised in review on dbgscope#139.
+    #[test]
+    fn test_a_claim_stops_excluding_once_its_process_leaves() {
+        let none = HashSet::new();
+        let mut arrivals = Arrivals::default();
+        let held_open = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        arrivals.deliver((0, 100), &none);
+        assert_eq!(
+            arrivals.presence(held_open, &[(0, 100)], &none),
+            Presence::Arrived,
+            "the launch was not given its process, so nothing here is under test"
+        );
+
+        // The process leaves -- a raw `.detach`, or an exit -- and the same pair comes back.
+        arrivals.forget_departed(&[]);
+        let reattach = arrivals.register(Arrival::Attached(100));
+        arrivals.deliver((0, 100), &none);
+        assert_eq!(
+            arrivals.presence(reattach, &[(0, 100)], &none),
+            Presence::Arrived,
+            "the reattach was refused its own stop as another open's claim, so its wait() times              out on a target sitting in front of it"
+        );
+
+        // And the open that held the departed claim no longer says it arrived, which is what the
+        // old prune did and is the honest answer about a process that is gone.
+        assert_ne!(
+            arrivals.presence(held_open, &[(0, 100)], &none),
+            Presence::Arrived,
+            "an open whose target left the session still reports it as arrived"
         );
     }
 
@@ -6933,6 +7022,57 @@ mod tests {
 
         drop(pending);
         owner.end_session().expect("end_session failed");
+    }
+
+    /// **A drop lets go of the session's pending opens**, which `end_session` did and `Drop` did
+    /// not.
+    ///
+    /// `Drop` tears down inline rather than calling `end_session`, so it never inherited the line
+    /// that forgets them -- which cost nothing while the register was a field on each wrapper and
+    /// costs a stale entry now that it is the session's. A guard held by a second wrapper outlives
+    /// the owner's drop, and one left registered against a session that has ended is **first in
+    /// line** for the next launch's stop through that wrapper, leaving the new guard to time out
+    /// on a target that stopped. Raised in review on dbgscope#139.
+    #[cfg(not(miri))]
+    #[test]
+    fn test_a_drop_lets_go_of_the_sessions_pending_opens() {
+        let _debuggee = one_debuggee();
+        let borrowed = {
+            let owner = DebugEngine::new();
+            // A second wrapper around the same client, and a guard registered through the owner
+            // that the second wrapper knows nothing about.
+            let borrowed = DebugEngine::from_client_interface(owner.client.clone());
+            let pending = owner
+                .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.1")
+                .expect("launch failed");
+            // Leaked deliberately: this is a guard that outlives the owner's drop, which is the
+            // whole shape under test. Its `Registered` never runs, so only the teardown can
+            // forget the entry.
+            std::mem::forget(pending);
+            assert_eq!(
+                borrowed
+                    .state
+                    .arrivals
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .pending
+                    .len(),
+                1,
+                "the open was not registered, so nothing here is under test"
+            );
+            borrowed
+        };
+
+        assert!(
+            borrowed
+                .state
+                .arrivals
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .pending
+                .is_empty(),
+            "an open registered against a session the owner's drop ended is still first in line,              so the next launch through this wrapper loses its stop to it"
+        );
     }
 
     /// **A session's attachments are visible through every wrapper**, both to delivery and to the
@@ -9183,6 +9323,76 @@ mod tests {
             !matches!(e.presence_of(&watcher), Presence::Arrived),
             "a break a host asked for was delivered as an arrival by the finite wait"
         );
+    }
+
+    /// **The opener's prune is what asks the register about departures**, which the rule test
+    /// beside it cannot say.
+    ///
+    /// `test_a_claim_stops_excluding_once_its_process_leaves` pins the rule and calls it directly,
+    /// so removing the call from `prune_processes_that_left` leaves it green -- measured, by making
+    /// that removal. This is the wiring: a launch delivered while its guard is held, its process
+    /// detached, and then an opener, whose prune has to clear the claim before the reattach can be
+    /// given the pair back.
+    ///
+    /// The second process is what keeps the session alive across the detach, so nothing else
+    /// clears anything; and the pair is asserted to come back, or a run where DbgEng handed out a
+    /// different engine id would pass without meeting the collision at all.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_the_openers_prune_clears_a_claim_on_a_departed_process() {
+        let _debuggee = one_debuggee();
+        let mut stays = a_process_to_attach_to();
+        {
+            let e = DebugEngine::new();
+            e.attach_process(stays.id()).expect("attach failed");
+
+            // A launch delivered by an outside pump, with its guard still held.
+            let launched = e
+                .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.1")
+                .expect("launch failed");
+            e.wait_for_event(LIVE_WAIT_MS)
+                .expect("the outside pump failed");
+            let WaitKind::Live(registered) = &launched.kind else {
+                panic!("a launch guard is not a live open");
+            };
+            assert!(
+                matches!(e.presence_of(registered), Presence::Arrived),
+                "the launch was not delivered its process, so nothing here is under test"
+            );
+
+            let held = e.session_processes().expect("could not list the session");
+            let (id, pid) = *held
+                .iter()
+                .find(|(_, pid)| *pid != stays.id())
+                .expect("the launched process is not in the session");
+
+            // It leaves, and the same pid is attached again -- which is where DbgEng hands the
+            // engine id straight back.
+            e.execute_command(&format!("|{id}s"))
+                .expect("could not select the process to detach");
+            e.execute_command(".detach").expect("could not detach it");
+            let reattached = e.attach_process_begin(pid).expect("reattach failed");
+            reattached.wait().expect("the reattach should complete");
+
+            let back = e
+                .session_processes()
+                .expect("could not list the session")
+                .iter()
+                .any(|entry| *entry == (id, pid));
+            assert!(
+                back,
+                "the reattach did not get the pair ({id}, {pid}) back, so this run never met the                  collision and asserts nothing"
+            );
+            assert!(
+                !matches!(e.presence_of(registered), Presence::Arrived),
+                "the departed process's claim survived the opener's prune, so the pair it holds                  refuses the next open its own stop"
+            );
+
+            drop(launched);
+            let _ = e.end_session();
+        }
+        let _ = stays.kill();
+        let _ = stays.wait();
     }
 
     /// **Reclaiming a departed process's engine id does not reclaim its arrival**, which used to
