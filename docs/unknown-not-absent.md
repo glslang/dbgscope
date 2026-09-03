@@ -282,9 +282,13 @@ saying: nobody outside the crate can see the watchdog fire, so a caller renderin
 should report it and say what to do — scope the command and retry. `OnRequest` mostly does not:
 that caller knows, having asked.
 
-And the origin is decided by **the watchdog's own flag**, not by the shared `interrupt_raised`
-bit — which the watchdog sets too, since that is what `InterruptHandle::interrupt` does.
-Reading the shared bit would report every deadline as a host request.
+And the origin is decided by **the watchdog's own flag**, which since dbgscope#136 stage 2 is the
+only thing that says a deadline passed: the watchdog goes through `InterruptHandle::break_in_only`
+and files no request against the operation, so the two origins are independent signals rather than
+two readings of one bit. They were not always. The watchdog used to reach the engine through
+`InterruptHandle::interrupt` like any host, so every classify site had to OR the two together and
+then trust the private one to say which it was — and reading the shared bit alone reported every
+deadline as a host request.
 
 ### A bound that bounds less than it appears to, and says so
 
