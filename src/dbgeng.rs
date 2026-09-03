@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -230,15 +230,15 @@ pub struct InterruptHandle {
     /// moment a host reaches for it. The refcount costs nothing and makes the lifetime a fact
     /// rather than a convention.
     control: IDebugControl4,
-    /// The engine's operation bookkeeping, so a request this handle raises is recorded **against
-    /// the operation it will stop** rather than against the engine at large. See [`BreakScope`].
+    /// The **session's** bookkeeping, so a request this handle raises is recorded against the
+    /// operation it will stop rather than against the engine at large. See [`BreakScope`].
     ///
-    /// **Shared with that engine, and not with another wrapper around the same client**, which is
-    /// the gap [`DebugEngine::stopped_on`] describes: `SetInterrupt` reaches the engine both
-    /// wrappers share, so a handle taken from one raises a break the other sees as a stop its
-    /// target made on its own -- and, since [`DebugEngine::pump`] takes the request to attribute
-    /// its [`WaitOutcome`], records as an arrival.
-    scope: Arc<Mutex<BreakScope>>,
+    /// Shared with every wrapper around the same client, not only with the engine this came from
+    /// ([`ClientState`]). `SetInterrupt` reaches the client both wrappers share, so a handle taken
+    /// from one raises a break the other would otherwise see as a stop its target made on its own
+    /// -- and, since [`DebugEngine::pump`] takes the request to attribute its [`WaitOutcome`], as
+    /// an arrival.
+    state: Arc<ClientState>,
 }
 // SAFETY: `control` is only ever handed to SetInterrupt, the one cross-thread-safe DbgEng call.
 // The other cross-thread touch is the `Release` on drop, which rests on the same assumption
@@ -274,12 +274,12 @@ impl InterruptHandle {
     /// `SetInterrupt`, with each operation clearing the flag as it opened; a request lodged
     /// between an operation's clear and its wait was therefore *erased* while its break was still
     /// on the way, and the resulting synthetic stop was reported as the target's own — up to and
-    /// including being recorded in [`DebugEngine::stopped_on`] as a target's initial break. No
+    /// including being delivered to a live open as its target's initial break. No
     /// ticket or generation counter closes that: the window is between two writes, not between two
     /// values. Holding the lock across the record *and* the delivery closes it by construction,
     /// because an operation cannot begin or end in the middle.
     pub fn interrupt(&self) -> Result<BreakRequest, DbgEngError> {
-        let mut scope = self.scope.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scope = self.state.breaks.lock().unwrap_or_else(|e| e.into_inner());
         let against = scope.innermost();
         // Delivered before it is recorded, which the lock makes safe and which the old ordering
         // could not afford: nothing can observe the interim state, so a `SetInterrupt` that fails
@@ -344,6 +344,228 @@ pub enum BreakRequest {
     /// long unbounded [`DebugEngine::execute_command`], which is a real thing to want — but no
     /// operation will claim it, and nothing here will report it.
     NothingRunning,
+}
+
+/// The state a debug **session** has, shared by every [`DebugEngine`] wrapping one
+/// `IDebugClient6`.
+///
+/// Two `DebugEngine`s can be live around one client — that is what
+/// [`DebugEngine::from_client_interface`] is for, and what
+/// `test_every_live_wrapper_sees_a_release_through_any_of_them` asserts — so anything that is a
+/// view of the *session* must not be private to one wrapper. Both of these were, and both were
+/// written down as known gaps rather than fixed at the time:
+///
+/// - **Arrivals.** A `wait_for_event` through wrapper B that pumps wrapper A's held target to its
+///   initial break recorded it in B alone. A then read [`Presence::Listed`], waited again, and got
+///   an unrelated event or `E_UNEXPECTED` — the 29.36s against 8.6µs that
+///   `examples/deferred_arrival.rs` arm F measures, undone by the wrapper boundary.
+/// - **Break requests.** A handle taken from wrapper A raises a break the other wrapper sees as a
+///   stop its target made on its own, and — since [`DebugEngine::pump`] takes the request to
+///   attribute its [`WaitOutcome`] — as an arrival.
+///
+/// dbgscope#136 stage 3, which is where the `Arc<ClientState>` note that used to sit on the
+/// arrival record said this belonged: it is one field, so doing the two halves apart would be two
+/// reviews of one seam.
+///
+/// **Not the session's *provenance*, which stays per wrapper.** `attached_processes` decides
+/// whether a teardown detaches a process or takes it with the session, and a session belongs to
+/// the wrapper that opened it — sharing that would put this crate's most consequential decision
+/// behind a lookup, to serve an arrangement neither consumer makes.
+#[derive(Debug, Default)]
+struct ClientState {
+    /// The opens waiting for a target to join this session and stop.
+    arrivals: Mutex<Arrivals>,
+    /// Which bounded operations are running, and which of them a host has asked to break.
+    breaks: Mutex<BreakScope>,
+}
+
+/// Every client this process has live state for, keyed by COM pointer.
+///
+/// `Weak`, so an entry dies with the last wrapper holding it and a pointer the allocator reuses
+/// cannot inherit the previous client's arrivals or break requests. That is what
+/// [`client_identities`] needs [`reissue_identity`] for and this needs nothing for: an identity is
+/// a cache tag whose staleness costs a re-read, where a stale arrival record would answer
+/// [`Presence::Arrived`] for a target that never stopped.
+///
+/// Swept on every insert rather than capped, for the same reason: a dead entry identifies itself,
+/// so the map is bounded by the number of *live* clients, which is one in the extension and one
+/// per worker process in windbg-mcp.
+fn client_states() -> &'static Mutex<HashMap<usize, Weak<ClientState>>> {
+    static STATES: OnceLock<Mutex<HashMap<usize, Weak<ClientState>>>> = OnceLock::new();
+    STATES.get_or_init(Mutex::default)
+}
+
+/// The state in force for `client`, creating it if this is the first wrapper to ask.
+///
+/// Poisoning is recovered rather than propagated, as [`locked_identities`] does and for the same
+/// reason: the constructors that call this are infallible, so one unrelated panic would otherwise
+/// turn every later wrap into a second one.
+fn state_for(client: &IDebugClient6) -> Arc<ClientState> {
+    let key = client.as_raw() as usize;
+    let mut states = client_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    states.retain(|_, state| state.strong_count() > 0);
+    if let Some(live) = states.get(&key).and_then(Weak::upgrade) {
+        return live;
+    }
+    let state = Arc::new(ClientState::default());
+    states.insert(key, Arc::downgrade(&state));
+    state
+}
+
+/// Identifies one open waiting for its target. Never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ArrivalId(u64);
+
+/// The opens waiting for a target to join this session and stop, and what each has been given.
+///
+/// **This is a delivery register, where what it replaces was a broadcast.** `stopped_on` was an
+/// engine-wide set of every `(engine id, system pid)` the engine had ever stopped on: every wait
+/// wrote into it and every guard polled it, and because it outlived the opens that read it, it
+/// needed a lifecycle of its own — pruned at both openers for pid reuse, cleared where a session
+/// was replaced and again where one was ended, each of which arrived as a review finding
+/// (dbgscope#133 rounds 7 to 9). A register of *pending* opens needs none of that: an entry lives
+/// exactly as long as the guard that made it, so there is no stale record to prune, clear or
+/// match by accident.
+///
+/// It also gives each open an identity, which is what closes the ambiguity [`Arrival`] used to
+/// document as accepted: two launches pending at once could not be told apart, because the first
+/// arrival was new to both snapshots and so ended both waits. A delivered arrival is **claimed**
+/// here, so the second launch waits for the next one. The reason that fix was weighed and rejected
+/// before is that it needed "new engine-wide state, cleared everywhere a session is replaced and
+/// pruned for pid reuse" — which is the very cost this shape does not have.
+#[derive(Debug, Default)]
+struct Arrivals {
+    /// Ids handed out so far. Never reused.
+    minted: u64,
+    /// Registered in the order the opens were made, which is the order arrivals are offered in.
+    pending: Vec<Pending>,
+}
+
+/// One registered open.
+#[derive(Debug)]
+struct Pending {
+    id: ArrivalId,
+    what: Arrival,
+    /// The process delivered to this open, once one has been.
+    arrived: Option<(u32, u32)>,
+}
+
+impl Pending {
+    /// Whether `entry` is the process this open is waiting for.
+    ///
+    /// `others` is every *other* pending open, and it is what keeps a launch and an attach pending
+    /// together from satisfying each other: a launch is identified by elimination, so without it
+    /// the process an attach is waiting for is new to the launch's snapshot and looks like the
+    /// launch's own. It replaces reading `attached_processes` for that, and is better in the one
+    /// way that matters here — the register is shared across wrappers where that set is not.
+    ///
+    /// `attached` is the delivering engine's own record, kept beside it rather than instead of it:
+    /// it also covers an attach whose guard has been dropped, whose process joins the session with
+    /// no registration left to name it.
+    fn wants(&self, entry: (u32, u32), others: &[&Pending], attached: &HashSet<u32>) -> bool {
+        match &self.what {
+            Arrival::Attached(pid) => entry.1 == *pid,
+            // Nothing to eliminate against, so nothing can be concluded — and in particular this
+            // must not claim an arrival some other open is entitled to.
+            Arrival::Launched(None) => false,
+            Arrival::Launched(Some(before)) => {
+                !before.contains(&entry)
+                    && !attached.contains(&entry.1)
+                    && !others
+                        .iter()
+                        .any(|other| matches!(other.what, Arrival::Attached(pid) if pid == entry.1))
+            }
+        }
+    }
+}
+
+impl Arrivals {
+    /// Registers an open, and answers the id that names it.
+    fn register(&mut self, what: Arrival) -> ArrivalId {
+        self.minted += 1;
+        let id = ArrivalId(self.minted);
+        self.pending.push(Pending {
+            id,
+            what,
+            arrived: None,
+        });
+        id
+    }
+
+    /// Forgets an open, when its guard is dropped.
+    fn forget(&mut self, id: ArrivalId) {
+        self.pending.retain(|pending| pending.id != id);
+    }
+
+    /// Forgets every open, when the session they were waiting on is replaced.
+    ///
+    /// A guard held across that keeps its id; the id then names nothing, and
+    /// [`Self::presence`] answers [`Presence::Absent`] for it — which is the truth, since the
+    /// session it was waiting on is gone.
+    fn forget_all(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Routes a stop to the open that wants it, if any.
+    ///
+    /// **First registered wins**, which is the whole of what makes two pending launches
+    /// distinguishable: the arrival is offered in registration order and claimed by one open, so
+    /// the second launch is still waiting when the next one comes.
+    ///
+    /// A process already claimed is offered to nobody. A target stops more than once in a session
+    /// — every later break is a stop on the same process — and a second delivery would hand an
+    /// open that arrived after this one an event belonging to a target it never asked about.
+    fn deliver(&mut self, entry: (u32, u32), attached: &HashSet<u32>) {
+        if self
+            .pending
+            .iter()
+            .any(|pending| pending.arrived == Some(entry))
+        {
+            return;
+        }
+        let Some(index) = self.pending.iter().position(|pending| {
+            let others: Vec<&Pending> = self
+                .pending
+                .iter()
+                .filter(|other| other.id != pending.id)
+                .collect();
+            pending.arrived.is_none() && pending.wants(entry, &others, attached)
+        }) else {
+            return;
+        };
+        self.pending[index].arrived = Some(entry);
+    }
+
+    /// Where the open `id` is waiting for has got to, given what the session currently holds.
+    ///
+    /// An id that names nothing is [`Presence::Absent`]: either the session was replaced under a
+    /// guard still held, or the guard is gone and nobody is asking.
+    fn presence(&self, id: ArrivalId, held: &[(u32, u32)], attached: &HashSet<u32>) -> Presence {
+        let Some(pending) = self.pending.iter().find(|pending| pending.id == id) else {
+            return Presence::Absent;
+        };
+        if pending.arrived.is_some() {
+            return Presence::Arrived;
+        }
+        if matches!(pending.what, Arrival::Launched(None)) {
+            return Presence::Unknown;
+        }
+        let others: Vec<&Pending> = self
+            .pending
+            .iter()
+            .filter(|other| other.id != pending.id)
+            .collect();
+        if held
+            .iter()
+            .any(|entry| pending.wants(*entry, &others, attached))
+        {
+            Presence::Listed
+        } else {
+            Presence::Absent
+        }
+    }
 }
 
 /// Which operations the engine is running, and which of them a host has asked to break.
@@ -435,7 +657,8 @@ impl Operation<'_> {
     /// be charged to whatever ran next, which is #135 half B.
     fn took_break_request(&self) -> bool {
         self.engine
-            .break_scope
+            .state
+            .breaks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take(self.id)
@@ -479,7 +702,8 @@ impl Drop for Operation<'_> {
     fn drop(&mut self) {
         let unread = self
             .engine
-            .break_scope
+            .state
+            .breaks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .end(self.id);
@@ -687,8 +911,9 @@ pub enum WaitOutcome {
     /// `process` is the `(engine id, system pid)` that event belongs to, where the last-event slot
     /// named a process this session still lists. `None` is that join failing, which is "nothing to
     /// add" rather than a failure — an engine with no event to name, a dump, an event belonging to
-    /// no process here. It is the pair recorded in [`DebugEngine::stopped_on`], answered here as
-    /// well so a caller pumping the engine itself need not read that record back.
+    /// no process here. It is the pair [`Arrivals::deliver`] routes to whichever open was waiting
+    /// for it, answered here as well so a caller pumping the engine itself can see what its pump
+    /// completed.
     Stopped { process: Option<(u32, u32)> },
     /// A finite bound passed with no event: `WaitForEvent` answered `S_FALSE`, and the target is
     /// **still running** with the engine holding no current process/thread.
@@ -1744,20 +1969,18 @@ pub struct DebugEngine {
     /// re-read the buffer (drive `.restart` after a `launch_process`) is what would make a
     /// tighter release safe.
     deferred_inputs: Mutex<Vec<TargetInput>>,
-    /// Which bounded operations this engine is running, and which of them a host has asked to
-    /// break. Shared with every [`InterruptHandle`] it hands out; see [`BreakScope`].
+    /// The **session's** state, shared by every wrapper around this client and with every
+    /// [`InterruptHandle`] this engine hands out: the opens waiting for a target
+    /// ([`Arrivals`]) and the break requests scoped to operations ([`BreakScope`]). See
+    /// [`ClientState`].
     ///
-    /// **Every access goes through [`Self::begin_operation`] and the [`Operation`] guard it
-    /// returns**, plus [`InterruptHandle::interrupt`] on the other side of the lock. Nothing reads
-    /// this field directly, and nothing clears it: a request names the operation it is for, so
-    /// there is nothing for a later operation to be charged with and nothing for an earlier one to
-    /// erase.
-    ///
-    /// It replaced an engine-wide `AtomicBool` that answered *has an interrupt been requested*
-    /// where every reader wanted *was **this** operation asked to stop* — a level where the design
-    /// needs an edge with identity, which is both halves of dbgscope#135 and what #136 stage 2
-    /// scoped.
-    break_scope: Arc<Mutex<BreakScope>>,
+    /// Nothing reads either through this field directly. Arrivals go through the [`Registered`]
+    /// guard an opener returns, break requests through [`Self::begin_operation`] and the
+    /// [`Operation`] guard it returns, plus [`InterruptHandle::interrupt`] on the other side of
+    /// the lock. Neither is ever cleared as an operation or an open begins: an entry names what it
+    /// is for, so there is nothing for a later one to be charged with and nothing for an earlier
+    /// one to erase.
+    state: Arc<ClientState>,
     /// The system pids of live user-mode processes this engine **attached** to rather than
     /// created — the ones ending the session must let go of rather than take with it.
     ///
@@ -1789,50 +2012,6 @@ pub struct DebugEngine {
     /// decision behind an eviction policy, to serve an arrangement nothing here makes — the
     /// extension's borrowed wrapper never attaches and never ends a session.
     attached_processes: Mutex<std::collections::HashSet<u32>>,
-
-    /// Every process this engine has **stopped on**, as `(engine id, system pid)`.
-    ///
-    /// Written by [`Self::record_where_it_stopped`] from `GetLastEventInformation` — on the
-    /// [`WaitOutcome::Stopped`] arm of [`Self::pump`] and nowhere else — and read by
-    /// [`Self::presence_of`] to answer whether a live open's target has got where the open
-    /// promised to leave it. It exists because that call is a single **session-wide slot that
-    /// every later event overwrites**, while a live open needs a *per-target* fact: three review
-    /// rounds on [`Arrival`] each moved one defect around for want of it, since membership is too
-    /// weak — a process is registered when its create event is processed and its initial break
-    /// comes later — and the raw slot is unreadable the moment anything else has stopped.
-    ///
-    /// A **pair**, so a target is not confused with a later process that inherited its engine id
-    /// after it left; fooling that needs a pid reuse in the same instant, which is the residue
-    /// `prune_processes_that_left` already documents and lives with — but only **within** a session.
-    /// Engine ids are handed out from zero again for the next one, so across a teardown the same
-    /// pair is no coincidence at all: two `attach_process` calls to one pid on one engine produce
-    /// it. Hence cleared both where a session is replaced
-    /// ([`Self::forget_the_previous_session`]) and where one is ended ([`Self::end_session`]) —
-    /// and it was review that caught the second half missing, not this sentence, which claimed it.
-    ///
-    /// It gains at most one entry per process the engine ever stops on, and a session holds a
-    /// handful of processes, so there is nothing here to evict.
-    ///
-    /// **Per wrapper, where the fact is per client, and that is a known gap rather than a
-    /// decision.** Two `DebugEngine`s can be live around one `IDebugClient6` -- what
-    /// [`Self::from_client_interface`] is for, and what
-    /// `test_every_live_wrapper_sees_a_release_through_any_of_them` asserts -- and the target
-    /// identity was moved into a per-client registry ([`client_identities`]) precisely because a
-    /// view cached against the *session* must not be private to one wrapper. This is such a view
-    /// and is still a field. So a `wait_for_event` through wrapper B that pumps wrapper A's held
-    /// target to its initial break records it in B alone: A then reads [`Presence::Listed`], waits
-    /// again, and gets an unrelated event or `E_UNEXPECTED`. [`InterruptHandle`]'s flag has the
-    /// mirror of it.
-    ///
-    /// Not reachable through either consumer as they stand -- the extension wraps a borrowed
-    /// client for pool commands and never opens a target, so it never holds a guard, and
-    /// windbg-mcp runs one engine per worker process -- which is why this is written down rather
-    /// than fixed inside the change that introduced it. Fixing it is one `Arc<ClientState>` per
-    /// client holding both this and the interrupt flag, looked up by client pointer; a `Weak` map
-    /// would handle pointer reuse for free, where the identity registry needs `reissue_identity`
-    /// to. It is worth doing on its own, with its own review: it moves interrupt provenance that
-    /// four command paths read to decide whether a break was asked for.
-    stopped_on: Mutex<std::collections::BTreeSet<(u32, u32)>>,
 }
 
 impl Default for DebugEngine {
@@ -1972,6 +2151,9 @@ impl DebugEngine {
             .cast::<IDebugSymbols3>()
             .expect("[-] Failed to get debug symbols interface");
 
+        // Taken before `client` moves into the struct below, and shared with every other wrapper
+        // around this same client: see `ClientState`.
+        let state = state_for(&client);
         Self {
             client,
             control,
@@ -1981,9 +2163,8 @@ impl DebugEngine {
             // go through here, and only `new()` (which calls `DebugCreate`) sets this.
             owns_session: false,
             deferred_inputs: Mutex::new(Vec::new()),
-            break_scope: Arc::new(Mutex::new(BreakScope::default())),
+            state,
             attached_processes: Mutex::new(std::collections::HashSet::new()),
-            stopped_on: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -2007,6 +2188,7 @@ impl DebugEngine {
                 operation: "querying IDebugSymbols3".into(),
                 source,
             })?;
+        let state = state_for(&client);
         Ok(Self {
             client,
             control,
@@ -2014,9 +2196,8 @@ impl DebugEngine {
             symbols,
             owns_session: false,
             deferred_inputs: Mutex::new(Vec::new()),
-            break_scope: Arc::new(Mutex::new(BreakScope::default())),
+            state,
             attached_processes: Mutex::new(std::collections::HashSet::new()),
-            stopped_on: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -2028,7 +2209,7 @@ impl DebugEngine {
     pub fn interrupt_handle(&self) -> InterruptHandle {
         InterruptHandle {
             control: self.control.clone(),
-            scope: Arc::clone(&self.break_scope),
+            state: Arc::clone(&self.state),
         }
     }
 
@@ -2047,7 +2228,8 @@ impl DebugEngine {
     /// request as it opened.
     fn begin_operation(&self) -> Operation<'_> {
         let id = self
-            .break_scope
+            .state
+            .breaks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .begin();
@@ -2707,13 +2889,13 @@ impl DebugEngine {
     ///   the wait (measured: `Err(0x80070002)` after 13ms, no debuggee behind it, and a further
     ///   wait answering `E_UNEXPECTED` in 37µs), so propagating is what keeps this from turning a
     ///   fast, accurate failure into a half-minute of pumping a session that has nothing in it.
-    fn wait_for_live_target(&self, arrival: &Arrival) -> Result<(), DbgEngError> {
+    fn wait_for_live_target(&self, registered: &Registered<'_>) -> Result<(), DbgEngError> {
         // One operation for the whole loop, not one per pump: `LIVE_WAIT_MS` bounds the open and
         // not each wait, so a break a host asks for anywhere inside it belongs to the open.
         //
         // This is the path #135 half A cost the most. The clear that used to stand here could wipe
         // a request that had been lodged and not yet delivered, and the synthetic Ctrl+Break that
-        // then arrived was recorded in `stopped_on` as a target's initial break -- so a guard's
+        // then arrived was recorded as a target's initial break -- so a guard's
         // `wait()` answered `Ok` for a process that never reached one, and the false entry lasted
         // the session. There is no clear now, and a request names this operation.
         let operation = self.begin_operation();
@@ -2725,7 +2907,7 @@ impl DebugEngine {
         // observed it.
         let mut asked_to_stop = false;
         loop {
-            let presence = self.presence_of(arrival);
+            let presence = self.presence_of(registered);
             match presence {
                 Presence::Arrived => return Ok(()),
                 Presence::Unknown if waited => return Ok(()),
@@ -2782,13 +2964,14 @@ impl DebugEngine {
     /// target has to have **stopped**, which is what `sxe ibp` armed and what the doc comments on
     /// both openers say they wait for.
     ///
-    /// **It is asked of [`Self::stopped_on`] and not of the last event**, which is the whole of
-    /// what three rounds of review on this predicate settled. `GetLastEventInformation` is a single
-    /// session-wide slot that every later event overwrites, so read directly it answers "not this
-    /// target" for a target still on its way *and* for one that stopped before this guard was
-    /// waited on — and every rule that tried to tell those apart from the reading alone moved the
-    /// defect somewhere else. The record is per target and does not decay, so the question becomes
-    /// a plain one: has this engine ever stopped on this process.
+    /// **It is asked of the open's own register entry and not of the last event**, which is the
+    /// whole of what three rounds of review on this predicate settled. `GetLastEventInformation` is
+    /// a single session-wide slot that every later event overwrites, so read directly it answers
+    /// "not this target" for a target still on its way *and* for one that stopped before this guard
+    /// was waited on -- and every rule that tried to tell those apart from the reading alone moved
+    /// the defect somewhere else. Since stage 3 the pump **delivers** a stop to the open that wants
+    /// it ([`Arrivals::deliver`]), so the question here is a plain one: has anything been delivered
+    /// to this open.
     ///
     /// **The three answers are three states, not a boolean with excuses**, and the middle one is
     /// what keeps the strictness from becoming a lie of its own. [`Presence::Listed`] is a target
@@ -2798,11 +2981,11 @@ impl DebugEngine {
     /// Every failure to *ask* answers [`Presence::Unknown`] rather than [`Presence::Absent`],
     /// which is the difference between a wait that ends where it always did and one that pumps an
     /// engine holding nothing until it faults.
-    fn presence_of(&self, arrival: &Arrival) -> Presence {
+    fn presence_of(&self, registered: &Registered<'_>) -> Presence {
         match self.has_target() {
             Ok(true) => {}
             // Asked, and answered: an engine holding no debuggee at all holds nothing this open
-            // was waiting for. That is knowledge, so it is `Absent` — the reverse of the mistake
+            // was waiting for. That is knowledge, so it is `Absent` -- the reverse of the mistake
             // docs/unknown-not-absent.md is about, and the same reading `attach_kernel`'s tail
             // already treats as a timeout rather than as a question it could not put.
             Ok(false) => return Presence::Absent,
@@ -2811,32 +2994,21 @@ impl DebugEngine {
         let Ok(held) = self.session_processes() else {
             return Presence::Unknown;
         };
-        let ours = match arrival {
-            Arrival::Attached(pid) => held.iter().find(|(_, held)| held == pid),
-            // Nothing to eliminate against, so nothing can be concluded.
-            Arrival::Launched(None) => return Presence::Unknown,
-            Arrival::Launched(Some(before)) => {
-                let attached = self
-                    .attached_processes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                held.iter()
-                    .find(|entry| !before.contains(entry) && !attached.contains(&entry.1))
-            }
-        };
-        let Some(entry) = ours else {
-            return Presence::Absent;
-        };
-        if self
-            .stopped_on
+        let attached = self.attached_pids();
+        self.state
+            .arrivals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(entry)
-        {
-            Presence::Arrived
-        } else {
-            Presence::Listed
-        }
+            .presence(registered.id, &held, &attached)
+    }
+
+    /// A copy of the pids this engine attached to, taken rather than borrowed so that no lock is
+    /// held across the arrival register's.
+    fn attached_pids(&self) -> HashSet<u32> {
+        self.attached_processes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The **engine** process id the engine's last event belongs to.
@@ -3223,32 +3395,41 @@ impl DebugEngine {
         })
     }
 
-    /// Records which process the engine has just stopped on, for [`Self::stopped_on`], and answers
-    /// which that was.
+    /// Delivers this stop to the open that was waiting for it, and answers which process it was.
     ///
     /// **Reached from [`WaitOutcome::Stopped`]'s arm and nowhere else**, which is the point of the
-    /// arm: the two ways a wait comes back having stopped on nothing — an expiry, and a break of
-    /// either origin — are other variants of the same value, so there is no gate here to forget.
+    /// arm: the two ways a wait comes back having stopped on nothing -- an expiry, and a break of
+    /// either origin -- are other variants of the same value, so there is no gate here to forget.
     /// Nine of #133's twenty-two findings were that gate being added one writer at a time.
     ///
-    /// **On every wait, whoever made it**, because the fact it preserves is destroyed by the *next*
-    /// wait from any source: a caller driving the engine itself — the documented way to complete a
-    /// target whose guard was dropped — must leave the same record behind as
-    /// [`Self::wait_for_live_target`]'s own pumping, or a guard waited afterwards reads its own
-    /// arrival as a target still coming.
+    /// **Delivered, where this used to broadcast** (dbgscope#136 stage 3). It wrote into an
+    /// engine-wide set of every process the engine had ever stopped on, which every guard then
+    /// polled; that set outlived the opens that read it, so it needed pruning for pid reuse and
+    /// clearing at two teardowns, each of which arrived as a review finding. Now the stop goes to
+    /// the one open that wants it and to nothing else, and there is no record left over to go
+    /// stale.
+    ///
+    /// **On every wait, whoever made it**, because the fact it carries is destroyed by the *next*
+    /// wait from any source: a caller driving the engine itself -- the documented way to complete a
+    /// target whose guard is still held -- must deliver as [`Self::wait_for_live_target`]'s own
+    /// pumping does, or that guard reads its own arrival as a target still coming. Since the
+    /// register is per **client** rather than per wrapper, that now holds through a second
+    /// `DebugEngine` around the same session as well.
     ///
     /// Best-effort: an engine with no event to name, a dump, an event belonging to no process this
-    /// session lists. Every one of those is "nothing to add" rather than a failure, and this is on
-    /// the path of every wait in the crate, so none of them may fail one.
+    /// session lists. Every one of those is "nothing to deliver" rather than a failure, and this is
+    /// on the path of every wait in the crate, so none of them may fail one.
     fn record_where_it_stopped(&self) -> Option<(u32, u32)> {
         let (Ok(id), Ok(held)) = (self.last_event_process(), self.session_processes()) else {
             return None;
         };
         let entry = held.into_iter().find(|(held, _)| *held == id)?;
-        self.stopped_on
+        let attached = self.attached_pids();
+        self.state
+            .arrivals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(entry);
+            .deliver(entry, &attached);
         Some(entry)
     }
 
@@ -4949,10 +5130,7 @@ impl DebugEngine {
         // returns. With the initial-breakpoint filter enabled above, that wait stops at
         // the loader breakpoint.
         self.retain_deferred_input(TargetInput::Wide(wide));
-        Ok(PendingTarget::new(
-            self,
-            WaitKind::Live(Arrival::Launched(before)),
-        ))
+        Ok(PendingTarget::live(self, Arrival::Launched(before)))
     }
 
     /// Attaches to an existing user-mode process by PID and waits for the break-in,
@@ -4979,10 +5157,7 @@ impl DebugEngine {
         self.prune_processes_that_left();
         self.claim_attached(pid);
         // The attach completes during `WaitForEvent`, which breaks the target in.
-        Ok(PendingTarget::new(
-            self,
-            WaitKind::Live(Arrival::Attached(pid)),
-        ))
+        Ok(PendingTarget::live(self, Arrival::Attached(pid)))
     }
 
     /// Opens a crash dump (`.dmp`) or a Time Travel Debugging trace (`.run`).
@@ -5054,21 +5229,19 @@ impl DebugEngine {
     /// a launched process outliving its session — a stray process, where the bug this whole path
     /// exists for was killing somebody else's. Handle lifetimes across four teardown paths are a
     /// worse risk than that.
-    /// **[`Self::stopped_on`] is pruned here too, and its reuse hazard is the sharper one.** An
-    /// entry is a `(engine id, pid)` *pair*, so a stale one is only ever matched when both numbers
-    /// come back together — which sounds like a coincidence and is instead the ordinary shape of
-    /// detaching a process and attaching to it again: measured on this engine, detaching engine id
-    /// 0 and attaching another process hands the freed 0 straight back. So a session that
-    /// `.detach`es one of its processes through the raw hatch and reattaches the same pid gets the
-    /// old pair, and `presence_of` answers `Arrived` for a target whose initial breakpoint has not
-    /// happened — the postcondition this whole path exists to hold. Pruning cannot cost anything
-    /// it should keep, because the only entries it drops are ones no lookup could legitimately
-    /// match: `presence_of` reads the record for a process it has already found in the session.
+    /// **It used to prune the arrival record too, and no longer has one to prune.** That record
+    /// was an engine-wide set of `(engine id, system pid)` pairs, and a stale pair was matched
+    /// whenever both numbers came back together -- which sounds like a coincidence and was instead
+    /// the ordinary shape of detaching a process and attaching to it again: measured on this
+    /// engine, detaching engine id 0 and attaching another process hands the freed 0 straight
+    /// back, so `presence_of` answered `Arrived` for a target whose initial breakpoint had not
+    /// happened. Since dbgscope#136 stage 3 an arrival is *delivered* to a registered open rather
+    /// than broadcast into a set, and an entry dies with the guard that made it, so there is no
+    /// record for a reused pair to match and nothing here to prune. Only the attachment half is
+    /// left, and it is about the teardown decision rather than about an open.
     ///
-    /// Here rather than at the departure, because there is nowhere else to put it — a `.detach`
-    /// arrives as raw command text — and nowhere else it needs to be: nothing reads either record
-    /// outside an open, and both openers prune before they wait.
-    ///
+    /// Here rather than at the departure, because there is nowhere else to put it -- a `.detach`
+    /// arrives as raw command text -- and nowhere else it needs to be.
     fn prune_processes_that_left(&self) {
         let Ok(held) = self.session_processes() else {
             return;
@@ -5077,32 +5250,31 @@ impl DebugEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|pid| held.iter().any(|(_, held)| held == pid));
-        self.stopped_on
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|entry| held.contains(entry));
     }
 
-    /// Forgets every recorded attach, and every process this engine had stopped on.
+    /// Forgets every recorded attach, and every open still waiting on the session being replaced.
     ///
-    /// Called when the session ends, and by the openers that **create** a target — a dump, a
+    /// Called when the session ends, and by the openers that **create** a target -- a dump, a
     /// trace, a kernel connection. Those replace the session outright, so a pid recorded against
     /// the previous one is stale, and the one way a stale pid could matter is the one that would
     /// hurt: the operating system reusing it for a process this engine went on to launch, which
     /// would then be detached from and survive a session that is supposed to take it.
     ///
-    /// [`Self::stopped_on`] goes with it for a plainer reason: an engine process id names a slot
-    /// in *a* session, so carrying one across would let the next session's first process inherit
-    /// an answer about a process that is gone.
+    /// The pending opens go for a narrower reason than the record they replace did. An entry
+    /// cannot outlive its guard, so nothing here is about staleness across time; what it is about
+    /// is a guard held *across* a session replacement, whose `(engine id, pid)` predicate would
+    /// otherwise be evaluated against a session it never asked about. Forgetting the entry leaves
+    /// [`Arrivals::presence`] answering [`Presence::Absent`] for it, which is the truth.
     fn forget_the_previous_session(&self) {
         self.attached_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        self.stopped_on
+        self.state
+            .arrivals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .forget_all();
     }
 
     /// Whether this engine holds a live user-mode process it **attached** to rather than
@@ -5169,27 +5341,30 @@ impl DebugEngine {
         // nothing can read them afterwards, while a session still live may still owe that read —
         // retaining a few bytes for the life of the engine beats a use-after-free.
         //
-        // `stopped_on`, because engine process ids are handed out from zero again for the next
-        // session, so a pair that outlives this one can be matched by a later process that
-        // inherited both numbers — which for two `attach_process` calls to the same pid on one
-        // engine is the ordinary case rather than a coincidence. `presence_of` would then answer
-        // `Arrived` on membership alone, which is the weaker claim this whole path exists to stop
-        // relying on. (`detach_attached_processes` already takes the attach record; this is the
-        // other half of what a session owns.)
+        // The pending opens, because an open waiting on a session that has ended is waiting for
+        // something that cannot arrive: forgetting the entry leaves `Arrivals::presence` answering
+        // `Absent` for a guard still held, which is the truth. This used to be an engine-wide
+        // record of every process the session had stopped on, and it had to be cleared here for a
+        // sharper reason -- engine process ids are handed out from zero again for the next
+        // session, so a pair that outlived this one was matched by a later process that inherited
+        // both numbers, which for two `attach_process` calls to the same pid on one engine is the
+        // ordinary case rather than a coincidence. Nothing outlives its guard any more, so what is
+        // left here is tidiness rather than a hazard. (`detach_attached_processes` already takes
+        // the attach record; this is the other half of what a session owns.)
         //
         // **The condition is `EndSession`'s own outcome and not the value this returns**, which
         // are two different facts wherever a detach fails: the `.and` above reports that failure to
         // the caller, and rightly, but a process this engine could not detach from is a process
         // left attached and running — it does not keep the session alive. Gating on the combined
         // result held both releases back on a session that had definitely gone, which for the
-        // buffers is a leak and for `stopped_on` is the stale record above, reached by a second
-        // road.
+        // buffers is a leak and for the opens is a guard left waiting on a session that has gone.
         if session_ended {
             self.release_deferred_inputs();
-            self.stopped_on
+            self.state
+                .arrivals
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .clear();
+                .forget_all();
         }
         ended
     }
@@ -5342,12 +5517,37 @@ impl Drop for DebugEngine {
 }
 
 /// Which initial-break wait completes a [`PendingTarget`].
-enum WaitKind {
-    /// User-mode launch/attach: finite `WaitForEvent`s until the target named here is in the
-    /// session.
-    Live(Arrival),
+enum WaitKind<'a> {
+    /// User-mode launch/attach: finite `WaitForEvent`s until the open registered here has been
+    /// delivered its target's stop.
+    Live(Registered<'a>),
     /// Kernel attach: the bounded INFINITE wait plus its INITIAL_BREAK bookkeeping.
     KernelBreakIn,
+}
+
+/// One open's entry in the session's arrival register, live for as long as this exists.
+///
+/// **Registered by the opener rather than by the wait**, which is what makes an outside pump able
+/// to complete a guard that is still held: [`PendingTarget`] documents driving the engine yourself
+/// as a thing to do, and until the entry exists there is nobody for a stop to be delivered to.
+///
+/// **Forgotten on drop, and that is the whole of the lifecycle** the record it replaces needed
+/// pruning, clearing and a review round each for. An entry cannot outlive the open that made it,
+/// so there is no stale arrival for a reused engine id or a reused pid to match.
+struct Registered<'a> {
+    engine: &'a DebugEngine,
+    id: ArrivalId,
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        self.engine
+            .state
+            .arrivals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget(self.id);
+    }
 }
 
 /// The user-mode process a live open is waiting to see join the session and stop.
@@ -5368,24 +5568,27 @@ enum WaitKind {
 /// hands back no pid — the process does not exist yet — while `AttachProcess` is given one. Naming
 /// the process is only half of it: what ends the wait is that process having **stopped**, which is
 /// the weaker claim membership is not — a process is registered when its create event is
-/// processed and its initial break comes later. That is what `DebugEngine::stopped_on` records,
-/// and reading it there rather than reading `GetLastEventInformation` in the moment is the part
-/// that took three rounds of review to get right: the last event is one session-wide slot, so any
-/// rule built on the reading alone answers the same way for a target still coming and for one that
-/// stopped before this guard was waited on.
+/// processed and its initial break comes later. That is what [`Arrivals`] delivers, and taking it
+/// from the pump that observed it rather than reading `GetLastEventInformation` in the moment is
+/// the part that took three rounds of review to get right: the last event is one session-wide slot,
+/// so any rule built on the reading alone answers the same way for a target still coming and for
+/// one that stopped before this guard was waited on.
 ///
-/// **The elimination is exact for opens made one after another and ambiguous for two launches
-/// pending at once**, where the first arrival is new to both snapshots and so ends both waits —
-/// including, since the ask precedes the first wait, without waiting at all. Every caller this
-/// crate has makes its opens sequentially, `PendingTarget` describes holding a guard as a way to
-/// commit bookkeeping between the two halves of *one* open, and nothing here launches twice before
-/// waiting. Two fixes for it were weighed and both cost more than the ambiguity. Telling the
-/// launches apart needs the engine to *record* which arrivals earlier waits claimed — new
-/// engine-wide state, cleared everywhere a session is replaced and pruned for pid reuse the way
-/// `prune_processes_that_left` is, where a stale claim makes a legitimate launch wait out
-/// `LIVE_WAIT_MS` and fail. Refusing overlapping launch guards contradicts the split this type
-/// exists for and gives a legitimate call a new way to fail. What is not weighed against them is
-/// a regression, since one wait taking whatever arrived was ambiguous in this case too.
+/// **The elimination used to be ambiguous for two launches pending at once**, where the first
+/// arrival is new to both snapshots and so ended both waits — including, since the ask precedes
+/// the first wait, without waiting at all. It was documented as accepted, because the fix as it
+/// then had to be built cost more than the ambiguity: telling the launches apart needed the engine
+/// to *record* which arrivals earlier waits had claimed, which meant new engine-wide state,
+/// cleared everywhere a session is replaced and pruned for pid reuse the way
+/// `prune_processes_that_left` was — and there a stale claim makes a legitimate launch wait out
+/// `LIVE_WAIT_MS` and fail.
+///
+/// dbgscope#136 stage 3 removes it, and removes that cost with it. An arrival is delivered to a
+/// registered open ([`Arrivals`]) and **claimed** by it, so the second launch is still waiting when
+/// the next one comes; and because an entry cannot outlive the guard that made it, there is no
+/// stale claim to prune or clear. The record whose lifecycle made the fix expensive was the thing
+/// the fix would have joined.
+#[derive(Debug)]
 enum Arrival {
     /// A process this engine launched: one the session did not hold when the launch was issued and
     /// that this engine did not attach to. The attach half of that is what keeps a launch and an
@@ -5399,6 +5602,7 @@ enum Arrival {
 }
 
 /// Whether the target a live open is waiting for has joined the session and stopped yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Presence {
     /// In the session, and this engine has been seen to stop on it.
     Arrived,
@@ -5485,12 +5689,24 @@ enum TargetInput {
 #[must_use = "the target was created but never waited for; call `wait()` to reach the initial break"]
 pub struct PendingTarget<'a> {
     engine: &'a DebugEngine,
-    kind: WaitKind,
+    kind: WaitKind<'a>,
 }
 
 impl<'a> PendingTarget<'a> {
-    fn new(engine: &'a DebugEngine, kind: WaitKind) -> Self {
+    fn new(engine: &'a DebugEngine, kind: WaitKind<'a>) -> Self {
         Self { engine, kind }
+    }
+
+    /// A live open, registered with the session so a pump from anywhere can deliver its target's
+    /// stop to it.
+    fn live(engine: &'a DebugEngine, arrival: Arrival) -> Self {
+        let id = engine
+            .state
+            .arrivals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register(arrival);
+        Self::new(engine, WaitKind::Live(Registered { engine, id }))
     }
 
     /// Waits for the target's initial break, completing the open.
@@ -5500,8 +5716,10 @@ impl<'a> PendingTarget<'a> {
     /// whole open rather than per wait, since a live open pumps until the event it stopped on is
     /// its own target's (see [`Arrival`]) instead of returning on the first event to arrive.
     pub fn wait(self) -> Result<(), DbgEngError> {
-        match self.kind {
-            WaitKind::Live(arrival) => self.engine.wait_for_live_target(&arrival),
+        // Borrowed rather than moved out, so the registration is forgotten when this guard drops
+        // at the end of the call -- on the error paths as much as the successful one.
+        match &self.kind {
+            WaitKind::Live(registered) => self.engine.wait_for_live_target(registered),
             WaitKind::KernelBreakIn => self.engine.wait_for_kernel_break_in(),
         }
     }
@@ -5743,6 +5961,89 @@ mod tests {
 
     use super::*;
 
+    /// **An arrival is delivered to one open, in registration order, and claimed.**
+    ///
+    /// The four rules the register exists for, asserted where they live rather than through an
+    /// engine -- so they run under Miri, and so a mutation to one fails the assertion written for
+    /// it rather than whichever end-to-end test happened to notice.
+    #[test]
+    fn test_an_arrival_is_delivered_to_one_open_and_claimed() {
+        let none = HashSet::new();
+        let mut arrivals = Arrivals::default();
+        // Two launches pending at once, both with the same empty snapshot: the ambiguity
+        // `Arrival` used to document as accepted.
+        let first = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        let second = arrivals.register(Arrival::Launched(Some(Vec::new())));
+
+        arrivals.deliver((0, 100), &none);
+        assert_eq!(
+            arrivals.presence(first, &[(0, 100)], &none),
+            Presence::Arrived,
+            "the first-registered open did not get the first arrival"
+        );
+        assert_ne!(
+            arrivals.presence(second, &[(0, 100)], &none),
+            Presence::Arrived,
+            "both launches were given one arrival, which is the ambiguity this removes"
+        );
+
+        // **A claimed process is offered to nobody**, which is a different rule from the one
+        // above: a target stops more than once in a session, and the second stop on a process
+        // already delivered must not be handed to an open waiting for a different one.
+        arrivals.deliver((0, 100), &none);
+        assert_ne!(
+            arrivals.presence(second, &[(0, 100)], &none),
+            Presence::Arrived,
+            "a repeat stop on an already-delivered process was given to the next open in line"
+        );
+
+        // The next genuine arrival is the second open's.
+        arrivals.deliver((1, 200), &none);
+        assert_eq!(
+            arrivals.presence(second, &[(0, 100), (1, 200)], &none),
+            Presence::Arrived,
+            "the second launch was not given the arrival nobody had claimed"
+        );
+
+        // An entry dies with its guard, and an id that names nothing is `Absent` -- which is what
+        // a guard held across a session replacement reads, and the whole of the lifecycle the
+        // record this replaces needed a prune and two clears for.
+        arrivals.forget(first);
+        assert_eq!(
+            arrivals.presence(first, &[(0, 100)], &none),
+            Presence::Absent,
+            "a forgotten open still answered about a process"
+        );
+    }
+
+    /// **A pending attach's process is not claimed by a pending launch**, or an open registered
+    /// first takes the arrival the other one named.
+    ///
+    /// A launch is identified by elimination, so the process an attach is waiting for is new to
+    /// the launch's snapshot and looks like the launch's own. Reading the engine's
+    /// `attached_processes` covered that and is kept, but it is per wrapper where the register is
+    /// per client -- so the register asks itself as well, which is exact and travels.
+    #[test]
+    fn test_a_pending_attach_keeps_its_process_from_a_pending_launch() {
+        let none = HashSet::new();
+        let mut arrivals = Arrivals::default();
+        // Registered first, so without the rule it would take whatever arrived.
+        let launch = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        let attach = arrivals.register(Arrival::Attached(200));
+
+        arrivals.deliver((0, 200), &none);
+        assert_ne!(
+            arrivals.presence(launch, &[(0, 200)], &none),
+            Presence::Arrived,
+            "the launch claimed the process a pending attach had named"
+        );
+        assert_eq!(
+            arrivals.presence(attach, &[(0, 200)], &none),
+            Presence::Arrived,
+            "the attach did not get its own process"
+        );
+    }
+
     /// **A request names an operation, and only that operation can be charged with it.**
     ///
     /// This is dbgscope#135 half A as a value rather than as a race. The old shape was an
@@ -5838,14 +6139,15 @@ mod tests {
         let e = DebugEngine::new();
         {
             let operation = e.begin_operation();
-            e.break_scope
+            e.state
+                .breaks
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
                 .record(operation.id);
             // Deliberately not taken: an operation that ends without reading its request is the
             // ordinary case on the paths where a break arrives too late to end anything.
         }
-        let scope = e.break_scope.lock().unwrap_or_else(|err| err.into_inner());
+        let scope = e.state.breaks.lock().unwrap_or_else(|err| err.into_inner());
         assert!(
             scope.running.is_empty() && scope.asked.is_empty(),
             "an operation that never read its request left {scope:?} for the next one"
@@ -6390,6 +6692,115 @@ mod tests {
             owner.target_identity(),
             "a wrapper that did not perform the release still has to observe it"
         );
+    }
+
+    /// **A pump through one wrapper completes an open held by another**, which is the scope half
+    /// of dbgscope#136 stage 3 and was written down as a known gap for two releases before it.
+    ///
+    /// Two `DebugEngine`s can be live around one `IDebugClient6` -- what
+    /// `from_client_interface` is for, and what the test above asserts about identity. The arrival
+    /// record was a field on each, so a `wait_for_event` through wrapper B that pumped wrapper A's
+    /// held target to its initial break recorded it in B alone: A then read `Listed`, waited again,
+    /// and spent its whole bound on an event that had already happened. That is
+    /// `examples/deferred_arrival.rs` arm F -- 29.36s against 8.6us -- undone by a wrapper
+    /// boundary rather than by a missing record.
+    ///
+    /// The construction that closes it is `ClientState`, keyed by client pointer and held by
+    /// `Arc`, so both wrappers register into and deliver from the same table.
+    ///
+    /// The assertion is on `Presence` rather than on a duration, because the duration is the
+    /// symptom and this is the mechanism: A's open is `Arrived` without A having waited at all.
+    #[cfg(not(miri))]
+    #[test]
+    fn test_a_pump_through_one_wrapper_completes_an_open_held_by_another() {
+        let _debuggee = one_debuggee();
+        let owner = DebugEngine::new();
+        let pending = owner
+            .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+
+        // A second wrapper around the *same* client, which is what an extension builds per
+        // command. It knows nothing of the guard above.
+        let borrowed = DebugEngine::from_client_interface(owner.client.clone());
+        let outcome = borrowed
+            .wait_for_event(LIVE_WAIT_MS)
+            .expect("the outside pump failed");
+        assert!(
+            matches!(outcome, WaitOutcome::Stopped { .. }),
+            "the pump that realises the launch answered {outcome:?}, so nothing was delivered"
+        );
+
+        let WaitKind::Live(registered) = &pending.kind else {
+            panic!("a launch guard is not a live open");
+        };
+        assert!(
+            matches!(owner.presence_of(registered), Presence::Arrived),
+            "a stop pumped through the second wrapper did not reach the open the first is              holding, so its wait() will spend the whole bound on an event that has happened"
+        );
+
+        drop(pending);
+        owner.end_session().expect("end_session failed");
+    }
+
+    /// **Two launches pending at once are told apart**, which [`Arrival`] used to document as an
+    /// accepted ambiguity.
+    ///
+    /// A launch is identified by elimination -- `CreateProcessWide` hands back no pid -- so with
+    /// two of them pending the first arrival is new to both snapshots and satisfied both waits.
+    /// The fix was weighed and rejected at the time because it needed "new engine-wide state,
+    /// cleared everywhere a session is replaced and pruned for pid reuse", which is exactly the
+    /// lifecycle the record it would have joined already had. A register of *pending opens* has no
+    /// such lifecycle: an arrival is **claimed** by the open it is delivered to, so the second
+    /// launch is still waiting when the next one comes.
+    ///
+    /// Asserted on the pair each open was given, which is the only thing that distinguishes them:
+    /// both waited for "a process nobody named", and they must not have been given the same one.
+    #[cfg(not(miri))]
+    #[test]
+    fn test_two_launches_pending_at_once_are_told_apart() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        let first = e
+            .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("first launch failed");
+        let second = e
+            .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.2")
+            .expect("second launch failed");
+
+        // Both spawns are deferred, so each is realised by one wait.
+        for _ in 0..2 {
+            e.wait_for_event(LIVE_WAIT_MS).expect("a pump failed");
+        }
+
+        let (WaitKind::Live(one), WaitKind::Live(two)) = (&first.kind, &second.kind) else {
+            panic!("a launch guard is not a live open");
+        };
+        let arrivals = e
+            .state
+            .arrivals
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let claimed = |id: ArrivalId| {
+            arrivals
+                .pending
+                .iter()
+                .find(|pending| pending.id == id)
+                .and_then(|pending| pending.arrived)
+        };
+        let (a, b) = (claimed(one.id), claimed(two.id));
+        assert!(
+            a.is_some() && b.is_some(),
+            "two waits realised {a:?} and {b:?}, so one launch was never delivered anything and              this says nothing about telling them apart"
+        );
+        assert_ne!(
+            a, b,
+            "both launches were given the same arrival, which is the ambiguity a register of              pending opens exists to remove"
+        );
+        drop(arrivals);
+
+        drop(first);
+        drop(second);
+        e.end_session().expect("end_session failed");
     }
 
     /// Reads a debugger pseudo-register (`$t0`, …) as a number, via `? <expr>` — whose output
@@ -7632,6 +8043,38 @@ mod tests {
     /// afterwards whether *the process the engine attached to* is still alive — and through a
     /// `cmd` the answer would be about the parent either way round.
     #[cfg(not(miri))]
+    /// Registers an open watching the one process this session holds, so a test can see whether a
+    /// wait **delivered** a stop to it.
+    ///
+    /// This is what replaced reading an engine-wide record of every process the engine had stopped
+    /// on. The old assertion was "the set is empty"; the new one is "the open waiting for this
+    /// process was not given anything", which is the same claim asked of the thing that now does
+    /// the work -- and asked through the real predicate rather than around it.
+    ///
+    /// `Arrival::Attached` because the pid is the identity a test can name. It does not attach:
+    /// nothing here touches the engine, only the register.
+    #[cfg(not(miri))]
+    fn watching_the_only_process(e: &DebugEngine) -> Registered<'_> {
+        let held = e.session_processes().expect("could not list the session");
+        let [(_, pid)] = held[..] else {
+            panic!("this session holds {held:?}, and the helper wants exactly one process");
+        };
+        registered(e, Arrival::Attached(pid))
+    }
+
+    /// Registers `what` and hands back the guard, for the tests that drive `presence_of` or
+    /// `wait_for_live_target` directly rather than through an opener.
+    #[cfg(not(miri))]
+    fn registered(e: &DebugEngine, what: Arrival) -> Registered<'_> {
+        let id = e
+            .state
+            .arrivals
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .register(what);
+        Registered { engine: e, id }
+    }
+
     fn a_process_to_attach_to() -> std::process::Child {
         std::process::Command::new("ping")
             .args(["-n", "30", "127.0.0.1"])
@@ -7960,9 +8403,9 @@ mod tests {
     ///
     /// Two phases, because they differ in what the engine's last event says at the moment of the
     /// wait: with one target it is still this one's, and with a second target arrived since it is
-    /// not. Both must pass, and that they can is the argument for `stopped_on` being a record
-    /// written as each wait observes a stop rather than a reading taken from one slot afterwards —
-    /// which is where three rounds of review on this branch ended up.
+    /// not. Both must pass, and that they can is the argument for an arrival being **delivered by
+    /// the wait that observed it** rather than read from one session-wide slot afterwards — which
+    /// is where three rounds of review on that branch ended up.
     ///
     /// The deterministic half of dbgscope#128, and the only half that is: the issue's own failure
     /// is a race that reproduces a few times in forty rounds under CPU load and never on a quiet
@@ -8007,7 +8450,7 @@ mod tests {
 
         // And again with the engine's last event no longer this target's. `GetLastEventInformation`
         // is one session-wide slot, so a second target arriving overwrites the evidence that this
-        // one ever stopped — which is why `stopped_on` records it as each wait observes it rather
+        // one ever stopped — which is why a stop is delivered by the wait that observed it rather
         // than being read back from that slot later. Measured across that record: 29.4s and
         // `E_UNEXPECTED` without it, single-digit µs with.
         let mut theirs = a_process_to_attach_to();
@@ -8035,70 +8478,26 @@ mod tests {
         let _ = theirs.wait();
     }
 
-    /// **Ending a session forgets which processes it stopped on.**
-    ///
-    /// The record is keyed by engine process id, and the next session hands those out from zero
-    /// again — so a pair that outlives a teardown is matched by whichever process inherits both
-    /// numbers, and two `attach_process` calls to the same pid on one engine produce exactly that.
-    /// `presence_of` would answer `Arrived` for the second on membership alone, which is the weaker
-    /// claim [`Arrival`] exists to stop relying on, and the window it reopens is the one between a
-    /// create event and the initial break.
-    ///
-    /// Asserted on the state rather than on that window, because the window is a race and the
-    /// state is not. The first assertion is also the only place the *write* side is pinned: a
-    /// record nothing wrote would pass every other test here by making each wait pump once more.
-    #[test]
-    #[cfg(not(miri))]
-    fn test_ending_a_session_forgets_which_processes_it_stopped_on() {
-        let _debuggee = one_debuggee();
-        let mut theirs = a_process_to_attach_to();
-        let e = DebugEngine::new();
-        e.attach_process(theirs.id()).expect("attach failed");
-        assert!(
-            !e.stopped_on
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .is_empty(),
-            "an attach that broke its target in recorded no stop"
-        );
-
-        e.end_session().expect("end_session failed");
-        assert!(
-            e.stopped_on
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .is_empty(),
-            "the session's stops outlived it, where the next session's engine ids start over"
-        );
-
-        let _ = theirs.kill();
-        let _ = theirs.wait();
-    }
-
-    /// **A stop says which process it was**, which is the half of the outcome that used to exist
-    /// only as a side effect on [`DebugEngine::stopped_on`].
+    /// **A stop says which process it was, and is delivered to the open waiting for it.**
     ///
     /// The wait here is the "outside pump" [`PendingTarget`] documents: a guard is begun and left
     /// held while somebody else drives the engine, so this `wait_for_event` is the call that
-    /// realises the deferred spawn and stops on its initial break. That makes it the one shape
-    /// where the answer is worth having in the caller's hand -- it is a wait whose stop belongs to
-    /// a target the caller did not open.
+    /// realises the deferred spawn and stops on its initial break. That makes it the shape where
+    /// delivery does the work -- the pump belongs to nobody, and the open it completes is one the
+    /// pumping caller has never heard of.
     ///
     /// Asserted against `session_processes` rather than against a literal, because the pair is two
-    /// numbers the engine hands out and neither is predictable; asserted against the record as
-    /// well, because the value and the record are one read and must not be able to disagree.
+    /// numbers the engine hands out and neither is predictable; and against the register as well,
+    /// because the value the pump answers and the delivery it makes are one read and must not be
+    /// able to disagree.
     #[test]
     #[cfg(not(miri))]
     fn test_a_stop_says_which_process_it_stopped_on() {
         let _debuggee = one_debuggee();
         let e = DebugEngine::new();
-        let _pending = e
+        let pending = e
             .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.1")
             .expect("launch failed");
-        e.stopped_on
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clear();
 
         let outcome = e
             .wait_for_event(LIVE_WAIT_MS)
@@ -8112,14 +8511,15 @@ mod tests {
             held,
             "the stop named {process:?}, which is not the one process this session holds"
         );
+        let WaitKind::Live(registered) = &pending.kind else {
+            panic!("a launch guard is not a live open");
+        };
         assert!(
-            e.stopped_on
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .contains(&process.expect("the stop named no process")),
-            "the pair the outcome answered is not the pair it recorded"
+            matches!(e.presence_of(registered), Presence::Arrived),
+            "the stop was not delivered to the open that was waiting for it, so its `wait()`              would pump again for an event that has already happened"
         );
 
+        drop(pending);
         e.end_session().expect("end_session failed");
     }
 
@@ -8178,10 +8578,7 @@ mod tests {
         // leaves a `ping` grandchild running for the rest of its thirty seconds.
         e.launch_process("ping.exe -n 30 127.0.0.1")
             .expect("launch failed");
-        e.stopped_on
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clear();
+        let watcher = watching_the_only_process(&e);
 
         let outcome = e
             .wait_for_event(300)
@@ -8192,11 +8589,8 @@ mod tests {
             "a wait with nothing to report answered {outcome:?}, so the bound did not expire and              nothing here is under test"
         );
         assert!(
-            e.stopped_on
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .is_empty(),
-            "a wait that stopped on nothing recorded a stop, from the event before it"
+            !matches!(e.presence_of(&watcher), Presence::Arrived),
+            "a wait that stopped on nothing delivered a stop to an open waiting for one"
         );
     }
 
@@ -8213,10 +8607,7 @@ mod tests {
         let e = DebugEngine::new();
         e.launch_process("ping.exe -n 30 127.0.0.1")
             .expect("launch failed");
-        e.stopped_on
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clear();
+        let watcher = watching_the_only_process(&e);
 
         let handle = e.interrupt_handle();
         let asked = std::thread::spawn(move || {
@@ -8235,11 +8626,8 @@ mod tests {
             run.cut_short
         );
         assert!(
-            e.stopped_on
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .is_empty(),
-            "a break a host asked for was recorded as the target arriving"
+            !matches!(e.presence_of(&watcher), Presence::Arrived),
+            "a break a host asked for was delivered as the target arriving"
         );
     }
 
@@ -8281,7 +8669,7 @@ mod tests {
             "the run ended as {:?}, so its watchdog never raised the flag under test",
             run.outcome
         );
-        let scope = e.break_scope.lock().unwrap_or_else(|err| err.into_inner());
+        let scope = e.state.breaks.lock().unwrap_or_else(|err| err.into_inner());
         assert!(
             scope.running.is_empty() && scope.asked.is_empty(),
             "a timed-out run left {scope:?} behind, so the next operation inherits it"
@@ -8322,7 +8710,10 @@ mod tests {
             .max()
             .unwrap_or(4)
             + 1000;
-        let outcome = e.wait_for_live_target(&Arrival::Attached(absent));
+        // Registered directly, because this test drives the wait rather than an opener: nothing
+        // is attached to `absent` and nothing will be.
+        let waiting = registered(&e, Arrival::Attached(absent));
+        let outcome = e.wait_for_live_target(&waiting);
         asked.join().expect("interrupting thread panicked").ok();
 
         assert!(
@@ -8351,10 +8742,7 @@ mod tests {
         let e = DebugEngine::new();
         e.launch_process("ping.exe -n 30 127.0.0.1")
             .expect("launch failed");
-        e.stopped_on
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clear();
+        let watcher = watching_the_only_process(&e);
 
         unsafe { e.control.SetExecutionStatus(DEBUG_STATUS_GO) }.expect("could not set it running");
         let handle = e.interrupt_handle();
@@ -8378,31 +8766,33 @@ mod tests {
             "the target is not stopped, so no break landed and nothing here is under test"
         );
         assert!(
-            e.stopped_on
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .is_empty(),
-            "a break a host asked for was recorded as an arrival by the finite wait"
+            !matches!(e.presence_of(&watcher), Presence::Arrived),
+            "a break a host asked for was delivered as an arrival by the finite wait"
         );
     }
 
-    /// **A process that left takes its stop with it**, or the pair outlives it and the next
-    /// process to inherit both numbers inherits the answer.
+    /// **Reclaiming a departed process's engine id does not reclaim its arrival**, which used to
+    /// be a hazard with a prune to guard it and is now a property of the shape.
     ///
     /// Engine ids are reused immediately: measured on this engine, detaching engine id 0 and
-    /// attaching another process hands the freed 0 straight back. A `(engine id, pid)` pair
-    /// therefore comes back whole whenever a session detaches a process through the raw hatch and
-    /// attaches to it again -- and `presence_of` would answer `Arrived` for a target whose initial
-    /// breakpoint had not happened.
+    /// attaching another process hands the freed 0 straight back. When arrivals were an
+    /// engine-wide set of `(engine id, pid)` pairs, a session that detached a process through the
+    /// raw hatch and attached the same pid again got the whole pair back, and `presence_of`
+    /// answered `Arrived` for a target whose initial breakpoint had not happened -- the
+    /// postcondition the live open exists to hold. `prune_processes_that_left` was the guard, and
+    /// it was review that put it there.
     ///
-    /// The second process is what makes this a *detach* rather than a teardown: it keeps the
-    /// session alive, so nothing else clears the record. Asserted between the open and its wait,
-    /// because that is where the prune runs and where the stale pair would still be readable --
-    /// after the wait the reattached process records the same pair legitimately, and the two are
-    /// indistinguishable.
+    /// **The construction that makes it unreachable** is that an arrival is delivered to a
+    /// registered open rather than broadcast into a set: an entry cannot outlive the guard that
+    /// made it, so the reattach's open starts with nothing delivered to it whatever numbers it
+    /// inherits. There is no record left to prune, and the prune's arrival half is gone with it.
+    ///
+    /// Kept as an end-to-end statement of that rather than deleted, since it costs one attach: the
+    /// second process is what makes this a *detach* rather than a teardown, so nothing else could
+    /// have cleared a record even if there were one.
     #[test]
     #[cfg(not(miri))]
-    fn test_a_process_that_left_takes_its_stop_with_it() {
+    fn test_reclaiming_an_engine_id_does_not_reclaim_its_arrival() {
         let _debuggee = one_debuggee();
         let mut leaves = a_process_to_attach_to();
         let mut stays = a_process_to_attach_to();
@@ -8419,23 +8809,16 @@ mod tests {
             e.execute_command(&format!("|{id}s"))
                 .expect("could not select the process to detach");
             e.execute_command(".detach").expect("could not detach it");
-            assert!(
-                e.stopped_on
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .contains(&(id, leaves.id())),
-                "the detached process was never recorded, so nothing here is under test"
-            );
 
             let guard = e
                 .attach_process_begin(leaves.id())
                 .expect("reattach failed");
+            let WaitKind::Live(registered) = &guard.kind else {
+                panic!("an attach guard is not a live open");
+            };
             assert!(
-                !e.stopped_on
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .contains(&(id, leaves.id())),
-                "the departed process's stop survived the open that reclaimed its engine id"
+                !matches!(e.presence_of(registered), Presence::Arrived),
+                "the reattach's open was arrived before its wait, so it inherited an answer about                  the process that left"
             );
             guard.wait().expect("the reattach should complete");
         }
@@ -8465,10 +8848,7 @@ mod tests {
         // leaves a `ping` grandchild running for the rest of its thirty seconds.
         e.launch_process("ping.exe -n 30 127.0.0.1")
             .expect("launch failed");
-        e.stopped_on
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clear();
+        let watcher = watching_the_only_process(&e);
 
         let run = e.execute_and_wait("g", 300).expect("the go should return");
         assert!(
@@ -8477,11 +8857,8 @@ mod tests {
             run.cut_short
         );
         assert!(
-            e.stopped_on
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .is_empty(),
-            "the watchdog's own Ctrl+Break was recorded as the target arriving"
+            !matches!(e.presence_of(&watcher), Presence::Arrived),
+            "the watchdog's own Ctrl+Break was delivered as the target arriving"
         );
     }
 
@@ -8500,11 +8877,17 @@ mod tests {
         let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         assert!(
-            matches!(e.presence_of(&Arrival::Attached(4)), Presence::Absent),
+            matches!(
+                e.presence_of(&registered(&e, Arrival::Attached(4))),
+                Presence::Absent
+            ),
             "an engine with no debuggee could not say an attached pid was missing"
         );
         assert!(
-            matches!(e.presence_of(&Arrival::Launched(None)), Presence::Absent),
+            matches!(
+                e.presence_of(&registered(&e, Arrival::Launched(None))),
+                Presence::Absent
+            ),
             "an engine with no debuggee deferred to the launch snapshot it does not have"
         );
     }
