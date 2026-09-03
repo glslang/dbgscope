@@ -58,6 +58,45 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **An arrival is delivered to the open waiting for it, instead of broadcast into a set every
+  guard polls.** An opener registers what it is waiting for (`Registered`), the pump routes a stop
+  to the first open that wants it and has nothing yet (`Arrivals`), and the entry dies with its
+  guard. Stage 3 of [#136](https://github.com/glslang/dbgscope/issues/136).
+
+  What it replaces, `stopped_on`, was an engine-wide set of every `(engine id, system pid)` the
+  engine had ever stopped on. Because it outlived the opens that read it, it needed a lifecycle of
+  its own — pruned at both openers for pid reuse, cleared where a session is replaced, and cleared
+  again where one is ended — and each of those three arrived as a review finding on
+  [#133](https://github.com/glslang/dbgscope/pull/133) rather than as a design. None of them is
+  needed now: nothing outlives its reader, so nothing can go stale.
+  `prune_processes_that_left` is down to the attachment record, which is about the teardown
+  decision rather than about an open.
+
+  **Two launches pending at once are told apart**, which `Arrival` documented as an accepted
+  ambiguity: a launch is identified by elimination, so the first arrival was new to both snapshots
+  and ended both waits. An arrival is now *claimed* by the open it is delivered to, so the second
+  launch is still waiting when the next one comes. That fix was weighed and rejected at the time
+  because it needed "new engine-wide state, cleared everywhere a session is replaced and pruned for
+  pid reuse" — which was the cost of the record it would have joined, and is the cost this shape
+  does not have.
+
+  **The state is per client rather than per wrapper**, in a new `ClientState` held by `Arc` and
+  keyed by client pointer in a `Weak` map. Two `DebugEngine`s can be live around one
+  `IDebugClient6`, and a `wait_for_event` through one used to complete an open held by the other in
+  its own copy of the record alone — the other then read `Listed`, waited again, and spent its whole
+  bound on an event that had already happened. That was written down as a known gap for two
+  releases; the interrupt scope from stage 2 had the mirror of it and moves into the same `Arc`,
+  because it is the same field. A `Weak` map needs no equivalent of `reissue_identity`: a dead entry
+  identifies itself, where a stale *identity* costs only a re-read and a stale *arrival* would
+  answer `Arrived` for a target that never stopped.
+
+  No public API changes. Two tests are gone rather than passing, and the constructions that make
+  them unreachable are named where they were:
+  `test_ending_a_session_forgets_which_processes_it_stopped_on` had no record to forget, and
+  `test_a_process_that_left_takes_its_stop_with_it` is now
+  `test_reclaiming_an_engine_id_does_not_reclaim_its_arrival`, which asserts the property
+  end to end instead of the guard that used to hold it.
+
 - **A break request names the operation it is for.** `InterruptHandle::interrupt` answers a
   `BreakRequest` — `Raised { operation }` or `NothingRunning` — instead of `Result<(), _>`, and
   files the request against the bounded operation the engine is running **under the same lock it

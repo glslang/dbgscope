@@ -31,7 +31,8 @@
 //!   µs after. Arm H is the same guard with a *second* target arrived since, which overwrites the
 //!   engine's one slot recording where it stopped — 29.4s and `E_UNEXPECTED` when the ask reads
 //!   that slot, µs when it reads a record written as each wait observed a stop. That is the
-//!   argument for `stopped_on` being a record rather than a reading.
+//!   argument for an arrival being delivered by the wait that observed it rather than read back
+//!   from that slot afterwards.
 //! - **The two endings of an open cannot meet** (arm I). An expired finite wait really is `Ok` —
 //!   `S_FALSE`, which the wrapper flattens (300ms bound, returned at 311ms) — so a wait that
 //!   expires while the engine holds nothing would end an open successfully with no debuggee. It
