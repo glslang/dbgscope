@@ -377,6 +377,38 @@ struct ClientState {
     arrivals: Mutex<Arrivals>,
     /// Which bounded operations are running, and which of them a host has asked to break.
     breaks: Mutex<BreakScope>,
+    /// The system pids of live user-mode processes this session **attached** to rather than
+    /// created — the ones ending it must let go of rather than take with it.
+    ///
+    /// Read by [`DebugEngine::end_session`] and by `Drop`, which is why it lives with the session
+    /// rather than being passed in at teardown: a caller can end a session explicitly, but nothing
+    /// gets to say anything when the engine is simply dropped, and a process this crate did not
+    /// create should survive either ending.
+    ///
+    /// **A set of pids rather than a flag about the session**, which two rounds of review argued
+    /// its way to and is worth keeping in one piece. DbgEng holds **several** user-mode processes
+    /// in one session — `|` lists them, and says `attach` or `create` against each — so a session
+    /// can be attached to somebody's service *and* have launched a program of its own, and a
+    /// session-wide answer is wrong for one of them whichever way it goes. Provenance is per
+    /// process because the fact is.
+    ///
+    /// **Recorded by the opener rather than asked of DbgEng.** `|` knows, but that is text; the
+    /// API does not expose it (`GetDebuggeeType` answers `DEBUG_CLASS_USER_WINDOWS` /
+    /// `DEBUG_USER_WINDOWS_PROCESS` for a launch and an attach alike), and parsing a debugger's
+    /// human output to decide whether to kill somebody's process is not a thing to build.
+    ///
+    /// **Per client, where it used to be per wrapper**, and the sentence that used to defend the
+    /// old placement was arguing against the wrong thing. It said sharing this would put the
+    /// crate's most consequential decision "behind an eviction policy" — true of
+    /// [`client_identities`], which is a cache with a cap, and not of [`ClientState`], where an
+    /// entry is `Weak` and dies with the last wrapper holding it. What the old placement actually
+    /// cost is two things this stage had to fix anyway. Delivery reads it to keep an attach's
+    /// process from being claimed by a pending launch, and a pump through a second wrapper read an
+    /// empty set (raised in review on dbgscope#139). And an `end_session` through a wrapper that
+    /// did not perform the attach saw no attachment to detach, so its passive end **killed**
+    /// somebody else's process — the exact failure this record exists to prevent, reached through
+    /// the wrapper boundary. Which processes a session attached to is a property of the session.
+    attached_processes: Mutex<HashSet<u32>>,
 }
 
 /// Every client this process has live state for, keyed by COM pointer.
@@ -450,6 +482,9 @@ struct Pending {
     what: Arrival,
     /// The process delivered to this open, once one has been.
     arrived: Option<(u32, u32)>,
+    /// Processes another open was given before it finished, which this one must not be given now
+    /// that the record of that claim has gone with its guard. See [`Arrivals::forget`].
+    inherited: Vec<(u32, u32)>,
 }
 
 impl Pending {
@@ -465,6 +500,9 @@ impl Pending {
     /// it also covers an attach whose guard has been dropped, whose process joins the session with
     /// no registration left to name it.
     fn wants(&self, entry: (u32, u32), others: &[&Pending], attached: &HashSet<u32>) -> bool {
+        if self.inherited.contains(&entry) {
+            return false;
+        }
         match &self.what {
             Arrival::Attached(pid) => entry.1 == *pid,
             // Nothing to eliminate against, so nothing can be concluded — and in particular this
@@ -490,13 +528,34 @@ impl Arrivals {
             id,
             what,
             arrived: None,
+            inherited: Vec::new(),
         });
         id
     }
 
-    /// Forgets an open, when its guard is dropped.
+    /// Forgets an open, when its guard is dropped — **handing its claim to the opens still
+    /// waiting**.
+    ///
+    /// A claim has to outlive the entry that made it, and that is not a lifecycle creeping back
+    /// in: it is inherited by the opens that exist *now* and goes when they do, where the record
+    /// this replaced lived for the whole session. Without it, two overlapping launches come apart
+    /// again the moment the first guard is consumed — its target's *next* genuine stop is then
+    /// claimed by nobody, is absent from the second launch's snapshot because it did not exist
+    /// when that snapshot was taken, and is delivered to the second launch, whose `wait()` returns
+    /// `Ok` for a process that never stopped. Raised in review on dbgscope#139; the ambiguity this
+    /// stage closes was otherwise closed only while both guards were held.
     fn forget(&mut self, id: ArrivalId) {
+        let claimed = self
+            .pending
+            .iter()
+            .find(|pending| pending.id == id)
+            .and_then(|pending| pending.arrived);
         self.pending.retain(|pending| pending.id != id);
+        if let Some(entry) = claimed {
+            for pending in &mut self.pending {
+                pending.inherited.push(entry);
+            }
+        }
     }
 
     /// Forgets every open, when the session they were waiting on is replaced.
@@ -1981,37 +2040,6 @@ pub struct DebugEngine {
     /// is for, so there is nothing for a later one to be charged with and nothing for an earlier
     /// one to erase.
     state: Arc<ClientState>,
-    /// The system pids of live user-mode processes this engine **attached** to rather than
-    /// created — the ones ending the session must let go of rather than take with it.
-    ///
-    /// Read by [`Self::end_session`] and by `Drop`, which is why it lives here rather than being
-    /// passed in at teardown: a caller can end a session explicitly, but nothing gets to say
-    /// anything when the engine is simply dropped, and a process this crate did not create should
-    /// survive either ending. It is the same asymmetry [`Self::resume_and_detach_live_kernel`]
-    /// exists for, on the target type that had never been given it.
-    ///
-    /// **A set of pids rather than a flag about the session**, which two rounds of review argued
-    /// its way to and is worth keeping in one piece. DbgEng holds **several** user-mode processes
-    /// in one session — `|` lists them, and says `attach` or `create` against each — so an engine
-    /// can be attached to somebody's service *and* have launched a program of its own, and a
-    /// session-wide answer is wrong for one of them whichever way it goes. Provenance is per
-    /// process because the fact is.
-    ///
-    /// **Recorded by the opener rather than asked of DbgEng.** `|` knows, but that is text; the
-    /// API does not expose it (`GetDebuggeeType` answers `DEBUG_CLASS_USER_WINDOWS` /
-    /// `DEBUG_USER_WINDOWS_PROCESS` for a launch and an attach alike), and parsing a debugger's
-    /// human output to decide whether to kill somebody's process is not a thing to build.
-    ///
-    /// **Per wrapper, not per client**, which is a deliberate difference from the target identity
-    /// beside it and was raised in review as a defect. Two wrappers around one `IDebugClient6`
-    /// would not see each other's attachments — true, and it is the same for `deferred_inputs`,
-    /// because a session belongs to the wrapper that opened it. The identity registry is keyed by
-    /// client for a reason that does not transfer: it is a **cache tag**, so losing one costs a
-    /// re-read, and that is what lets it have a cap and evict. Losing an attachment kills
-    /// somebody's process. Sharing this the same way would put the crate's most consequential
-    /// decision behind an eviction policy, to serve an arrangement nothing here makes — the
-    /// extension's borrowed wrapper never attaches and never ends a session.
-    attached_processes: Mutex<std::collections::HashSet<u32>>,
 }
 
 impl Default for DebugEngine {
@@ -2164,7 +2192,6 @@ impl DebugEngine {
             owns_session: false,
             deferred_inputs: Mutex::new(Vec::new()),
             state,
-            attached_processes: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -2197,7 +2224,6 @@ impl DebugEngine {
             owns_session: false,
             deferred_inputs: Mutex::new(Vec::new()),
             state,
-            attached_processes: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -3005,7 +3031,8 @@ impl DebugEngine {
     /// A copy of the pids this engine attached to, taken rather than borrowed so that no lock is
     /// held across the arrival register's.
     fn attached_pids(&self) -> HashSet<u32> {
-        self.attached_processes
+        self.state
+            .attached_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -5199,7 +5226,8 @@ impl DebugEngine {
     /// Records that `pid` is a process this engine attached to, so the teardown detaches from it
     /// instead of taking it.
     fn claim_attached(&self, pid: u32) {
-        self.attached_processes
+        self.state
+            .attached_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(pid);
@@ -5246,7 +5274,8 @@ impl DebugEngine {
         let Ok(held) = self.session_processes() else {
             return;
         };
-        self.attached_processes
+        self.state
+            .attached_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|pid| held.iter().any(|(_, held)| held == pid));
@@ -5266,7 +5295,8 @@ impl DebugEngine {
     /// otherwise be evaluated against a session it never asked about. Forgetting the entry leaves
     /// [`Arrivals::presence`] answering [`Presence::Absent`] for it, which is the truth.
     fn forget_the_previous_session(&self) {
-        self.attached_processes
+        self.state
+            .attached_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -5289,6 +5319,7 @@ impl DebugEngine {
     /// would say "detached and left running" about a session that launched and killed one.
     pub fn attached_to_a_live_process(&self) -> bool {
         let attached = self
+            .state
             .attached_processes
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -5405,6 +5436,7 @@ impl DebugEngine {
     fn detach_attached_processes(&self) -> Result<(), DbgEngError> {
         let attached = std::mem::take(
             &mut *self
+                .state
                 .attached_processes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
@@ -6013,6 +6045,49 @@ mod tests {
             arrivals.presence(first, &[(0, 100)], &none),
             Presence::Absent,
             "a forgotten open still answered about a process"
+        );
+    }
+
+    /// **A claim outlives the open that made it, for as long as anything is still waiting.**
+    ///
+    /// The first launch is delivered its process and then finishes, which takes its entry -- and
+    /// with it the only record that the process was spoken for. Its target's *next* genuine stop
+    /// is then claimed by nobody, and is absent from the second launch's snapshot because it did
+    /// not exist when that snapshot was taken, so it is delivered to the second launch, whose
+    /// `wait()` returns `Ok` for a process that never stopped. Raised in review on dbgscope#139,
+    /// where the ambiguity this stage closes turned out to be closed only while both guards were
+    /// held.
+    ///
+    /// **Not a lifecycle creeping back in**, which is the thing to check rather than take on
+    /// trust: the claim is inherited by the opens that exist at that moment and goes when they do,
+    /// where the record this replaced lived for the whole session and needed a prune and two
+    /// clears. The last assertion is that half -- once nothing is pending, nothing is remembered.
+    #[test]
+    fn test_a_claim_outlives_the_open_that_made_it() {
+        let none = HashSet::new();
+        let mut arrivals = Arrivals::default();
+        let first = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        let second = arrivals.register(Arrival::Launched(Some(Vec::new())));
+
+        arrivals.deliver((0, 100), &none);
+        arrivals.forget(first);
+
+        // The same process stopping again, which is what every later break in its target is.
+        arrivals.deliver((0, 100), &none);
+        assert_ne!(
+            arrivals.presence(second, &[(0, 100)], &none),
+            Presence::Arrived,
+            "a process the first launch had been given was handed to the second once the first              guard was gone, so its wait() returns Ok for a target that never stopped"
+        );
+
+        // And the inheritance goes when the opens that hold it do.
+        arrivals.forget(second);
+        let third = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        arrivals.deliver((0, 100), &none);
+        assert_eq!(
+            arrivals.presence(third, &[(0, 100)], &none),
+            Presence::Arrived,
+            "an open registered after everything else had finished inherited a claim that should              have gone with them, which is the lifecycle this shape exists not to have"
         );
     }
 
@@ -6740,6 +6815,53 @@ mod tests {
 
         drop(pending);
         owner.end_session().expect("end_session failed");
+    }
+
+    /// **A session's attachments are visible through every wrapper**, both to delivery and to the
+    /// teardown that has to let them go.
+    ///
+    /// Raised in review on dbgscope#139 against the delivery half: wrapper A attaches, drops that
+    /// guard, and holds a pending launch; an outside pump through wrapper B then read B's own empty
+    /// set, so the attached process -- new to the launch's snapshot, since it had not joined when
+    /// that snapshot was taken -- was delivered to A's launch, whose `wait()` returned `Ok` before
+    /// its own target stopped.
+    ///
+    /// The fix is that the record is the **session's**, and the sentence that used to keep it per
+    /// wrapper was arguing against the wrong thing: it said sharing would put this decision "behind
+    /// an eviction policy", which is true of the identity cache and not of a `Weak` map whose entry
+    /// dies with the last wrapper holding it.
+    ///
+    /// The second half asserted here was not raised and is the sharper one. An `end_session`
+    /// through a wrapper that did not perform the attach used to see no attachment to detach, so
+    /// its passive end **killed** somebody else's process -- the exact failure the record exists
+    /// to prevent, reached through the wrapper boundary. `STILL_RUNNING` is what separates the two
+    /// endings; `Child::try_wait` cannot, for the reason `exit_code_of` records.
+    #[cfg(not(miri))]
+    #[test]
+    fn test_a_sessions_attachments_are_visible_through_every_wrapper() {
+        let _debuggee = one_debuggee();
+        let mut theirs = a_process_to_attach_to();
+        {
+            let owner = DebugEngine::new();
+            owner.attach_process(theirs.id()).expect("attach failed");
+            // A second wrapper around the *same* client, as an extension builds per command.
+            let borrowed = DebugEngine::from_client_interface(owner.client.clone());
+            assert!(
+                borrowed.attached_to_a_live_process(),
+                "a wrapper that did not perform the attach cannot see it, so its teardown will                  take a process it was only looking at"
+            );
+
+            // The teardown through that second wrapper has to detach rather than kill.
+            let _ = borrowed.end_session();
+        }
+        assert_eq!(
+            exit_code_of(theirs.id()),
+            Some(STILL_RUNNING),
+            "the attached process was taken by a teardown through the wrapper that did not attach              to it"
+        );
+
+        let _ = theirs.kill();
+        let _ = theirs.wait();
     }
 
     /// **Two launches pending at once are told apart**, which [`Arrival`] used to document as an
@@ -8240,7 +8362,8 @@ mod tests {
         // and left running. Reading the field directly is the only way to say the record is clean
         // rather than merely unmatched.
         assert!(
-            e.attached_processes
+            e.state
+                .attached_processes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty(),
