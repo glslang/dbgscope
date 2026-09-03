@@ -39,24 +39,30 @@
 //! whether a second request survives a wait that consumed the first, and it cannot control the
 //! interleaving it needs: `interrupt()` releases its lock between the two calls, and the waiter is
 //! blocked inside `WaitForEvent` where no lock on this side can hold it, so DbgEng may already have
-//! consumed the first request and begun unwinding while the second is delivered. The timestamp
-//! check the arm prints is **necessary and not sufficient** — it rules the bad ordering out when it
-//! fails, and does not rule it in when it passes. The deterministic version of the question is
-//! `test_get_interrupt_drain_semantics`, which needs no wait and therefore no race: three
-//! `SetInterrupt`s then five polls read `[true, false, false, false, false]`, so the engine's
-//! pending request is **a flag and not a counter**. That is what says D's `true` cannot merely be
-//! the leftover second of a pair — there is no second, only one flag.
+//! consumed the first request and begun unwinding while the second is delivered. What the arm
+//! checks is that both requests named the **same operation**, so that operation's guard — which
+//! lives exactly as long as the pump — outlived both. That is **necessary and not sufficient**: it
+//! rules the bad ordering out when it fails and does not rule it in when it passes. The
+//! deterministic version of the question is `test_get_interrupt_drain_semantics`, which needs no
+//! wait and therefore no race: three `SetInterrupt`s then five polls read
+//! `[true, false, false, false, false]`, so the engine's pending request is **a flag and not a
+//! counter**. That is what says D's `true` cannot merely be the leftover second of a pair — there
+//! is no second, only one flag.
 //!
 //! (C was first written as D by accident, with a 50 ms gap between the two requests that turned out
 //! to be far longer than the wait took to unwind. It measured a real thing and not the thing its
 //! name claimed. Two arms now, with the gap stated in each.)
 //!
 //! **Every arm asserts its preconditions before it draws a conclusion**, because each has a vacuous
-//! pass in the direction that matters: an interrupt that was never delivered leaves the wait to
+//! pass in the direction that matters. An interrupt that was never delivered leaves the wait to
 //! expire on its own clock and every poll then reads `false`, which is exactly the shape of "the
-//! hypothesis holds". So each arm requires the delivery it needs (a `BreakRequest`) and the ending
-//! it needs (`WaitOutcome::OnRequest`) before it reads a poll. Printing them beside the conclusion
-//! is not enough — a conclusion a reader has to audit is one this file should not be drawing.
+//! hypothesis holds"; and D's 400 ms gap is a *guess* about a loaded host, so on a slow enough one
+//! its second request is filed against the operation still running and the arm becomes C wearing
+//! D's name. So each arm requires the delivery it needs (a `BreakRequest`, of the right variant),
+//! the ending it needs (`WaitOutcome::OnRequest`), and — for C and D, whose whole subject is *which
+//! operation* a request reached — the operation identity that makes it the arm it claims to be.
+//! Printing those beside the conclusion is not enough: a conclusion a reader has to audit is one
+//! this file should not be drawing.
 //!
 //! **What this licenses, and what it does not.** C and D together are the useful pair: a post-wait
 //! `true` means *a request survives that this wait did not consume*, and the only thing it can
@@ -77,7 +83,7 @@
 //! Run: cargo run --example interrupt_provenance
 
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dbgscope::dbgeng::{BreakRequest, DebugEngine, WaitOutcome};
 
@@ -210,15 +216,14 @@ fn main() {
             // No gap, so both have the best chance of being in flight at once.
             let first = handle.interrupt();
             let second = handle.interrupt();
-            (first, second, Instant::now())
+            (first, second)
         });
         let waited = e.wait_for_event(15_000);
-        let returned = Instant::now();
-        let (first, second, both_issued) = asked.join().expect("the asking thread panicked");
+        let (first, second) = asked.join().expect("the asking thread panicked");
 
         // Both delivered, or this arm is about one request and should say so. Same reason as A.
-        first.expect("the first interrupt was not delivered");
-        second.expect("the second interrupt was not delivered");
+        let first = first.expect("the first interrupt was not delivered");
+        let second = second.expect("the second interrupt was not delivered");
         assert_eq!(
             waited.as_ref().ok(),
             Some(&WaitOutcome::OnRequest),
@@ -226,24 +231,35 @@ fn main() {
         );
 
         let polls: Vec<bool> = (0..5).map(|_| e.interrupted().unwrap()).collect();
-        // Necessary and not sufficient, which is what the second review round was about: `false`
-        // here rules the bad interleaving out, `true` does not rule it in.
-        let both_in_flight = returned >= both_issued;
+        // **The operation id is the check, not a timestamp.** This replaces the clock comparison
+        // the last round added, which only said the second `interrupt()` returned before the Rust
+        // caller stamped the finished wait. Two requests naming the *same* operation says something
+        // tighter: the operation's guard was still alive when the second went, and that guard lives
+        // exactly as long as the pump does. Still necessary rather than sufficient -- the native
+        // `WaitForEvent` can have returned with `pump` still in its post-processing -- but it is a
+        // strictly closer proxy, and it costs nothing now that a request says what it was filed
+        // against.
+        let one_operation = matches!(
+            (first, second),
+            (
+                BreakRequest::Raised { operation: a },
+                BreakRequest::Raised { operation: b }
+            ) if a == b
+        );
         println!("C. two SetInterrupts back to back, around one wait");
         println!("   wait -> {waited:?}");
         println!(
-            "   the wait returned to Rust {} the second request was issued{}",
-            if both_in_flight { "after" } else { "BEFORE" },
-            if both_in_flight {
-                " (necessary for both to have been in flight, not sufficient)"
+            "   requests {first:?} / {second:?}{}",
+            if one_operation {
+                " -- one operation, so its guard outlived both (necessary, not sufficient)"
             } else {
-                ""
+                " -- NOT one operation"
             }
         );
         println!("   five GetInterrupt polls afterwards: {polls:?}");
         println!(
             "   -> {}\n",
-            match (both_in_flight, polls == [false; 5]) {
+            match (one_operation, polls == [false; 5]) {
                 (true, true) =>
                     "nothing survived -- consistent with the flag semantics \
                                  test_get_interrupt_drain_semantics pins deterministically",
@@ -251,7 +267,7 @@ fn main() {
                     "a second request survived the wait, which a flag cannot do -- \
                                   worth chasing against that test",
                 (false, _) =>
-                    "INCONCLUSIVE: the wait was over before the second request went, so \
+                    "INCONCLUSIVE: the operation was over before the second request went, so \
                                this ran arm D and says nothing about two at once",
             }
         );
@@ -272,8 +288,9 @@ fn main() {
         let asked = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             let first = handle.interrupt();
-            // Long enough that the wait has certainly returned on the first: this second request
-            // is aimed at an operation that has already ended, which is exactly the residue
+            // Long enough that the wait has *almost* certainly returned on the first, and the
+            // assertion below is what makes "almost" safe: this second request is meant to be
+            // aimed at an operation that has already ended, which is exactly the residue
             // bookkeeping cannot close.
             std::thread::sleep(Duration::from_millis(400));
             let second = handle.interrupt();
@@ -292,6 +309,19 @@ fn main() {
             waited.as_ref().ok(),
             Some(&WaitOutcome::OnRequest),
             "the wait ended as {waited:?} rather than on the first break, so the second was not late"
+        );
+        // **The arm's defining precondition, asserted rather than timed.** 400 ms is a guess about
+        // a loaded host, and on a slow enough one the waiter is still inside `WaitForEvent` when
+        // the second request goes -- which files it against the *same* operation, lets that wait
+        // coalesce and consume it, and leaves the polls reading `false`. The arm would then report
+        // "a late request leaves no trace", which is the opposite of what it found and the one
+        // conclusion stage 3 would build on. `NothingRunning` is the engine saying there was no
+        // operation left to file against, which is precisely what "late" means here.
+        assert_eq!(
+            late,
+            BreakRequest::NothingRunning,
+            "the second request was filed as {late:?}, so the operation had not ended and this is \
+             arm C rather than arm D"
         );
 
         let polls: Vec<bool> = (0..5).map(|_| e.interrupted().unwrap()).collect();
