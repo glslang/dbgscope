@@ -106,6 +106,19 @@ All notable changes to this project are documented here. The format follows
   placement argued that sharing would put the decision "behind an eviction policy" -- true of the
   identity cache, and not of a `Weak` map whose entry dies with the last wrapper holding it.
 
+  **Two more from review, one of them pre-existing.** "Somebody else has this process" is now one
+  rule in `Pending::wants`, so `presence` applies it as well as `deliver` did. A second launch was
+  otherwise told `Listed` on the strength of a process the first had been given, and `Listed` is
+  not `Absent`, so an interrupted wait answered `Ok(())` instead of `LiveTargetInterrupted`.
+
+  And `prune_processes_that_left` no longer drops an attachment that has not joined yet.
+  `AttachProcess` joins its process at the next `WaitForEvent`, so between `attach_process_begin`
+  and that wait the pid is recorded and the session does not list it. An opener pruning in that
+  window dropped the record — after which the teardown treats somebody else's process as one this
+  engine launched, and takes it. An attachment now carries whether it has been seen
+  (`Attachment::Deferred` / `Joined`), promoted wherever the engine lists the session on its own
+  account: the prune, and the pump.
+
   No public API changes. Two tests are gone rather than passing, and the constructions that make
   them unreachable are named where they were:
   `test_ending_a_session_forgets_which_processes_it_stopped_on` had no record to forget, and
