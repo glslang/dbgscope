@@ -653,6 +653,27 @@ impl Arrivals {
     /// A [`Claim::Departed`] one is handed to nobody: [`Self::forget_departed`] has already taken
     /// that process out of every inheritance, and putting it back is the stale claim that method
     /// exists to remove.
+    /// Forgets an open **outright**, whatever state it is in — for an open whose wait has ended in
+    /// a way that says its process is not coming.
+    ///
+    /// [`Self::forget`] is the ordinary path and keeps an abandoned launch's place in the queue,
+    /// which is right when the guard was simply dropped: the create is still queued and its process
+    /// is still on its way. It is wrong when the open pumped its whole bound and nothing came,
+    /// because the entry then survives to take the *next* launch's stop — the failure keeping it
+    /// exists to prevent, from the other side. Raised in review on dbgscope#143.
+    fn discard(&mut self, id: ArrivalId) {
+        let Some(index) = self.pending.iter().position(|pending| pending.id == id) else {
+            return;
+        };
+        let claimed = self.pending[index].claim.held();
+        self.pending.remove(index);
+        if let Some(entry) = claimed {
+            for pending in &mut self.pending {
+                pending.inherited.push(entry);
+            }
+        }
+    }
+
     fn forget(&mut self, id: ArrivalId) {
         let Some(index) = self.pending.iter().position(|pending| pending.id == id) else {
             return;
@@ -680,13 +701,7 @@ impl Arrivals {
             self.pending[index].abandoned = true;
             return;
         }
-        let claimed = self.pending[index].claim.held();
-        self.pending.remove(index);
-        if let Some(entry) = claimed {
-            for pending in &mut self.pending {
-                pending.inherited.push(entry);
-            }
-        }
+        self.discard(id);
     }
 
     /// Drops every claim and inherited exclusion naming a process the session no longer holds.
@@ -3166,8 +3181,17 @@ impl DebugEngine {
                         // by a later process that inherits the pid. Not on the interrupted branch
                         // above -- an open the host cut short says nothing about whether the
                         // attach is still coming.
+                        //
+                        // The registration goes the same way and for the same reason, or a
+                        // *launch* that timed out here would be kept as abandoned when its guard
+                        // drops (dbgscope#141) and would then take the next launch's stop -- the
+                        // very failure keeping it exists to prevent, arrived at from the other
+                        // side. `discard` and not `forget`: this open pumped its whole bound and
+                        // nothing came, which is the one ending that says nothing is coming.
+                        // Raised in review on dbgscope#143.
                         if waited {
                             self.retire_deferred_attachment(registered);
+                            self.discard_registration(registered);
                         }
                         Err(DbgEngError::LiveTargetTimeout)
                     }
@@ -3312,6 +3336,29 @@ impl DebugEngine {
         if attached.get(&pid) == Some(&Attachment::Deferred) {
             attached.remove(&pid);
         }
+    }
+
+    /// Forgets an open outright, for a wait that ended saying its process is not coming.
+    ///
+    /// The guard's own drop calls [`Arrivals::forget`] shortly afterwards and finds nothing, which
+    /// is the point: `forget` would keep an abandoned launch's place in the queue, and an open that
+    /// pumped its whole bound for nothing must not hold one. See [`Arrivals::discard`].
+    ///
+    /// **This call site is not pinned by a test, and says so rather than being assumed covered.**
+    /// The rule it reaches is (`..._keeps_its_place_and_an_attach_does_not`'s last block, which
+    /// fails if `discard` keeps the entry), but the *wiring* needs a launch whose process never
+    /// arrives inside `LIVE_WAIT_MS`, and a create that reaches the queue produces a process —
+    /// every way a launch fails with nothing created lands on `launch_process_begin`'s own `?`
+    /// (measured: a missing image is `0x80070002` in 1.5 ms, before any guard exists). Backing this
+    /// line out leaves the whole suite green; that was checked rather than supposed. The attach
+    /// side has `test_the_openers_prune_clears_a_claim_on_a_departed_process` for the equivalent
+    /// wiring because a *pid* that never joins is constructible where a launch is not.
+    fn discard_registration(&self, registered: &Registered<'_>) {
+        self.state
+            .arrivals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .discard(registered.id);
     }
 
     /// A copy of the pids this engine attached to, taken rather than borrowed so that no lock is
@@ -6613,6 +6660,20 @@ mod tests {
             Presence::Absent,
             "an abandoned attach was kept in the register, where the engine's own attachment record \
              is what covers it"
+        );
+
+        // And a launch whose wait ended saying nothing is coming is discarded rather than kept,
+        // or it survives to take the *next* launch's stop — the failure keeping an abandoned entry
+        // exists to prevent, reached from the other side. Raised in review on dbgscope#143.
+        let timed_out = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        arrivals.discard(timed_out);
+        let after = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        arrivals.deliver((3, 400), &none);
+        assert_eq!(
+            arrivals.presence(after, &[(3, 400)], &none),
+            Presence::Arrived,
+            "a launch whose wait timed out kept its place in the queue and took the next launch's \
+             process"
         );
     }
 
