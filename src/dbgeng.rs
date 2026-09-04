@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -240,10 +241,16 @@ pub struct InterruptHandle {
     /// an arrival.
     state: Arc<ClientState>,
 }
-// SAFETY: `control` is only ever handed to SetInterrupt, the one cross-thread-safe DbgEng call.
-// The other cross-thread touch is the `Release` on drop, which rests on the same assumption
-// [`DebugEngine`]'s own `Send`/`Sync` below already make about these interfaces; a handle held for
-// the life of a process (the intended use) never reaches it at all.
+// SAFETY: `control` is only ever handed to SetInterrupt, the one DbgEng call documented as safe
+// from any thread, and `state` is behind its own locks. The other cross-thread touch is the
+// `Release` on drop, which assumes the interface's refcount is atomic — as COM requires of any
+// object usable from more than one apartment, and as `SetInterrupt`'s own guarantee presupposes;
+// a handle held for the life of a process, which is the intended use, never reaches it at all.
+//
+// This comment used to rest that last point on `DebugEngine`'s own `Send`/`Sync`. Those are gone
+// (dbgscope#136 stage 4): they claimed the whole engine crossed threads, which is the opposite of
+// what the type above says, so the assumption is stated here instead of borrowed from an impl that
+// should never have made it.
 unsafe impl Send for InterruptHandle {}
 // SAFETY: as above — sharing a handle only shares the ability to make that one call.
 unsafe impl Sync for InterruptHandle {}
@@ -555,6 +562,15 @@ impl Pending {
         // process evidence that *this* one is `Listed` -- and `Listed` is not `Absent`, so a
         // second launch interrupted before its own process joined answered `Ok(())` instead of
         // `LiveTargetInterrupted`. Raised in review on dbgscope#139.
+        //
+        // **It excludes attaches too, and that starves nobody**, which review read the other way
+        // and is worth having measured here rather than argued again: two *live* attaches on one
+        // pid cannot exist, because the kernel gives a process one debug port and refuses the
+        // second attach outright -- measured on this engine, `AttachProcess` for an already
+        // attached pid answers `0xD0000048 STATUS_PORT_ALREADY_SET`, so the second open fails in
+        // `attach_process_begin` before it registers anything. The reachable case is a pid *reused*
+        // after the first process left, and both openers call `prune_processes_that_left` before
+        // registering, so the stale claim is already `Claim::Departed` and `held()` answers `None`.
         if self.inherited.contains(&entry)
             || others.iter().any(|other| other.claim.held() == Some(entry))
         {
@@ -2158,7 +2174,12 @@ pub struct DebugEngine {
     /// reaches `end_session` — retained for good. Verifying on hardware that DbgEng does not
     /// re-read the buffer (drive `.restart` after a `launch_process`) is what would make a
     /// tighter release safe.
-    deferred_inputs: Mutex<Vec<TargetInput>>,
+    /// A `RefCell` and not a `Mutex`, since dbgscope#136 stage 4: every reader reaches this
+    /// through `&self`, and an engine is neither `Send` nor `Sync`, so there is one thread here
+    /// by construction and the lock was guarding against a caller the type cannot produce. The
+    /// three accesses are a push, a clear and a `Drop` that takes the vector, none of them
+    /// nested and none re-entrant, so the runtime borrow it costs instead can never be observed.
+    deferred_inputs: RefCell<Vec<TargetInput>>,
     /// The **session's** state, shared by every wrapper around this client and with every
     /// [`InterruptHandle`] this engine hands out: the opens waiting for a target
     /// ([`Arrivals`]) and the break requests scoped to operations ([`BreakScope`]). See
@@ -2179,8 +2200,26 @@ impl Default for DebugEngine {
     }
 }
 
-unsafe impl Sync for DebugEngine {}
-unsafe impl Send for DebugEngine {}
+// A `DebugEngine` is deliberately neither `Send` nor `Sync`, and that is the absence of two
+// `unsafe impl`s rather than an oversight — dbgscope#136 stage 4.
+//
+// They asserted the opposite of what this crate says two hundred lines up, where
+// [`InterruptHandle`] records that `SetInterrupt` is the one DbgEng call documented as safe from
+// any thread *because the rest of the engine is single-thread-affine*. `Sync` promised concurrent
+// `&self` calls into an engine that cannot take them; `Send` promised a move to another thread,
+// which is the same claim one step weaker and equally unsupported. Neither had a safety comment,
+// and neither could have been given a true one.
+//
+// Nothing needed them, which is what makes this a deletion rather than a trade: measured by
+// removing each and building, both this crate (`--all-targets`, tests and examples included) and
+// windbg-mcp compile unchanged. Both consumers already create the engine on the thread that uses
+// it — windbg-mcp in `worker::build_engine`, on its engine thread, and the pool extension around
+// the client DbgEng hands its command, on DbgEng's own calling thread.
+//
+// [`InterruptHandle`] is left as the single affordance that crosses threads, which is the whole
+// of the threading model: one `SetInterrupt`, from anywhere, and nothing else.
+// `the_engine_does_not_cross_threads_and_the_handle_does` is what stops an `unsafe impl` coming
+// back without one.
 
 impl DebugEngine {
     /// Creates a new instance of the Debug Engine client
@@ -2321,7 +2360,7 @@ impl DebugEngine {
             // Default to "borrowed": constructors that wrap an existing WinDbg client
             // go through here, and only `new()` (which calls `DebugCreate`) sets this.
             owns_session: false,
-            deferred_inputs: Mutex::new(Vec::new()),
+            deferred_inputs: RefCell::new(Vec::new()),
             state,
         }
     }
@@ -2353,7 +2392,7 @@ impl DebugEngine {
             dataspaces,
             symbols,
             owns_session: false,
-            deferred_inputs: Mutex::new(Vec::new()),
+            deferred_inputs: RefCell::new(Vec::new()),
             state,
         })
     }
@@ -5432,19 +5471,13 @@ impl DebugEngine {
     /// Parks an input buffer for the life of the session, so DbgEng can still read it when
     /// it completes a deferred spawn or dial. See [`DebugEngine::deferred_inputs`].
     fn retain_deferred_input(&self, input: TargetInput) {
-        self.deferred_inputs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(input);
+        self.deferred_inputs.borrow_mut().push(input);
     }
 
     /// Releases the parked input buffers. Only sound once the session is over: until then
     /// the engine may still owe a deferred spawn or dial that reads them.
     fn release_deferred_inputs(&self) {
-        self.deferred_inputs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.deferred_inputs.borrow_mut().clear();
     }
 
     /// Records that `pid` is a process this engine attached to, so the teardown detaches from it
@@ -5792,12 +5825,9 @@ impl Drop for DebugEngine {
             // pointer to; `end_session` is the only place a release can be justified, and a
             // borrowed client never reaches it. Costs nothing unless a `*_begin` opener was
             // actually used on a borrowed client.
-            std::mem::forget(std::mem::take(
-                &mut *self
-                    .deferred_inputs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            ));
+            // `get_mut` rather than `borrow_mut`: `drop` has `&mut self`, so the borrow is
+            // checked at compile time and this path cannot panic on one.
+            std::mem::forget(std::mem::take(self.deferred_inputs.get_mut()));
             return;
         }
         // Don't leave a live kernel frozen at a break if we're torn down without an
@@ -6626,6 +6656,65 @@ mod tests {
             arrivals.presence(attach, &[(0, 200)], &none),
             Presence::Arrived,
             "the attach did not get its own process"
+        );
+    }
+
+    /// **The engine does not cross threads and the handle does**, which is the whole of this
+    /// crate's threading model and is now a property of the types rather than a sentence.
+    ///
+    /// dbgscope#136 stage 4 deleted `unsafe impl Send`/`Sync for DebugEngine`. They asserted the
+    /// opposite of what [`InterruptHandle`]'s own doc says — `SetInterrupt` is the one DbgEng call
+    /// safe from any thread *because the rest of the engine is single-thread-affine* — and neither
+    /// carried a safety comment, because neither could have been given a true one.
+    ///
+    /// **Asserted rather than left to the absence of an `unsafe impl`**, since re-adding one is a
+    /// single line that compiles, reads as a fix for whatever error it silences, and puts the
+    /// engine back on threads it cannot take. `Send` is checked as well as `Sync`: a move is the
+    /// same claim as a share one step weaker, and equally unsupported.
+    ///
+    /// The negative half needs the inherent-method trick, because Rust has no `T: !Send`: an
+    /// inherent `impl` is preferred to a trait one during method resolution, so `CAN` is reached
+    /// only when the bound holds and the blanket trait answers for everything else. Needs no
+    /// engine, so it runs under Miri.
+    #[test]
+    fn test_the_engine_does_not_cross_threads_and_the_handle_does() {
+        struct Ask<T>(std::marker::PhantomData<T>);
+        trait Cannot {
+            const CAN: bool = false;
+        }
+        impl<T> Cannot for Ask<T> {}
+        impl<T: Send> Ask<T> {
+            const CAN: bool = true;
+        }
+        struct AskShared<T>(std::marker::PhantomData<T>);
+        trait CannotShare {
+            const CAN: bool = false;
+        }
+        impl<T> CannotShare for AskShared<T> {}
+        impl<T: Sync> AskShared<T> {
+            const CAN: bool = true;
+        }
+
+        assert!(
+            !<Ask<DebugEngine>>::CAN,
+            "DebugEngine is Send again, so an engine can be moved to a thread that is not the one \
+             it is affine to"
+        );
+        assert!(
+            !<AskShared<DebugEngine>>::CAN,
+            "DebugEngine is Sync again, so two threads can make concurrent &self calls into an \
+             engine that cannot take them"
+        );
+
+        // And the one affordance that is meant to cross, or the watchdogs and every host that
+        // stops a runaway command have no way to reach the engine at all.
+        assert!(
+            <Ask<InterruptHandle>>::CAN,
+            "InterruptHandle is no longer Send"
+        );
+        assert!(
+            <AskShared<InterruptHandle>>::CAN,
+            "InterruptHandle is no longer Sync"
         );
     }
 

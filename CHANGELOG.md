@@ -46,6 +46,26 @@ All notable changes to this project are documented here. The format follows
 
 ### Removed
 
+- **`unsafe impl Send` and `unsafe impl Sync` for `DebugEngine`** (#136 stage 4). They asserted
+  the opposite of what this crate says about its own threading: `SetInterrupt` is the one DbgEng
+  call documented as safe from any thread *because the rest of the engine is
+  single-thread-affine*, so `Sync` promised concurrent `&self` calls into an engine that cannot
+  take them and `Send` promised a move to another thread, which is the same claim one step
+  weaker. Neither carried a safety comment, and neither could have been given a true one.
+
+  **Semver-visible, and measured against both consumers before it was made**: removing each and
+  building leaves this crate (`--all-targets`, tests and examples included) and windbg-mcp
+  compiling unchanged, because both already create the engine on the thread that uses it. A
+  consumer that did move an engine between threads is the case this breaks, and it was relying
+  on an unsound impl to do it.
+
+  `InterruptHandle` is untouched and is now the crate's only `Send + Sync` type — one
+  `SetInterrupt` from anywhere, and nothing else. `deferred_inputs` becomes a `RefCell` rather
+  than a `Mutex`, since `&self` now implies one thread. And
+  `test_the_engine_does_not_cross_threads_and_the_handle_does` asserts all four bounds, because
+  re-adding an `unsafe impl` is one line that compiles and reads as a fix for whatever error it
+  silences.
+
 - The public `Breakpoint<'a>` type, which had no caller in `src/` or `examples/` and was a trap for
   anyone who found it: built on the v1 `IDebugBreakpoint` where the read path uses v2, offering no
   setter but `set_offset_expression`, and panicking in three of its four methods — `enable`'s
