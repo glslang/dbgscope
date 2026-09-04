@@ -708,13 +708,26 @@ impl Arrivals {
     /// guard still held, or the guard is gone and nobody is asking. So is one whose process has
     /// left the session, which is the same answer for the same reason — there is nothing there to
     /// go and look at.
+    ///
+    /// **A claim is read against `held` and not believed on its own**, which is the half of the
+    /// old shape worth keeping: `presence_of` used to locate the process in the session *first*
+    /// and ask whether it had stopped second, so `Arrived` could not outlive the target. Answering
+    /// from the claim alone let it, because [`Self::forget_departed`] runs from the openers — a
+    /// session that opens nothing more never prunes, so a target delivered and since gone stayed
+    /// `Arrived` indefinitely and a guard's `wait()` returned `Ok(())` for a process the caller
+    /// could not read. Raised in review on dbgscope#139, against this branch's own regression.
+    ///
+    /// It costs the open the rest of its bound — the answer is `Absent`, so the loop pumps on —
+    /// and that is what every release has done. Saying "it arrived and left" would be a fourth
+    /// [`Presence`], and nothing above here has a use for the distinction yet.
     fn presence(&self, id: ArrivalId, held: &[(u32, u32)], attached: &HashSet<u32>) -> Presence {
         let Some(pending) = self.pending.iter().find(|pending| pending.id == id) else {
             return Presence::Absent;
         };
         match pending.claim {
-            Claim::Arrived(_) => return Presence::Arrived,
-            Claim::Departed => return Presence::Absent,
+            Claim::Arrived(entry) if held.contains(&entry) => return Presence::Arrived,
+            // Delivered, and gone since — whether or not a prune has caught up with it.
+            Claim::Arrived(_) | Claim::Departed => return Presence::Absent,
             Claim::Waiting => {}
         }
         if matches!(pending.what, Arrival::Launched(None)) {
@@ -6404,6 +6417,40 @@ mod tests {
             Presence::Absent,
             "an open that finished and whose target then left took somebody else's process rather \
              than staying finished"
+        );
+    }
+
+    /// **An arrival is read against what the session holds, not believed on its own.**
+    ///
+    /// [`Arrivals::forget_departed`] runs from the openers, so a session that opens nothing more
+    /// never prunes: a claim outlives its process by however long that is, which is unbounded. The
+    /// shape this replaced could not have the bug — `presence_of` located the process in the
+    /// session first and asked whether it had stopped second — and answering from the claim alone
+    /// let `Arrived` outlive the target, so a guard's `wait()` returned `Ok(())` for a process the
+    /// caller could not read. Raised in review on dbgscope#139.
+    ///
+    /// The second process is not decoration: an engine holding nothing at all is refused by
+    /// `presence_of` before the register is asked, so a session kept alive by somebody else is
+    /// the only way this question reaches here.
+    #[test]
+    fn test_an_arrived_claim_is_read_against_what_the_session_holds() {
+        let none = HashSet::new();
+        let mut arrivals = Arrivals::default();
+        let open = arrivals.register(Arrival::Attached(100));
+        arrivals.deliver((0, 100), &none);
+        assert_eq!(
+            arrivals.presence(open, &[(0, 100), (1, 200)], &none),
+            Presence::Arrived,
+            "the attach was not given its process, so nothing here is under test"
+        );
+
+        // It leaves, and nothing has pruned -- the other process keeps the session alive, so no
+        // opener has run and `forget_departed` has not been called.
+        assert_eq!(
+            arrivals.presence(open, &[(1, 200)], &none),
+            Presence::Absent,
+            "a claim on a process that has left the session still reported it as arrived, so the \
+             guard's wait() returns Ok for a target the caller cannot read"
         );
     }
 
