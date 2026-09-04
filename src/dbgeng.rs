@@ -493,13 +493,44 @@ struct Arrivals {
     pending: Vec<Pending>,
 }
 
+/// What has been delivered to one open, if anything.
+///
+/// **Three states rather than an `Option`, because a claim that has gone is not a claim that was
+/// never made.** [`Arrivals::forget_departed`] has to stop an open reporting a process that left
+/// the session as arrived — an open whose target has gone has not arrived anywhere its caller can
+/// use — and setting the field back to nothing did that by making the entry *pending again*. An
+/// [`Arrival::Attached`] open wants any stop bearing its pid, and the finished one is registered
+/// before the reattach's, so it was offered the reattached process first and the new open's
+/// `wait()` timed out on a target sitting in front of it. Raised in review on dbgscope#139.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// Nothing has been delivered to this open.
+    Waiting,
+    /// This process was, and the session still holds it.
+    Arrived((u32, u32)),
+    /// One was, and it has since left the session. A tombstone rather than a return to
+    /// [`Self::Waiting`]: the open is finished, so it is never offered another arrival, and
+    /// [`Arrivals::presence`] answers [`Presence::Absent`] for it.
+    Departed,
+}
+
+impl Claim {
+    /// The process delivered to this open and still held by the session, where there is one.
+    fn held(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Arrived(entry) => Some(entry),
+            Self::Waiting | Self::Departed => None,
+        }
+    }
+}
+
 /// One registered open.
 #[derive(Debug)]
 struct Pending {
     id: ArrivalId,
     what: Arrival,
-    /// The process delivered to this open, once one has been.
-    arrived: Option<(u32, u32)>,
+    /// What has been delivered to this open, and whether the session still holds it.
+    claim: Claim,
     /// Processes another open was given before it finished, which this one must not be given now
     /// that the record of that claim has gone with its guard. See [`Arrivals::forget`].
     inherited: Vec<(u32, u32)>,
@@ -518,14 +549,14 @@ impl Pending {
     /// it also covers an attach whose guard has been dropped, whose process joins the session with
     /// no registration left to name it.
     fn wants(&self, entry: (u32, u32), others: &[&Pending], attached: &HashSet<u32>) -> bool {
-        // Somebody else has it, either still (`arrived`) or by an inheritance left behind when
+        // Somebody else has it, either still (`claim`) or by an inheritance left behind when
         // their guard went (`inherited`). Asked here rather than in `deliver` alone, because
         // `presence` asks the same question and would otherwise call another open's delivered
         // process evidence that *this* one is `Listed` -- and `Listed` is not `Absent`, so a
         // second launch interrupted before its own process joined answered `Ok(())` instead of
         // `LiveTargetInterrupted`. Raised in review on dbgscope#139.
         if self.inherited.contains(&entry)
-            || others.iter().any(|other| other.arrived == Some(entry))
+            || others.iter().any(|other| other.claim.held() == Some(entry))
         {
             return false;
         }
@@ -553,7 +584,7 @@ impl Arrivals {
         self.pending.push(Pending {
             id,
             what,
-            arrived: None,
+            claim: Claim::Waiting,
             inherited: Vec::new(),
         });
         id
@@ -581,12 +612,22 @@ impl Arrivals {
     /// when that snapshot was taken, and is delivered to the second launch, whose `wait()` returns
     /// `Ok` for a process that never stopped. Raised in review on dbgscope#139; the ambiguity this
     /// stage closes was otherwise closed only while both guards were held.
+    ///
+    /// It is handed to **every** open still waiting rather than along a chain, so an inheritance
+    /// needs no forwarding of its own: a claim reaches an open directly or not at all, and one
+    /// registered after this call has the process in its own snapshot. Also raised on dbgscope#139,
+    /// as a non-transitive handoff; `test_a_claim_is_inherited_by_every_open_still_waiting` is what
+    /// pins it, since with two opens "every remaining open" and "the next one" are the same set.
+    ///
+    /// A [`Claim::Departed`] one is handed to nobody: [`Self::forget_departed`] has already taken
+    /// that process out of every inheritance, and putting it back is the stale claim that method
+    /// exists to remove.
     fn forget(&mut self, id: ArrivalId) {
         let claimed = self
             .pending
             .iter()
             .find(|pending| pending.id == id)
-            .and_then(|pending| pending.arrived);
+            .and_then(|pending| pending.claim.held());
         self.pending.retain(|pending| pending.id != id);
         if let Some(entry) = claimed {
             for pending in &mut self.pending {
@@ -606,15 +647,23 @@ impl Arrivals {
     /// else's and its `wait()` times out on a target sitting in front of it. Raised in review on
     /// dbgscope#139.
     ///
-    /// Clearing `arrived` rather than only the exclusion is deliberate and is what the old prune
+    /// Dropping the claim rather than only the exclusion is deliberate and is what the old prune
     /// did: an open whose target has left the session has not arrived anywhere its caller can use,
     /// and [`Self::presence`] should say `Absent` rather than `Arrived` about a process that is
     /// gone.
+    ///
+    /// **It becomes [`Claim::Departed`] and not [`Claim::Waiting`]**, or the open that finished is
+    /// pending again and takes the next arrival it happens to want ahead of whoever is really
+    /// waiting for it — see [`Claim`].
     fn forget_departed(&mut self, held: &[(u32, u32)]) {
         let still_here = |entry: &(u32, u32)| held.contains(entry);
         for pending in &mut self.pending {
-            if pending.arrived.is_some_and(|entry| !still_here(&entry)) {
-                pending.arrived = None;
+            if pending
+                .claim
+                .held()
+                .is_some_and(|entry| !still_here(&entry))
+            {
+                pending.claim = Claim::Departed;
             }
             pending.inherited.retain(still_here);
         }
@@ -646,23 +695,27 @@ impl Arrivals {
                 .iter()
                 .filter(|other| other.id != pending.id)
                 .collect();
-            pending.arrived.is_none() && pending.wants(entry, &others, attached)
+            matches!(pending.claim, Claim::Waiting) && pending.wants(entry, &others, attached)
         }) else {
             return;
         };
-        self.pending[index].arrived = Some(entry);
+        self.pending[index].claim = Claim::Arrived(entry);
     }
 
     /// Where the open `id` is waiting for has got to, given what the session currently holds.
     ///
     /// An id that names nothing is [`Presence::Absent`]: either the session was replaced under a
-    /// guard still held, or the guard is gone and nobody is asking.
+    /// guard still held, or the guard is gone and nobody is asking. So is one whose process has
+    /// left the session, which is the same answer for the same reason — there is nothing there to
+    /// go and look at.
     fn presence(&self, id: ArrivalId, held: &[(u32, u32)], attached: &HashSet<u32>) -> Presence {
         let Some(pending) = self.pending.iter().find(|pending| pending.id == id) else {
             return Presence::Absent;
         };
-        if pending.arrived.is_some() {
-            return Presence::Arrived;
+        match pending.claim {
+            Claim::Arrived(_) => return Presence::Arrived,
+            Claim::Departed => return Presence::Absent,
+            Claim::Waiting => {}
         }
         if matches!(pending.what, Arrival::Launched(None)) {
             return Presence::Unknown;
@@ -6281,7 +6334,8 @@ mod tests {
         assert_eq!(
             arrivals.presence(reattach, &[(0, 100)], &none),
             Presence::Arrived,
-            "the reattach was refused its own stop as another open's claim, so its wait() times              out on a target sitting in front of it"
+            "the reattach was refused its own stop as another open's claim, so its wait() times \
+             out on a target sitting in front of it"
         );
 
         // And the open that held the departed claim no longer says it arrived, which is what the
@@ -6290,6 +6344,113 @@ mod tests {
             arrivals.presence(held_open, &[(0, 100)], &none),
             Presence::Arrived,
             "an open whose target left the session still reports it as arrived"
+        );
+    }
+
+    /// **An open whose process left does not go back to waiting**, which the test above cannot
+    /// say because its held open is a launch.
+    ///
+    /// A launch is kept off a reattached process by an unrelated rule — a pending attach keeps its
+    /// process from a pending launch — so that pairing passes whether the departed claim is a
+    /// tombstone or a clear. Put to *two attaches* it does not: an [`Arrival::Attached`] open wants
+    /// any stop bearing its pid, the finished one is registered first, and [`Arrivals::deliver`]
+    /// offers in registration order. Cleared back to waiting it takes the reattach's own stop and
+    /// the new guard times out on a target sitting in front of it. Raised in review on
+    /// dbgscope#139, as the regression that retiring the stale claim opened.
+    ///
+    /// The first phase is the same open with nobody beside it, reached through the raw hatch
+    /// (`.detach` and an attach that registers nothing). That is what pins the answer
+    /// [`Arrivals::presence`] gives a departed claim: with a second open in the register the pair
+    /// is spoken for and the reply is `Absent` either way, so `Listed` — keep waiting, your target
+    /// is here — needs asking where there is no one else.
+    #[test]
+    fn test_a_departed_claim_does_not_reopen_the_open_that_held_it() {
+        let none = HashSet::new();
+
+        // Alone: the pair comes back through the raw hatch, with no second open to hold it off.
+        let mut arrivals = Arrivals::default();
+        let alone = arrivals.register(Arrival::Attached(100));
+        arrivals.deliver((0, 100), &none);
+        arrivals.forget_departed(&[]);
+        assert_eq!(
+            arrivals.presence(alone, &[(0, 100)], &none),
+            Presence::Absent,
+            "an open that finished reported a reattached process as its own still to come, so its \
+             wait() pumps for an initial break that has already happened"
+        );
+
+        let mut arrivals = Arrivals::default();
+        let finished = arrivals.register(Arrival::Attached(100));
+        arrivals.deliver((0, 100), &none);
+        assert_eq!(
+            arrivals.presence(finished, &[(0, 100)], &none),
+            Presence::Arrived,
+            "the attach was not given its process, so nothing here is under test"
+        );
+
+        // It leaves -- a raw `.detach`, or an exit -- and the same pid is attached again, which is
+        // where the engine hands the freed engine id straight back.
+        arrivals.forget_departed(&[]);
+        let reattach = arrivals.register(Arrival::Attached(100));
+        arrivals.deliver((0, 100), &none);
+        assert_eq!(
+            arrivals.presence(reattach, &[(0, 100)], &none),
+            Presence::Arrived,
+            "the reattach's own stop went to the open whose process had left, so its wait() times \
+             out on a target sitting in front of it"
+        );
+        assert_eq!(
+            arrivals.presence(finished, &[(0, 100)], &none),
+            Presence::Absent,
+            "an open that finished and whose target then left took somebody else's process rather \
+             than staying finished"
+        );
+    }
+
+    /// **A claim is inherited by every open still waiting, not handed along one at a time.**
+    ///
+    /// Put to *three* launches, because with two "every remaining open" and "the next one" are the
+    /// same set — so a handoff written as a chain passes every other test here. Raised in review on
+    /// dbgscope#139 as a non-transitive handoff, where the second launch finishing would forward
+    /// its own claim and drop the only record of the one it had inherited. It does not, because the
+    /// first [`Arrivals::forget`] gave the third launch a copy of its own; nothing pinned that
+    /// until now.
+    ///
+    /// The last two steps are the other half: the exclusion is *targeted*, so a genuinely new
+    /// process still reaches the open that is waiting. Without them a register that refused
+    /// everything would pass.
+    #[test]
+    fn test_a_claim_is_inherited_by_every_open_still_waiting() {
+        let none = HashSet::new();
+        let mut arrivals = Arrivals::default();
+        let first = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        let second = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        let third = arrivals.register(Arrival::Launched(Some(Vec::new())));
+
+        arrivals.deliver((0, 100), &none);
+        arrivals.forget(first);
+        arrivals.deliver((1, 200), &none);
+        arrivals.forget(second);
+
+        // Both targets stopping again, which is what every later break in either of them is.
+        let held = [(0, 100), (1, 200)];
+        arrivals.deliver((0, 100), &none);
+        arrivals.deliver((1, 200), &none);
+        assert_ne!(
+            arrivals.presence(third, &held, &none),
+            Presence::Arrived,
+            "the third launch was given a process one of its predecessors had already been given, \
+             so its wait() returns Ok for a target that never stopped"
+        );
+
+        // And its own arrival still reaches it.
+        let held = [(0, 100), (1, 200), (2, 300)];
+        arrivals.deliver((2, 300), &none);
+        assert_eq!(
+            arrivals.presence(third, &held, &none),
+            Presence::Arrived,
+            "the third launch was refused a process nobody else had been given, so an inheritance \
+             is refusing arrivals wholesale rather than the ones it names"
         );
     }
 
@@ -6322,7 +6483,8 @@ mod tests {
         assert_ne!(
             arrivals.presence(second, &[(0, 100)], &none),
             Presence::Arrived,
-            "a process the first launch had been given was handed to the second once the first              guard was gone, so its wait() returns Ok for a target that never stopped"
+            "a process the first launch had been given was handed to the second once the first \
+             guard was gone, so its wait() returns Ok for a target that never stopped"
         );
 
         // And the inheritance goes when the opens that hold it do.
@@ -6332,7 +6494,8 @@ mod tests {
         assert_eq!(
             arrivals.presence(third, &[(0, 100)], &none),
             Presence::Arrived,
-            "an open registered after everything else had finished inherited a claim that should              have gone with them, which is the lifecycle this shape exists not to have"
+            "an open registered after everything else had finished inherited a claim that should \
+             have gone with them, which is the lifecycle this shape exists not to have"
         );
     }
 
@@ -7055,7 +7218,8 @@ mod tests {
         };
         assert!(
             matches!(owner.presence_of(registered), Presence::Arrived),
-            "a stop pumped through the second wrapper did not reach the open the first is              holding, so its wait() will spend the whole bound on an event that has happened"
+            "a stop pumped through the second wrapper did not reach the open the first is holding, \
+             so its wait() will spend the whole bound on an event that has happened"
         );
 
         drop(pending);
@@ -7109,7 +7273,8 @@ mod tests {
                 .unwrap_or_else(|err| err.into_inner())
                 .pending
                 .is_empty(),
-            "an open registered against a session the owner's drop ended is still first in line,              so the next launch through this wrapper loses its stop to it"
+            "an open registered against a session the owner's drop ended is still first in line, \
+             so the next launch through this wrapper loses its stop to it"
         );
     }
 
@@ -7144,7 +7309,8 @@ mod tests {
             let borrowed = DebugEngine::from_client_interface(owner.client.clone());
             assert!(
                 borrowed.attached_to_a_live_process(),
-                "a wrapper that did not perform the attach cannot see it, so its teardown will                  take a process it was only looking at"
+                "a wrapper that did not perform the attach cannot see it, so its teardown will \
+                 take a process it was only looking at"
             );
 
             // The teardown through that second wrapper has to detach rather than kill.
@@ -7153,7 +7319,8 @@ mod tests {
         assert_eq!(
             exit_code_of(theirs.id()),
             Some(STILL_RUNNING),
-            "the attached process was taken by a teardown through the wrapper that did not attach              to it"
+            "the attached process was taken by a teardown through the wrapper that did not attach \
+             to it"
         );
 
         let _ = theirs.kill();
@@ -7203,16 +7370,18 @@ mod tests {
                 .pending
                 .iter()
                 .find(|pending| pending.id == id)
-                .and_then(|pending| pending.arrived)
+                .and_then(|pending| pending.claim.held())
         };
         let (a, b) = (claimed(one.id), claimed(two.id));
         assert!(
             a.is_some() && b.is_some(),
-            "two waits realised {a:?} and {b:?}, so one launch was never delivered anything and              this says nothing about telling them apart"
+            "two waits realised {a:?} and {b:?}, so one launch was never delivered anything and \
+             this says nothing about telling them apart"
         );
         assert_ne!(
             a, b,
-            "both launches were given the same arrival, which is the ambiguity a register of              pending opens exists to remove"
+            "both launches were given the same arrival, which is the ambiguity a register of \
+             pending opens exists to remove"
         );
         drop(arrivals);
 
@@ -7672,11 +7841,13 @@ mod tests {
         assert_eq!(
             breakpoints(&e).expect("bl failed"),
             Vec::<String>::new(),
-            "run_to_address left its breakpoint armed after a timeout — a later `g` passing              that address would stop there spuriously"
+            "run_to_address left its breakpoint armed after a timeout — a later `g` passing that \
+             address would stop there spuriously"
         );
         assert!(
             command_took_effect(&e, 0x63),
-            "the engine is unusable after a timeout — the target was left running, or the              current process/thread was never restored"
+            "the engine is unusable after a timeout — the target was left running, or the current \
+             process/thread was never restored"
         );
         let _ = e.end_session();
     }
@@ -8673,7 +8844,8 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|err| err.into_inner())
                     .contains_key(&theirs.id()),
-                "an attachment that can never join was kept, so a later process inheriting its                  pid is treated as one this engine only attached to"
+                "an attachment that can never join was kept, so a later process inheriting its pid \
+                 is treated as one this engine only attached to"
             );
 
             drop(attaching);
@@ -8704,7 +8876,8 @@ mod tests {
             .expect("launch failed");
         assert!(
             !e.holds_nothing_at_all(),
-            "a session with a live target read as holding nothing, so a failed pump would retire              an attach the engine has not yet had a chance to process"
+            "a session with a live target read as holding nothing, so a failed pump would retire \
+             an attach the engine has not yet had a chance to process"
         );
         let _ = e.end_session();
     }
@@ -8737,7 +8910,8 @@ mod tests {
         let outcome = e.wait_for_live_target(&waiting);
         assert!(
             matches!(outcome, Err(DbgEngError::CommandFailed(_))),
-            "the open answered {outcome:?} rather than failing, so it did not take the ending              this test is about"
+            "the open answered {outcome:?} rather than failing, so it did not take the ending this \
+             test is about"
         );
         assert!(
             !e.state
@@ -8745,7 +8919,8 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
                 .contains_key(&absent),
-            "a pump that failed with the session holding nothing left the record behind, so a              later process inheriting that pid is treated as one this engine only attached to"
+            "a pump that failed with the session holding nothing left the record behind, so a \
+             later process inheriting that pid is treated as one this engine only attached to"
         );
     }
 
@@ -8782,7 +8957,8 @@ mod tests {
         let outcome = e.wait_for_live_target(&waiting);
         assert!(
             matches!(outcome, Err(DbgEngError::LiveTargetTimeout)),
-            "the open answered {outcome:?} rather than timing out, so it did not reach the branch              that retires the record"
+            "the open answered {outcome:?} rather than timing out, so it did not reach the branch \
+             that retires the record"
         );
         assert!(
             !e.state
@@ -8825,7 +9001,8 @@ mod tests {
                     .expect("could not list the session")
                     .iter()
                     .any(|(_, pid)| *pid == theirs.id()),
-                "the attached process is already listed, so this window does not exist here and                  the test is asserting nothing"
+                "the attached process is already listed, so this window does not exist here and \
+                 the test is asserting nothing"
             );
 
             // The opener that prunes, in that window.
@@ -8839,7 +9016,8 @@ mod tests {
                     .unwrap_or_else(|err| err.into_inner())
                     .get(&theirs.id()),
                 Some(&Attachment::Deferred),
-                "the prune took a record of an attachment that had not joined yet, so the                  teardown will treat somebody else's process as one this engine launched"
+                "the prune took a record of an attachment that had not joined yet, so the teardown \
+                 will treat somebody else's process as one this engine launched"
             );
 
             attaching.wait().expect("the attach should complete");
@@ -9174,7 +9352,8 @@ mod tests {
         };
         assert!(
             matches!(e.presence_of(registered), Presence::Arrived),
-            "the stop was not delivered to the open that was waiting for it, so its `wait()`              would pump again for an event that has already happened"
+            "the stop was not delivered to the open that was waiting for it, so its `wait()` would \
+             pump again for an event that has already happened"
         );
 
         drop(pending);
@@ -9203,7 +9382,8 @@ mod tests {
         let waited = e.wait_for_event(300);
         assert!(
             waited.is_err(),
-            "a wait on an engine with no debuggee returned {waited:?} instead of failing — if it              now expires, `presence_of`'s empty-session arm is reachable and wants a bound test"
+            "a wait on an engine with no debuggee returned {waited:?} instead of failing — if it \
+             now expires, `presence_of`'s empty-session arm is reachable and wants a bound test"
         );
     }
 
@@ -9244,7 +9424,8 @@ mod tests {
         assert_eq!(
             outcome,
             WaitOutcome::Expired,
-            "a wait with nothing to report answered {outcome:?}, so the bound did not expire and              nothing here is under test"
+            "a wait with nothing to report answered {outcome:?}, so the bound did not expire and \
+             nothing here is under test"
         );
         assert!(
             !matches!(e.presence_of(&watcher), Presence::Arrived),
@@ -9495,11 +9676,13 @@ mod tests {
                 .any(|entry| *entry == (id, pid));
             assert!(
                 back,
-                "the reattach did not get the pair ({id}, {pid}) back, so this run never met the                  collision and asserts nothing"
+                "the reattach did not get the pair ({id}, {pid}) back, so this run never met the \
+                 collision and asserts nothing"
             );
             assert!(
                 !matches!(e.presence_of(registered), Presence::Arrived),
-                "the departed process's claim survived the opener's prune, so the pair it holds                  refuses the next open its own stop"
+                "the departed process's claim survived the opener's prune, so the pair it holds \
+                 refuses the next open its own stop"
             );
 
             drop(launched);
@@ -9556,7 +9739,8 @@ mod tests {
             };
             assert!(
                 !matches!(e.presence_of(registered), Presence::Arrived),
-                "the reattach's open was arrived before its wait, so it inherited an answer about                  the process that left"
+                "the reattach's open was arrived before its wait, so it inherited an answer about \
+                 the process that left"
             );
             guard.wait().expect("the reattach should complete");
         }
