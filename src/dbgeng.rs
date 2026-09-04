@@ -566,11 +566,20 @@ impl Pending {
             // must not claim an arrival some other open is entitled to.
             Arrival::Launched(None) => false,
             Arrival::Launched(Some(before)) => {
+                // An attach still *waiting* for this pid, and only one. The exclusion is here
+                // because a launch is identified by elimination, so the process an attach named is
+                // new to the launch's snapshot and looks like the launch's own -- a reason that
+                // holds exactly while the attach could still claim it. One already delivered is
+                // covered by the `claim.held()` check above, which is exact where this is by pid;
+                // one whose process has departed will never claim anything again, and leaving it
+                // to exclude means a later launch that inherits the pid is refused its own stop by
+                // an open that is finished with it. Raised in review on dbgscope#139.
                 !before.contains(&entry)
                     && !attached.contains(&entry.1)
-                    && !others
-                        .iter()
-                        .any(|other| matches!(other.what, Arrival::Attached(pid) if pid == entry.1))
+                    && !others.iter().any(|other| {
+                        matches!(other.claim, Claim::Waiting)
+                            && matches!(other.what, Arrival::Attached(pid) if pid == entry.1)
+                    })
             }
         }
     }
@@ -5887,11 +5896,22 @@ impl Drop for Registered<'_> {
 /// `prune_processes_that_left` was — and there a stale claim makes a legitimate launch wait out
 /// `LIVE_WAIT_MS` and fail.
 ///
-/// dbgscope#136 stage 3 removes it, and removes that cost with it. An arrival is delivered to a
-/// registered open ([`Arrivals`]) and **claimed** by it, so the second launch is still waiting when
-/// the next one comes; and because an entry cannot outlive the guard that made it, there is no
+/// dbgscope#136 stage 3 removes most of it, and removes that cost with it. An arrival is delivered
+/// to a registered open ([`Arrivals`]) and **claimed** by it, so the second launch is still waiting
+/// when the next one comes; and because an entry cannot outlive the guard that made it, there is no
 /// stale claim to prune or clear. The record whose lifecycle made the fix expensive was the thing
-/// the fix would have joined.
+/// the fix would have joined. A guard that finishes and is dropped hands its claim to the opens
+/// still waiting ([`Arrivals::forget`]), so the two live guards and the delivered-then-dropped case
+/// are both exact.
+///
+/// **What is left is a launch abandoned before it is delivered anything**, and it is dbgscope#141
+/// rather than this change: dropping such a guard takes a `Waiting` entry out of the register and
+/// leaves no exclusion, so the process the deferred `CreateProcessWide` still produces is new to
+/// the *next* launch's snapshot and is claimed by it. Keeping the entry is not simply the fix —
+/// nothing would ever retire one whose launch failed to start (`deferred_arrival` arm C: an image
+/// that does not exist fails inside the wait), and it would then take the next launch's process
+/// and time that guard out instead. A wrong `Ok` for a wrong timeout is a trade rather than a fix,
+/// and it wants deciding on its own.
 #[derive(Debug)]
 enum Arrival {
     /// A process this engine launched: one the session did not hold when the launch was issued and
@@ -6417,6 +6437,41 @@ mod tests {
             Presence::Absent,
             "an open that finished and whose target then left took somebody else's process rather \
              than staying finished"
+        );
+    }
+
+    /// **An attach that is finished with a pid does not keep a launch from it.**
+    ///
+    /// The exclusion beside it — a pending attach keeps its process from a pending launch — reads
+    /// the *registration*, which says which pid the open named and not whether it can still have
+    /// it. An attach whose process has left is done, and Windows reuses pids: leaving it to exclude
+    /// means a later launch that inherits the number is refused its own stop by an open that will
+    /// never claim anything again, nobody else wants it, and that guard times out with its target
+    /// stopped in front of it. Raised in review on dbgscope#139.
+    ///
+    /// The attach's guard is deliberately still held here. Dropping it takes the entry out of the
+    /// register and the question with it, which is a different test.
+    #[test]
+    fn test_a_finished_attach_does_not_keep_a_launch_from_a_reused_pid() {
+        let none = HashSet::new();
+        let mut arrivals = Arrivals::default();
+        let attach = arrivals.register(Arrival::Attached(100));
+        arrivals.deliver((0, 100), &none);
+        arrivals.forget_departed(&[]);
+
+        // A launch begun after that, and the pid comes back around on its process.
+        let launch = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        arrivals.deliver((1, 100), &none);
+        assert_eq!(
+            arrivals.presence(launch, &[(1, 100)], &none),
+            Presence::Arrived,
+            "the launch was refused its own stop by an attach that is finished with the pid, so \
+             nobody claimed it and the guard times out on a target in front of it"
+        );
+        assert_eq!(
+            arrivals.presence(attach, &[(1, 100)], &none),
+            Presence::Absent,
+            "the finished attach took a process it did not attach to"
         );
     }
 
