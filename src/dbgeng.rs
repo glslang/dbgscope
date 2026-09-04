@@ -541,6 +541,11 @@ struct Pending {
     /// Processes another open was given before it finished, which this one must not be given now
     /// that the record of that claim has gone with its guard. See [`Arrivals::forget`].
     inherited: Vec<(u32, u32)>,
+    /// Its guard is gone and it was never delivered anything, but its `CreateProcessWide` is still
+    /// queued — so the entry stays to claim the process that create still produces. Nothing holds
+    /// its id any more; it exists only to keep that process from the *next* launch, and it goes
+    /// with the session ([`Arrivals::forget_all`]). See [`Arrivals::forget`], dbgscope#141.
+    abandoned: bool,
 }
 
 impl Pending {
@@ -611,6 +616,7 @@ impl Arrivals {
             what,
             claim: Claim::Waiting,
             inherited: Vec::new(),
+            abandoned: false,
         });
         id
     }
@@ -648,12 +654,34 @@ impl Arrivals {
     /// that process out of every inheritance, and putting it back is the stale claim that method
     /// exists to remove.
     fn forget(&mut self, id: ArrivalId) {
-        let claimed = self
-            .pending
-            .iter()
-            .find(|pending| pending.id == id)
-            .and_then(|pending| pending.claim.held());
-        self.pending.retain(|pending| pending.id != id);
+        let Some(index) = self.pending.iter().position(|pending| pending.id == id) else {
+            return;
+        };
+        // **A launch abandoned before it was delivered anything keeps its place in the queue**
+        // (dbgscope#141). Dropping the guard does not un-queue the `CreateProcessWide` behind it,
+        // so that process still arrives — and it is new to the *next* launch's snapshot, because
+        // it did not exist when that snapshot was taken, so without this the next launch claims it
+        // and its `wait()` returns for a target it never asked for. Measured before it was fixed:
+        // a launch of `ping.exe` behind an abandoned `cmd.exe` was delivered the `cmd.exe`.
+        //
+        // The entry is kept rather than an exclusion left behind, because there is nothing to
+        // exclude yet — which process the create will produce is exactly what nobody knows. Being
+        // first in registration order is what makes it right: `deliver` offers in that order, and
+        // the engine realises queued creates in it.
+        //
+        // **Only a launch, and only one that has been given nothing.** An abandoned *attach* is
+        // already covered by the engine's `attached_processes`, which is what `Pending::wants`
+        // reads it for; and an entry that has a claim is removed and its claim inherited, as
+        // before. `Launched(None)` is removed too: it can never claim anything, so keeping it
+        // would leave an entry that does nothing at all.
+        if self.pending[index].claim == Claim::Waiting
+            && matches!(self.pending[index].what, Arrival::Launched(Some(_)))
+        {
+            self.pending[index].abandoned = true;
+            return;
+        }
+        let claimed = self.pending[index].claim.held();
+        self.pending.remove(index);
         if let Some(entry) = claimed {
             for pending in &mut self.pending {
                 pending.inherited.push(entry);
@@ -6539,6 +6567,55 @@ mod tests {
         );
     }
 
+    /// **An abandoned launch keeps its place in the queue; an abandoned attach does not.**
+    ///
+    /// dbgscope#141. Dropping a launch guard does not un-queue its `CreateProcessWide`, so that
+    /// process still arrives — new to the next launch's snapshot, because it did not exist when
+    /// that snapshot was taken. Removing the entry therefore hands it to the next launch.
+    ///
+    /// The attach half is the other rule and is asserted here rather than assumed, because it is
+    /// the one that says why this is not "keep every abandoned entry": an attach names a pid, and
+    /// the engine's own `attached_processes` already covers one whose guard has gone — which is
+    /// what [`Pending::wants`] reads that set for. Keeping the entry as well would leave
+    /// [`Arrivals::presence`] answering `Listed` for an id nobody holds.
+    #[test]
+    fn test_an_abandoned_launch_keeps_its_place_and_an_attach_does_not() {
+        let none = HashSet::new();
+        let mut arrivals = Arrivals::default();
+
+        let abandoned = arrivals.register(Arrival::Launched(Some(Vec::new())));
+        arrivals.forget(abandoned);
+        let mine = arrivals.register(Arrival::Launched(Some(Vec::new())));
+
+        // The abandoned launch's own process, arriving after its guard has gone.
+        arrivals.deliver((0, 100), &none);
+        assert_ne!(
+            arrivals.presence(mine, &[(0, 100)], &none),
+            Presence::Arrived,
+            "the next launch was given the abandoned launch's process, so its wait() returns for a \
+             target it never asked for"
+        );
+
+        // And its own still reaches it, or the entry is refusing arrivals wholesale.
+        arrivals.deliver((1, 200), &none);
+        assert_eq!(
+            arrivals.presence(mine, &[(0, 100), (1, 200)], &none),
+            Presence::Arrived,
+            "the next launch was refused a process nobody else was entitled to"
+        );
+
+        // An abandoned attach is removed: `attached_processes` covers it, and a kept entry would
+        // answer `Listed` for an id nobody holds.
+        let attach = arrivals.register(Arrival::Attached(300));
+        arrivals.forget(attach);
+        assert_eq!(
+            arrivals.presence(attach, &[(2, 300)], &none),
+            Presence::Absent,
+            "an abandoned attach was kept in the register, where the engine's own attachment record \
+             is what covers it"
+        );
+    }
+
     /// **A claim is inherited by every open still waiting, not handed along one at a time.**
     ///
     /// Put to *three* launches, because with two "every remaining open" and "the next one" are the
@@ -7579,6 +7656,121 @@ mod tests {
         drop(first);
         drop(second);
         e.end_session().expect("end_session failed");
+    }
+
+    /// **A launch abandoned before anything pumps does not hand its process to the next launch**
+    /// (dbgscope#141).
+    ///
+    /// Dropping a guard takes a `Waiting` entry out of the register and leaves no exclusion behind
+    /// — there is nothing to leave, since nothing was ever delivered to it. The queued
+    /// `CreateProcessWide` still produces a process, and it is new to the *next* launch's snapshot
+    /// because it did not exist when that snapshot was taken.
+    ///
+    /// **This has to read which process was delivered, not what the session holds.** Two attempts
+    /// through the public surface both passed while the defect was live, which is why the assertion
+    /// is where it is: counting processes when `wait()` returns says nothing, because **one pump
+    /// realises both queued creates** (measured: session 0 → 2 on a single `WaitForEvent`); and
+    /// asking whether the second program is *listed* says nothing either, because membership is the
+    /// weaker claim this whole module is built on not confusing with having stopped.
+    ///
+    /// So it reads the register rather than the session, and asserts the property the fix actually
+    /// delivers: **the abandoned entry absorbs an arrival of its own**, distinct from the next
+    /// launch's. Before the fix nothing accounted for the abandoned create, so the next launch was
+    /// satisfied by the first stop to arrive and no one was waiting for the other process at all.
+    ///
+    /// **It deliberately does not assert that the next launch got its *own* process, because that
+    /// is not true and cannot be made true by this change.** `deliver` offers in registration
+    /// order and the abandoned entry is first, so it takes whichever process arrives first — and
+    /// one `WaitForEvent` realises *both* queued creates (measured: session 0 → 2 on a single
+    /// pump), so which one the event names is a coin flip. Asserting the image name here failed
+    /// about half of all runs with the fix in place, which is how this was found. Identifying a
+    /// launch by arrival order is the residual ambiguity [`Arrival`] has always documented for two
+    /// launches pending at once; dbgscope#139 closed "both guards get the same arrival", not "each
+    /// guard gets its own", and closing the second needs something to match on rather than an
+    /// order. See dbgscope#141.
+    ///
+    /// **Several rounds, because one is racy in the direction that matters.** Measured with the fix
+    /// backed out, a single round catches the defect 9 times in 10 and passes the other time — a
+    /// guard that goes green on broken code one run in ten is the wrong way round.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_an_abandoned_launch_does_not_hand_its_process_to_the_next_one() {
+        let _debuggee = one_debuggee();
+        for round in 1..=5 {
+            an_abandoned_launch_round(round);
+        }
+    }
+
+    /// One round of [`test_an_abandoned_launch_does_not_hand_its_process_to_the_next_one`], in its
+    /// own session so a round cannot inherit the previous one's processes.
+    #[cfg(not(miri))]
+    fn an_abandoned_launch_round(round: usize) {
+        let e = DebugEngine::new();
+
+        // Abandoned before anything pumps, so its create is still queued.
+        let abandoned = e
+            .launch_process_begin("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("the first launch would not begin");
+        drop(abandoned);
+
+        let mine = e
+            .launch_process_begin("ping.exe -n 30 127.0.0.2")
+            .expect("the second launch would not begin");
+        let WaitKind::Live(registered) = &mine.kind else {
+            panic!("a launch guard is not a live open");
+        };
+        let id = registered.id;
+
+        // **Pumped directly rather than through `wait()`**, which consumes the guard and takes the
+        // registration with it — the claim has to be read while the open is still alive, and the
+        // first draft of this test read it afterwards and found nothing at all. Bounded rather than
+        // once, for the reason `test_the_openers_prune_clears_a_claim_on_a_departed_process` gives:
+        // one `WaitForEvent` is one *event*, however many creates it happens to realise.
+        let claim_of = |id: ArrivalId| {
+            e.state
+                .arrivals
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .pending
+                .iter()
+                .find(|pending| pending.id == id)
+                .and_then(|pending| pending.claim.held())
+        };
+        let mut claimed = None;
+        for _ in 0..5 {
+            claimed = claim_of(id);
+            if claimed.is_some() {
+                break;
+            }
+            e.wait_for_event(LIVE_WAIT_MS).expect("a pump failed");
+        }
+        let mine = claimed.expect("nothing was delivered to the second launch in five pumps");
+
+        // The abandoned entry absorbed an arrival of its own, and a different one. **That** is
+        // what the fix delivers: before it, no entry accounted for the abandoned create, so the
+        // second launch was satisfied by the first stop to arrive and nothing was waiting for the
+        // other process at all.
+        let absorbed = e
+            .state
+            .arrivals
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .pending
+            .iter()
+            .find(|pending| pending.abandoned)
+            .and_then(|pending| pending.claim.held());
+        let absorbed = absorbed.unwrap_or_else(|| {
+            panic!(
+                "round {round}: the abandoned launch's entry was given nothing, so its process was \
+                 left for whoever asked next"
+            )
+        });
+        assert_ne!(
+            absorbed, mine,
+            "round {round}: the abandoned launch and the one after it were given the same process"
+        );
+
+        let _ = e.end_session();
     }
 
     /// Reads a debugger pseudo-register (`$t0`, …) as a number, via `? <expr>` — whose output
