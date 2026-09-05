@@ -12,6 +12,10 @@ All notable changes to this project are documented here. The format follows
   kind, engine process and thread, and, when the event carried one, an `ExceptionRecord` with the
   code, flags, faulting address and parameters. That is `.exr -1` typed, and it is the user-mode
   counterpart to `bug_check`: on a target stopped by a fault it is the record that stopped it.
+  `Ok(None)` where the engine has seen no event, which is any engine before its first wait —
+  including a dump `open_dump` has *named* but nothing has pumped. That case is `None` rather than
+  an error because the engine does not fail it: it answers `S_OK` with kind `0` and `DEBUG_ANY_ID`
+  for both ids, and kind `0` is not a `DEBUG_EVENT_*` value.
   `ExceptionRecord::parameters` arrives already cut to the record's own `NumberParameters` (and
   clamped to the fifteen slots there are), because the count is the field that tells the two shapes
   of a `0xc0000409` apart — one parameter is the CRT's `abort`, three is WIL's, whose second is the
@@ -31,6 +35,11 @@ All notable changes to this project are documented here. The format follows
   fail-fast dump, after `~1s` the other walk returns the parked thread's six frames while this one
   still returns the crash's twelve, while `.frame`, `.cxr` and `.ecxr` move neither, since they
   change the symbol scope and `GetStackTrace` walks from the thread's registers.
+  A `ThreadContext` carries the target it was read from and is refused
+  (`DbgEngError::ContextFromAnotherTarget`) by an engine that no longer holds it, exactly as
+  `set_scope` refuses a stale `Scope` — and for a sharper reason: a stale scope points the session
+  somewhere visibly wrong, while a stale context comes back as frames, which is an answer a caller
+  cannot tell from the right one.
 - `examples/stored_event_probe.rs`, the measurements behind the three. It also caught the one that
   would otherwise have shipped: `GetStoredEventInformation` does **not** refuse a context buffer
   that is too small the way `GetScope` does. It truncates — offered 716 bytes for an x64 dump it

@@ -140,6 +140,16 @@ pub enum DbgEngError {
 
     #[error("this scope was read from a target the engine no longer holds")]
     ScopeFromAnotherTarget,
+
+    /// The sibling of [`Self::ScopeFromAnotherTarget`], for the same hazard on the other saved
+    /// register state this crate hands out.
+    ///
+    /// A [`crate::dbgeng::ThreadContext`] means something only on the target it was read from, and
+    /// walking a stack from one belonging to a *previous* target is the worse of the two: a stale
+    /// scope points the session somewhere visibly wrong, while a stale context comes back as
+    /// frames. The engine unwinds whatever those addresses reach now and answers.
+    #[error("this register context was read from a target the engine no longer holds")]
+    ContextFromAnotherTarget,
 }
 
 /// Fallback length of `_EPROCESS::ImageFileName` when the field's own size cannot be read.
@@ -232,6 +242,15 @@ const SCOPE_CONTEXT_SIZES: &[u32] = &[716, 912, 1232, 2048, 4096, 8192, 16384, 3
 /// rather than below them, and grows only on the one signal this call gives that there was more to
 /// write: the engine having filled the buffer exactly to the brim.
 const STORED_CONTEXT_SIZES: &[u32] = &[4096, 8192, 16384, 32768, 65536];
+
+/// The event kind an engine reports when it has no event to report.
+///
+/// Not a `DEBUG_EVENT_*` constant, because it is not one: the engine's own list starts at
+/// `DEBUG_EVENT_BREAKPOINT` (`0x1`) and every value in it is a single bit. Zero is what
+/// `GetLastEventInformation` answers — with `S_OK`, and `DEBUG_ANY_ID` for both ids — on an engine
+/// that has seen nothing, which is any engine before its first wait and a dump `open_dump` has
+/// named but nothing has pumped.
+const NO_EVENT_KIND: u32 = 0;
 
 /// Ctrl+Breaks one engine from another thread.
 ///
@@ -1665,15 +1684,32 @@ const EXCEPTION_NONCONTINUABLE: u32 = 0x1;
 /// than from wherever the session's scope happens to point ([`DebugEngine::stack_frames_from`]).
 /// That is what `.ecxr` does to a session, without doing it to the session: the caller's selected
 /// frame and thread are untouched, so a triage that walks the crash stack is still a read.
+///
+/// **It carries the target it was read from, exactly as [`Scope`] does**, and for a sharper
+/// version of the same reason. These registers and the stack addresses in them mean something only
+/// on that target, so handing one to an engine that has since released it and opened another walks
+/// whatever those addresses reach now. Unlike a stale [`Scope`] — which points the session
+/// somewhere visibly wrong — a stale context comes back as *frames*, which is an answer a caller
+/// has no way to tell from the right one. [`DebugEngine::stack_frames_from`] refuses it instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadContext {
     bytes: Vec<u8>,
+    /// The [`DebugEngine::target_identity`] this was read from; see the type's own note.
+    target: u64,
 }
 
 impl ThreadContext {
     /// The bytes, for the one caller that has to hand them back to the engine.
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// The [`DebugEngine::target_identity`] of the target this was read from.
+    ///
+    /// Exposed because a caller holding one across a session boundary is the party that can say
+    /// whether that was deliberate, and comparing is cheaper than being refused.
+    pub fn target(&self) -> u64 {
+        self.target
     }
 
     /// How many bytes the engine reported, which is the `CONTEXT` size for this target — not the
@@ -3590,8 +3626,14 @@ impl DebugEngine {
     /// [`Self::session_processes`], which answers both — so callers join it to that pairing rather
     /// than to a pid.
     ///
-    /// Fails on an engine that has seen no event, which is every engine before its first wait, and
-    /// that failure is an answer of "cannot say" rather than "no".
+    /// **An engine that has seen no event does not fail this — it answers `DEBUG_ANY_ID`.**
+    /// Measured on both an engine holding nothing and a dump `open_dump` has named but nothing has
+    /// pumped (`examples/stored_event_probe.rs`, `empty` and `unwaited`): `S_OK`, kind `0`, and
+    /// `0xffffffff` for both ids. This used to say the call fails there, which is where
+    /// [`Self::last_event`] inherited the same wrong claim from (dbgscope#144). It costs the one
+    /// caller nothing — `record_where_it_stopped` looks the id up in the session listing, and
+    /// `DEBUG_ANY_ID` is in no listing — but a caller that read it as an engine id would be
+    /// joining on a sentinel.
     ///
     /// **The event *kind* is read and dropped, and that is not an oversight.** Review round 14
     /// asked for the stop reason to be preserved and validated, so that an open completes on its
@@ -5079,9 +5121,18 @@ impl DebugEngine {
     /// gets *that* event and not the fault. On a freshly opened dump it is the event the dump was
     /// written for; [`Self::stored_event`] is the one that stays that way.
     ///
-    /// Fails on an engine that has seen no event, which is every engine before its first wait.
-    /// That failure is "cannot say" rather than "nothing happened".
-    pub fn last_event(&self) -> Result<DebugEvent, DbgEngError> {
+    /// `Ok(None)` where the engine has seen no event, which is every engine before its first wait
+    /// — including a dump that `open_dump` has *named* but nothing has pumped, since the engine
+    /// reads one on the first wait and not at the open.
+    ///
+    /// **That case is `None` rather than an error because the engine does not fail it.** It
+    /// answers `S_OK` with kind `0` and `DEBUG_ANY_ID` for both ids, and kind `0` is not a
+    /// `DEBUG_EVENT_*` value — there is no event, and the engine is saying so. Returning that
+    /// event as if it were one would hand a caller a `DebugEvent` whose `kind` means "nothing
+    /// happened yet" and let "the target is not loaded" read as an event kind this build does not
+    /// recognise (dbgscope#144). Measured by `examples/stored_event_probe.rs`'s `empty` and
+    /// `unwaited` arms.
+    pub fn last_event(&self) -> Result<Option<DebugEvent>, DbgEngError> {
         let mut kind = 0u32;
         let mut process = 0u32;
         let mut thread = 0u32;
@@ -5109,8 +5160,13 @@ impl DebugEngine {
             operation: "reading the engine's last event".into(),
             source,
         })?;
+        // See the doc comment: an engine with nothing to report succeeds and says so with a kind
+        // that is not an event kind, rather than failing.
+        if kind == NO_EVENT_KIND {
+            return Ok(None);
+        }
         let exception = extra.exception(kind, used);
-        Ok(DebugEvent {
+        Ok(Some(DebugEvent {
             kind,
             process,
             thread,
@@ -5119,7 +5175,7 @@ impl DebugEngine {
             // `GetLastEventInformation` carries no context. `.ecxr` works on a dump because the
             // *stored* event has one, which is why the two calls are not one.
             context: None,
-        })
+        }))
     }
 
     /// The event a dump was written for, with the register context it was written with — what
@@ -5179,7 +5235,10 @@ impl DebugEngine {
                         thread,
                         first_chance: exception.as_ref().is_some_and(|(_, first)| *first),
                         exception: exception.map(|(record, _)| record),
-                        context: (!context.is_empty()).then_some(ThreadContext { bytes: context }),
+                        context: (!context.is_empty()).then(|| ThreadContext {
+                            bytes: context,
+                            target: self.target_identity(),
+                        }),
                     }));
                 }
                 // **Checked before the retry, not after it.** "There is no stored event" is an
@@ -5273,6 +5332,13 @@ impl DebugEngine {
     ) -> Result<Vec<StackFrame>, DbgEngError> {
         if max_frames == 0 {
             return Ok(Vec::new());
+        }
+        // **Refused before the engine sees it, exactly as `set_scope` refuses a stale scope.**
+        // The check is cheap and the failure it prevents is not detectable afterwards: a context
+        // from a released target unwinds whatever its addresses reach in the new one and comes
+        // back as a plausible stack.
+        if context.target != self.target_identity() {
+            return Err(DbgEngError::ContextFromAnotherTarget);
         }
         // An empty context would be read by the engine as "walk from the current one", which is
         // the question `stack_frames` answers and the opposite of what this was called for. A
@@ -10867,6 +10933,64 @@ mod tests {
                 .exception(DEBUG_EVENT_EXCEPTION, ExtraEventInfo::SIZE - 1)
                 .is_none(),
             "a write shorter than the struct was read as the whole struct"
+        );
+    }
+
+    /// An engine that has seen no event reports no event, rather than an event kind of nothing.
+    ///
+    /// The engine does **not** fail this call before its first wait: it answers `S_OK` with kind
+    /// `0` and `DEBUG_ANY_ID` for both ids. Without the check that turns that into `None`, a
+    /// caller is handed a `DebugEvent` whose `kind` is not a `DEBUG_EVENT_*` value at all, and
+    /// "the target is not loaded yet" reads as an event kind this build does not recognise
+    /// (dbgscope#144). An engine holding nothing is the cheapest way to reach that state; the
+    /// other is a dump named but not pumped, which needs a file and is in the probe.
+    #[test]
+    fn test_an_engine_with_no_event_reports_none_rather_than_a_kind_of_zero() {
+        let e = DebugEngine::new();
+        assert!(
+            matches!(e.last_event(), Ok(None)),
+            "an engine that has seen no event did not report none — which means either it failed \
+             the call, or kind 0 was dressed up as an event"
+        );
+    }
+
+    /// A context is refused by an engine that no longer holds the target it was read from.
+    ///
+    /// The sibling of the `set_scope` rule, and the more important of the two: a stale scope points
+    /// the session somewhere visibly wrong, while a stale context comes back as *frames* — an
+    /// answer indistinguishable from the right one. Asserted against a real engine because
+    /// `target_identity` is engine state, and with **no target at all**, since the check has to
+    /// come before the engine sees the bytes rather than after it declines them.
+    #[test]
+    fn test_a_context_from_another_target_is_refused() {
+        let e = DebugEngine::new();
+        // Read from an engine whose identity is whatever it is now, and then invalidated the only
+        // way this crate can: by construction, since `target_identity` is per-engine.
+        let stale = ThreadContext {
+            bytes: vec![0u8; 1232],
+            target: e.target_identity().wrapping_add(1),
+        };
+        assert!(
+            matches!(
+                e.stack_frames_from(&stale, 8),
+                Err(DbgEngError::ContextFromAnotherTarget)
+            ),
+            "a context from another target was walked rather than refused"
+        );
+
+        // **And the refusal is about identity, not about there being no target.** A context whose
+        // identity matches gets past this check and fails on the engine instead, which is what
+        // shows the check is not passing everything through.
+        let current = ThreadContext {
+            bytes: vec![0u8; 1232],
+            target: e.target_identity(),
+        };
+        assert!(
+            !matches!(
+                e.stack_frames_from(&current, 8),
+                Err(DbgEngError::ContextFromAnotherTarget)
+            ),
+            "a context from this very engine was refused as another target's"
         );
     }
 

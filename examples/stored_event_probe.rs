@@ -2,8 +2,15 @@
 //! [`DebugEngine::last_event`], [`DebugEngine::stored_event`] and
 //! [`DebugEngine::stack_frames_from`].
 //!
-//! Five questions no unit test can answer, because each is a question about what a real
+//! Six questions no unit test can answer, because each is a question about what a real
 //! `dbgeng.dll` does. Measured on dbgeng 10.0.29547.1002, x64, Windows 11 26200, 2026-09-05.
+//!
+//! 0. **What does an engine with nothing to report say?** Not an error — `S_OK`, kind `0`, and
+//!    `DEBUG_ANY_ID` (`0xffffffff`) for both ids. True of an engine holding no target at all
+//!    (`empty`) *and* of a dump `open_dump` has named but nothing has pumped (`unwaited`), since
+//!    the engine reads the dump's event on the first wait rather than at the open. Kind `0` is not
+//!    a `DEBUG_EVENT_*` value, so `last_event` reports `None` for it rather than dressing it up as
+//!    an event; without that, "the target is not loaded yet" reads as an unrecognised event kind.
 //!
 //! 1. **How does the engine say "this target has no stored event"?** It refuses, and the refusal
 //!    has to be told apart from a failure. Measured: `E_UNEXPECTED` (`0x8000ffff`), on a live
@@ -33,7 +40,9 @@
 //!
 //! ```text
 //! cargo run --example stored_event_probe -- live
+//! cargo run --example stored_event_probe -- empty
 //! cargo run --example stored_event_probe -- dump <path-to-dump>
+//! cargo run --example stored_event_probe -- unwaited <path-to-dump>
 //! ```
 //!
 //! **The dump arm wants a user-mode fault dump, and a two-thread one to answer question 5.** The
@@ -72,16 +81,56 @@ fn main() {
     let arm = args.next().unwrap_or_else(|| "live".into());
     match arm.as_str() {
         "live" => live(),
+        "empty" => empty(),
         "dump" => match args.next() {
             Some(path) => dump(&path),
             None => {
                 println!("dump needs a path: cargo run --example stored_event_probe -- dump <path>")
             }
         },
+        "unwaited" => match args.next() {
+            Some(path) => unwaited(&path),
+            None => println!(
+                "unwaited needs a path: cargo run --example stored_event_probe -- unwaited <path>"
+            ),
+        },
         other => {
             println!("unknown arm {other}");
-            println!("arms: live, dump <path>");
+            println!("arms: live, empty, dump <path>, unwaited <path>");
         }
+    }
+}
+
+/// An engine holding nothing at all — the state every engine is in before its first open.
+fn empty() {
+    println!("======== empty: an engine with no target ========");
+    let engine = DebugEngine::new();
+    print_reads(&engine);
+}
+
+/// A dump named but never pumped, which is the state `open_dump` alone leaves the engine in.
+fn unwaited(path: &str) {
+    println!("======== unwaited: {path} ========");
+    let engine = DebugEngine::new();
+    if let Err(e) = engine.open_dump(path) {
+        println!("could not open {path}: {e}");
+        return;
+    }
+    print_reads(&engine);
+}
+
+/// Just the two event reads, for the arms that are asking what an engine says before it has
+/// anything to say.
+fn print_reads(engine: &DebugEngine) {
+    match engine.last_event() {
+        Ok(Some(event)) => print_event("last_event", &event),
+        Ok(None) => println!("  last_event: none — this engine has seen no event"),
+        Err(e) => println!("  last_event: {e}"),
+    }
+    match engine.stored_event() {
+        Ok(Some(event)) => print_event("stored_event", &event),
+        Ok(None) => println!("  stored_event: none"),
+        Err(e) => println!("  stored_event: {e}"),
     }
 }
 
@@ -129,7 +178,8 @@ fn dump(path: &str) {
 /// Both event reads, and the two stack walks, on whatever target the caller opened.
 fn report(engine: &DebugEngine) {
     match engine.last_event() {
-        Ok(event) => print_event("last_event", &event),
+        Ok(Some(event)) => print_event("last_event", &event),
+        Ok(None) => println!("  last_event: none — this engine has seen no event"),
         Err(e) => println!("  last_event: {e}"),
     }
     let stored = match engine.stored_event() {
