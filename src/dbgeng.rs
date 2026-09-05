@@ -7,7 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use windows::Win32::Foundation::{E_INVALIDARG, E_NOINTERFACE, S_FALSE, S_OK};
+use windows::Win32::Foundation::{
+    E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_UNEXPECTED, S_FALSE, S_OK,
+};
 use windows::core::{HRESULT, IUnknown, Interface, PCSTR, PCWSTR, PWSTR};
 
 // Import the necessary Windows Debug Engine interfaces
@@ -16,24 +18,24 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_BREAK_IO, DEBUG_BREAK_READ, DEBUG_BREAK_WRITE, DEBUG_BREAKPOINT_CODE,
     DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_DEFERRED, DEBUG_BREAKPOINT_ENABLED,
     DEBUG_BREAKPOINT_ONE_SHOT, DEBUG_CLASS_KERNEL, DEBUG_ENGOPT_INITIAL_BREAK,
-    DEBUG_EVENT_BREAKPOINT, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE, DEBUG_KERNEL_SMALL_DUMP,
-    DEBUG_MODNAME_SYMBOL_FILE, DEBUG_MODULE_PARAMETERS, DEBUG_MODULE_USER_MODE,
-    DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL, DEBUG_REGISTER_DESCRIPTION,
-    DEBUG_REGISTER_SUB_REGISTER, DEBUG_STACK_FRAME, DEBUG_STATUS_GO, DEBUG_STATUS_GO_HANDLED,
-    DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_MASK, DEBUG_STATUS_NO_DEBUGGEE,
-    DEBUG_STATUS_REVERSE_GO, DEBUG_STATUS_REVERSE_STEP_BRANCH, DEBUG_STATUS_REVERSE_STEP_INTO,
-    DEBUG_STATUS_REVERSE_STEP_OVER, DEBUG_STATUS_STEP_BRANCH, DEBUG_STATUS_STEP_INTO,
-    DEBUG_STATUS_STEP_OVER, DEBUG_SYMINFO_IMAGEHLP_MODULEW64, DEBUG_SYMTYPE_CODEVIEW,
-    DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA, DEBUG_SYMTYPE_EXPORT,
-    DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE, DEBUG_VALUE_FLOAT32,
-    DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82, DEBUG_VALUE_FLOAT128,
-    DEBUG_VALUE_INT8, DEBUG_VALUE_INT16, DEBUG_VALUE_INT32, DEBUG_VALUE_INT64,
-    DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128, DebugConnectWide, IDebugAdvanced2,
-    IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
+    DEBUG_EVENT_BREAKPOINT, DEBUG_EVENT_EXCEPTION, DEBUG_EXECUTE_ECHO, DEBUG_INTERRUPT_ACTIVE,
+    DEBUG_KERNEL_SMALL_DUMP, DEBUG_LAST_EVENT_INFO_EXCEPTION, DEBUG_MODNAME_SYMBOL_FILE,
+    DEBUG_MODULE_PARAMETERS, DEBUG_MODULE_USER_MODE, DEBUG_OUTCTL_THIS_CLIENT, DEBUG_OUTPUT_NORMAL,
+    DEBUG_REGISTER_DESCRIPTION, DEBUG_REGISTER_SUB_REGISTER, DEBUG_STACK_FRAME, DEBUG_STATUS_GO,
+    DEBUG_STATUS_GO_HANDLED, DEBUG_STATUS_GO_NOT_HANDLED, DEBUG_STATUS_MASK,
+    DEBUG_STATUS_NO_DEBUGGEE, DEBUG_STATUS_REVERSE_GO, DEBUG_STATUS_REVERSE_STEP_BRANCH,
+    DEBUG_STATUS_REVERSE_STEP_INTO, DEBUG_STATUS_REVERSE_STEP_OVER, DEBUG_STATUS_STEP_BRANCH,
+    DEBUG_STATUS_STEP_INTO, DEBUG_STATUS_STEP_OVER, DEBUG_SYMINFO_IMAGEHLP_MODULEW64,
+    DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
+    DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM, DEBUG_VALUE,
+    DEBUG_VALUE_FLOAT32, DEBUG_VALUE_FLOAT64, DEBUG_VALUE_FLOAT80, DEBUG_VALUE_FLOAT82,
+    DEBUG_VALUE_FLOAT128, DEBUG_VALUE_INT8, DEBUG_VALUE_INT16, DEBUG_VALUE_INT32,
+    DEBUG_VALUE_INT64, DEBUG_VALUE_VECTOR64, DEBUG_VALUE_VECTOR128, DebugConnectWide,
+    IDebugAdvanced2, IDebugBreakpoint2, IDebugClient6, IDebugControl4, IDebugDataSpaces4,
     IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
     IDebugSystemObjects,
 };
-use windows::Win32::System::Diagnostics::Debug::IMAGEHLP_MODULEW64;
+use windows::Win32::System::Diagnostics::Debug::{EXCEPTION_RECORD64, IMAGEHLP_MODULEW64};
 
 /// Callback type for breakpoint events that receives the breakpoint, context, and flags
 pub type BreakpointCallback =
@@ -213,6 +215,23 @@ const KERNEL_ATTACH_WAIT_MS: u32 = 60_000;
 /// is larger than any of them — a size this crate has not seen, and would otherwise refuse to
 /// read a scope for at all.
 const SCOPE_CONTEXT_SIZES: &[u32] = &[716, 912, 1232, 2048, 4096, 8192, 16384, 32768, 65536];
+
+/// Buffer sizes offered to `GetStoredEventInformation` for a stored event's register context,
+/// smallest first.
+///
+/// **A separate ladder from [`SCOPE_CONTEXT_SIZES`], because the two calls fail differently and
+/// borrowing the other one's rule produced a wrong answer that surfaced three calls later.**
+/// `GetScope` *refuses* a buffer below the target's `CONTEXT` size, so climbing from the smallest
+/// finds the exact size and the first rung that is accepted is the right one. This call does not
+/// refuse: offered 716 bytes for an **x64** dump it writes 716, reports 716, and returns success
+/// — a truncated context, which `GetContextStackTrace` then rejects with `E_INVALIDARG` from a
+/// caller that did nothing wrong. Measured on the user-mode fail-fast dump in
+/// `examples/stored_event_probe.rs`.
+///
+/// So it starts *above* every real `CONTEXT` — x64's is 1,232 bytes, ARM64's 912, x86's 716 —
+/// rather than below them, and grows only on the one signal this call gives that there was more to
+/// write: the engine having filled the buffer exactly to the brim.
+const STORED_CONTEXT_SIZES: &[u32] = &[4096, 8192, 16384, 32768, 65536];
 
 /// Ctrl+Breaks one engine from another thread.
 ///
@@ -1511,6 +1530,196 @@ pub struct BugCheck {
     /// The four parameters, in the order the bug check screen and `!analyze` print them as
     /// `Arg1`..`Arg4`.
     pub parameters: [u64; 4],
+}
+
+/// An exception the engine reported, as the fields of `EXCEPTION_RECORD64`.
+///
+/// The kernel's counterpart to [`BugCheck`], and kept as sparse for the same reason: what a given
+/// code's parameters *mean* is per-code lore — `0xc0000005`'s three say which access faulted where,
+/// `0xe06d7363`'s four are the MSVC throw — and none of it is knowledge the engine has. This is the
+/// record; deciding what it says is the caller's.
+///
+/// **[`Self::parameters`] is already cut to `NumberParameters`.** The raw record carries fifteen
+/// slots whatever it filled, and a caller reading past the count reads whatever the last exception
+/// on that thread left there. Trimming here is the difference between a parameter and a leftover,
+/// and it is exactly the count that tells the two shapes of a fail-fast apart: one parameter is the
+/// CRT's `abort`, three is WIL's, whose second is the `HRESULT`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionRecord {
+    /// The exception code — `0xc0000409` for a fail-fast, `0xe06d7363` for a C++ throw.
+    pub code: u32,
+    /// `EXCEPTION_NONCONTINUABLE` and friends; see [`Self::noncontinuable`].
+    pub flags: u32,
+    /// The instruction that raised it.
+    pub address: u64,
+    /// `ExceptionInformation`, cut to the `NumberParameters` the record declares.
+    pub parameters: Vec<u64>,
+    /// The address of the record this one is nested inside, or `None` at the outermost.
+    ///
+    /// A pointer into the target rather than a record: chasing it needs a read, and a caller that
+    /// does not care should not pay for one. Nesting is not exotic — an exception raised while
+    /// another is being handled produces exactly this — and a triage that missed it would report
+    /// the outer code for an inner fault.
+    pub nested: Option<u64>,
+}
+
+impl ExceptionRecord {
+    /// `EXCEPTION_NONCONTINUABLE`: resuming past this one raises a second exception rather than
+    /// continuing. True of every fail-fast, which is what makes them fatal.
+    pub fn noncontinuable(&self) -> bool {
+        self.flags & EXCEPTION_NONCONTINUABLE != 0
+    }
+
+    /// The record as the engine wrote it, with the two fields that need deciding decided.
+    ///
+    /// The parameter count is clamped to the array as well as taken from the record: fifteen is
+    /// how many slots there are, `NumberParameters` is how many the raiser filled, and a record
+    /// claiming more than it can hold is a corrupt record rather than an excuse to read off the
+    /// end of it.
+    fn from_raw(raw: &EXCEPTION_RECORD64) -> Self {
+        let filled = (raw.NumberParameters as usize).min(raw.ExceptionInformation.len());
+        Self {
+            code: raw.ExceptionCode.0 as u32,
+            flags: raw.ExceptionFlags,
+            address: raw.ExceptionAddress,
+            parameters: raw.ExceptionInformation[..filled].to_vec(),
+            nested: (raw.ExceptionRecord != 0).then_some(raw.ExceptionRecord),
+        }
+    }
+}
+
+/// Whether an engine refusal means "this target has no stored event" rather than a failure.
+///
+/// A live target has none, and neither does a dump not written for a fault, so this is an ordinary
+/// answer and not an error — but the engine has no way to say so except by refusing, and refusing
+/// is also what it does when something is wrong. Pinned to the one code it uses for this, measured
+/// by `examples/stored_event_probe.rs` against a live process and a kernel crash dump, so that a
+/// genuine failure still reaches the caller as one.
+fn no_stored_event(code: HRESULT) -> bool {
+    code == E_UNEXPECTED
+}
+
+/// A buffer for the extra information `GetLastEventInformation` and `GetStoredEventInformation`
+/// write beside an event.
+///
+/// One buffer for every event kind rather than a union of the eight `DEBUG_LAST_EVENT_INFO_*`
+/// shapes, because only one of them is ever read here and the rest exist only to be large enough
+/// not to truncate. `DEBUG_LAST_EVENT_INFO_EXCEPTION` *is* the largest — an `EXCEPTION_RECORD64`
+/// and a flag against the `u32`s and `u64`s the others hold — so sizing to it is sizing to all of
+/// them, and the alignment is the record's.
+#[repr(C, align(8))]
+struct ExtraEventInfo([u8; size_of::<DEBUG_LAST_EVENT_INFO_EXCEPTION>()]);
+
+impl Default for ExtraEventInfo {
+    fn default() -> Self {
+        Self([0; size_of::<DEBUG_LAST_EVENT_INFO_EXCEPTION>()])
+    }
+}
+
+impl ExtraEventInfo {
+    const SIZE: u32 = size_of::<DEBUG_LAST_EVENT_INFO_EXCEPTION>() as u32;
+
+    fn as_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+        self.0.as_mut_ptr().cast()
+    }
+
+    /// The exception record the engine wrote here, and whether it was first-chance.
+    ///
+    /// **Both guards are load-bearing.** The buffer is only an exception record when the event was
+    /// an exception — for any other kind these same bytes are an exit code or a module base, and
+    /// reading them as a record would invent one. And `used` is the engine's own count: a call
+    /// that wrote less than the struct's size did not write this struct, whatever the kind says.
+    fn exception(&self, kind: u32, used: u32) -> Option<(ExceptionRecord, bool)> {
+        if kind != DEBUG_EVENT_EXCEPTION || used < Self::SIZE {
+            return None;
+        }
+        // SAFETY: the engine reported writing `used` bytes here and `used >= SIZE`, which is this
+        // buffer's size; it is aligned for the struct, and the read is unaligned-safe regardless.
+        // `DEBUG_LAST_EVENT_INFO_EXCEPTION` is plain old data, so a copy out is a copy of bytes.
+        let info: DEBUG_LAST_EVENT_INFO_EXCEPTION =
+            unsafe { std::ptr::read_unaligned(self.0.as_ptr().cast()) };
+        Some((
+            ExceptionRecord::from_raw(&info.ExceptionRecord),
+            info.FirstChance != 0,
+        ))
+    }
+}
+
+/// `EXCEPTION_NONCONTINUABLE`.
+///
+/// Spelled out rather than imported: the `windows` crate has it, but under
+/// `Win32_System_SystemServices`, and pulling a whole feature module in for one `= 1` is a worse
+/// trade than a line. Not to be confused with that crate's `EXCEPTION_NONCONTINUABLE_EXCEPTION`,
+/// which is `0xc0000025` — the status raised by trying to continue past one of these, not the flag
+/// that says so.
+const EXCEPTION_NONCONTINUABLE: u32 = 0x1;
+
+/// A target's `CONTEXT`, exactly as the engine handed it over.
+///
+/// **Opaque on purpose.** `CONTEXT` is per-architecture, per-processor-feature and versioned by
+/// its own `ContextFlags`; an x64 one is 1,232 bytes today and an `XSTATE`-extended one is not.
+/// Nothing here parses it, so nothing here goes stale when it grows — the engine wrote the bytes
+/// and the engine reads them back.
+///
+/// It exists so that a stack can be walked from the context an *event* was recorded with rather
+/// than from wherever the session's scope happens to point ([`DebugEngine::stack_frames_from`]).
+/// That is what `.ecxr` does to a session, without doing it to the session: the caller's selected
+/// frame and thread are untouched, so a triage that walks the crash stack is still a read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadContext {
+    bytes: Vec<u8>,
+}
+
+impl ThreadContext {
+    /// The bytes, for the one caller that has to hand them back to the engine.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// How many bytes the engine reported, which is the `CONTEXT` size for this target — not the
+    /// size of the buffer it was offered.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the engine reported no context at all, which a stored event can legitimately do.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// The event a target is stopped on, as [`DebugEngine::last_event`] and
+/// [`DebugEngine::stored_event`] report it.
+///
+/// [`Self::kind`] is a raw `DEBUG_EVENT_*` value rather than an enum. Two reasons, and the second
+/// is the one that decided it. The engine's list grows, and a closed enum would turn a new event
+/// kind into a variant this crate has to ship before a caller can see it. And the distinction a
+/// caller actually needs is already spelled: [`Self::exception`] is `Some` exactly when the event
+/// carried a record, which is the question, and it is not answered by the kind — an initial break
+/// arrives as `DEBUG_EVENT_EXCEPTION` (`0x2`) carrying `STATUS_BREAKPOINT`, not as
+/// `DEBUG_EVENT_BREAKPOINT`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugEvent {
+    /// The raw `DEBUG_EVENT_*` value.
+    pub kind: u32,
+    /// The **engine** process id the event belongs to — the same index
+    /// [`DebugEngine::session_processes`] pairs, not a system pid.
+    pub process: u32,
+    /// The **engine** thread id the event belongs to.
+    pub thread: u32,
+    /// The exception, when the event carried one. `None` for every other kind of event.
+    pub exception: Option<ExceptionRecord>,
+    /// Whether [`Self::exception`] is first-chance — the debugger seeing it before the target's
+    /// own handlers do. Meaningless, and `false`, when there is no exception.
+    ///
+    /// A second-chance record is the interesting one on a crash: it means nothing in the target
+    /// handled it, which for a C++ exception is the whole finding.
+    pub first_chance: bool,
+    /// The register context the event was recorded with, where the engine kept one.
+    ///
+    /// Always `None` from [`DebugEngine::last_event`], which does not carry one; `Some` from
+    /// [`DebugEngine::stored_event`] on a dump written for a fault.
+    pub context: Option<ThreadContext>,
 }
 
 /// One frame of a stack walk, as [`DebugEngine::stack_frames`] reports it.
@@ -4860,6 +5069,144 @@ impl DebugEngine {
         Ok(Some(BugCheck { code, parameters }))
     }
 
+    /// The event the engine last saw — what `.lastevent` prints, as values.
+    ///
+    /// The user-mode counterpart to [`Self::bug_check`], and the typed form of `.exr -1`: on a
+    /// target stopped by a fault, [`DebugEvent::exception`] is the record that stopped it.
+    ///
+    /// **This is the engine's last event, not the session's history.** It is whatever stopped the
+    /// engine most recently, so a caller who has stepped, gone, or hit a breakpoint since the fault
+    /// gets *that* event and not the fault. On a freshly opened dump it is the event the dump was
+    /// written for; [`Self::stored_event`] is the one that stays that way.
+    ///
+    /// Fails on an engine that has seen no event, which is every engine before its first wait.
+    /// That failure is "cannot say" rather than "nothing happened".
+    pub fn last_event(&self) -> Result<DebugEvent, DbgEngError> {
+        let mut kind = 0u32;
+        let mut process = 0u32;
+        let mut thread = 0u32;
+        // Sized for the largest `DEBUG_LAST_EVENT_INFO_*` there is, which is the exception one by a
+        // wide margin, and `u64`-aligned because the engine writes an `EXCEPTION_RECORD64` into it.
+        // The engine reports how much it used, and nothing below reads past that.
+        let mut extra = ExtraEventInfo::default();
+        let mut used = 0u32;
+        unsafe {
+            self.control.GetLastEventInformation(
+                &mut kind,
+                &mut process,
+                &mut thread,
+                Some(extra.as_mut_ptr()),
+                ExtraEventInfo::SIZE,
+                Some(&mut used),
+                // The description is text — "Break instruction exception - code 80000003 (first
+                // chance)" — and every fact in it is in the fields beside it. Asking for it would
+                // be a second buffer for a second rendering of what this already returns.
+                None,
+                None,
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "reading the engine's last event".into(),
+            source,
+        })?;
+        let exception = extra.exception(kind, used);
+        Ok(DebugEvent {
+            kind,
+            process,
+            thread,
+            first_chance: exception.as_ref().is_some_and(|(_, first)| *first),
+            exception: exception.map(|(record, _)| record),
+            // `GetLastEventInformation` carries no context. `.ecxr` works on a dump because the
+            // *stored* event has one, which is why the two calls are not one.
+            context: None,
+        })
+    }
+
+    /// The event a dump was written for, with the register context it was written with — what
+    /// `.ecxr` adopts, as values.
+    ///
+    /// **The difference from [`Self::last_event`] is that this one does not move.** It is the
+    /// event the target was *stored* on, so it still answers after a caller has stepped, gone, or
+    /// changed threads — which is exactly the state a triage runs in on any session somebody has
+    /// already been working in. [`DebugEvent::context`] is what makes that usable: hand it to
+    /// [`Self::stack_frames_from`] and the crash stack comes back without `.ecxr`'s side effect on
+    /// the session's selected scope.
+    ///
+    /// `Ok(None)` where the target has no stored event, which is every live target and every dump
+    /// not written for a fault. That is a fact about the target rather than a failure, and it is
+    /// read off the engine's own refusal rather than probed for — see [`no_stored_event`].
+    pub fn stored_event(&self) -> Result<Option<DebugEvent>, DbgEngError> {
+        let mut kind = 0u32;
+        let mut process = 0u32;
+        let mut thread = 0u32;
+        let mut refusal = None;
+        for (rung, &size) in STORED_CONTEXT_SIZES.iter().enumerate() {
+            let mut context = vec![0u8; size as usize];
+            let mut context_used = 0u32;
+            let mut extra = ExtraEventInfo::default();
+            let mut extra_used = 0u32;
+            match unsafe {
+                self.control.GetStoredEventInformation(
+                    &mut kind,
+                    &mut process,
+                    &mut thread,
+                    Some(context.as_mut_ptr().cast()),
+                    size,
+                    Some(&mut context_used),
+                    Some(extra.as_mut_ptr()),
+                    ExtraEventInfo::SIZE,
+                    Some(&mut extra_used),
+                )
+            } {
+                // **Filled to the brim means it may have had more to write**, which is the only
+                // signal this call gives that the buffer was too small — see
+                // [`STORED_CONTEXT_SIZES`]. Grow while there is a rung left; on the last one, take
+                // what there is rather than returning nothing.
+                Ok(())
+                    if context_used as usize >= context.len()
+                        && rung + 1 < STORED_CONTEXT_SIZES.len() =>
+                {
+                    continue;
+                }
+                Ok(()) => {
+                    // Clamped to the buffer as well as to the engine's own count, the same trust
+                    // decision `stack_frames` makes about `filled`.
+                    context.truncate((context_used as usize).min(context.len()));
+                    let exception = extra.exception(kind, extra_used);
+                    return Ok(Some(DebugEvent {
+                        kind,
+                        process,
+                        thread,
+                        first_chance: exception.as_ref().is_some_and(|(_, first)| *first),
+                        exception: exception.map(|(record, _)| record),
+                        context: (!context.is_empty()).then_some(ThreadContext { bytes: context }),
+                    }));
+                }
+                // **Checked before the retry, not after it.** "There is no stored event" is an
+                // answer, and climbing the whole ladder to rediscover it four more times would
+                // turn one refusal into five engine calls.
+                Err(why) if no_stored_event(why.code()) => return Ok(None),
+                // Not what this engine does — it truncates rather than refusing, which is what the
+                // ladder above is shaped around — but a refusal for being too small is still worth
+                // one more rung rather than an error.
+                Err(why) if why.code() == E_INVALIDARG => refusal = Some(why),
+                Err(why) => {
+                    refusal = Some(why);
+                    break;
+                }
+            }
+        }
+        Err(DbgEngError::Context {
+            operation: "reading the event this target was stored on".into(),
+            // Unreachable with a non-empty ladder: the only arm that does not return records a
+            // refusal, and the one that continues cannot be the last rung. Spelled as a fallback
+            // rather than an `expect` because a panic here would be this crate breaking its own
+            // rule about library code — and as `E_FAIL` rather than `E_UNEXPECTED`, which is the
+            // code [`no_stored_event`] reads as "there is no stored event" and would be a lie.
+            source: refusal.unwrap_or_else(|| windows::core::Error::from(E_FAIL)),
+        })
+    }
+
     /// The current thread's stack, read through `IDebugControl` — what `k` renders, as data.
     ///
     /// Walked from the current context (`GetStackTrace` with zero offsets), so on a crash dump
@@ -4894,8 +5241,73 @@ impl DebugEngine {
         // engine's own count, and trusting it past the allocation would be a trust decision this
         // does not need to make.
         raw.truncate((filled as usize).min(max_frames));
-        Ok(raw
-            .iter()
+        Ok(self.resolve_frames(&raw))
+    }
+
+    /// The stack a recorded register context was in, rather than the one the session's **current
+    /// thread** is in — what `.ecxr` followed by `k` renders, without the `.ecxr`.
+    ///
+    /// Given [`DebugEvent::context`] from [`Self::stored_event`], this is the crash stack of a
+    /// dump, walked on any session whatever thread it has selected, and it leaves that selection
+    /// exactly where it found it — so a triage built on this is still a read of the target.
+    ///
+    /// **The difference from [`Self::stack_frames`] is the selected thread, and only that.**
+    /// Measured on the two-thread fail-fast dump in `examples/stored_event_probe.rs`: after `~1s`
+    /// the other walk returns the parked thread's six frames while this one still returns the
+    /// crash's twelve. What does *not* move it is `.frame`, `.cxr` or `.ecxr` — all three change
+    /// the symbol scope, and `GetStackTrace` walks from the thread's registers rather than from
+    /// the scope, so both walks agree across all three. That is worth knowing before reaching for
+    /// this one: on a freshly opened dump, whose current thread is the faulting thread, the two
+    /// answers are identical, and the reason to prefer this is that it stays identical.
+    ///
+    /// The context is passed through to `GetContextStackTrace` untouched — its size is the
+    /// engine's own [`ThreadContext::len`], not a size this code believes in — so a target whose
+    /// `CONTEXT` this crate has never seen walks the same as one it has.
+    ///
+    /// `max_frames` bounds the walk, and zero frames is a legitimate ask answered without touching
+    /// the engine, both exactly as [`Self::stack_frames`].
+    pub fn stack_frames_from(
+        &self,
+        context: &ThreadContext,
+        max_frames: usize,
+    ) -> Result<Vec<StackFrame>, DbgEngError> {
+        if max_frames == 0 {
+            return Ok(Vec::new());
+        }
+        // An empty context would be read by the engine as "walk from the current one", which is
+        // the question `stack_frames` answers and the opposite of what this was called for. A
+        // caller holding one has a `stored_event` that reported no context; say so.
+        if context.is_empty() {
+            return Err(DbgEngError::Context {
+                operation: "walking the stack of a recorded context that has no registers".into(),
+                source: windows::core::Error::from(E_INVALIDARG),
+            });
+        }
+        let mut raw = vec![DEBUG_STACK_FRAME::default(); max_frames];
+        let mut filled = 0u32;
+        unsafe {
+            self.control.GetContextStackTrace(
+                Some(context.as_bytes().as_ptr().cast()),
+                context.len() as u32,
+                Some(&mut raw),
+                None,
+                0,
+                0,
+                Some(&mut filled),
+            )
+        }
+        .map_err(|source| DbgEngError::Context {
+            operation: "walking the stack of a recorded register context".into(),
+            source,
+        })?;
+        raw.truncate((filled as usize).min(max_frames));
+        Ok(self.resolve_frames(&raw))
+    }
+
+    /// The engine's raw frames with each one's symbol resolved — shared by the two stack walks, so
+    /// that a frame from either is the same record and joins the other.
+    fn resolve_frames(&self, raw: &[DEBUG_STACK_FRAME]) -> Vec<StackFrame> {
+        raw.iter()
             .enumerate()
             .map(|(index, frame)| {
                 let (symbol, displacement) = self.symbol_at(frame.InstructionOffset);
@@ -4909,7 +5321,7 @@ impl DebugEngine {
                     displacement,
                 }
             })
-            .collect())
+            .collect()
     }
 
     /// Disassembles `count` instructions from `address` — what `u` renders, as data.
@@ -10355,6 +10767,123 @@ mod tests {
             ),
             "run_to_address was not refused"
         );
+    }
+
+    /// A record carries as many parameters as it says it filled, and no more.
+    ///
+    /// The count is the field the two shapes of a `0xc0000409` are told apart by -- one parameter
+    /// is the CRT's `abort`, three is WIL's, whose second is the `HRESULT` -- so reading a
+    /// leftover as a parameter would not be a cosmetic error. It would answer the question.
+    #[test]
+    fn test_a_record_carries_only_the_parameters_it_filled() {
+        let mut raw = EXCEPTION_RECORD64 {
+            ExceptionCode: windows::Win32::Foundation::NTSTATUS(0xc000_0409_u32 as i32),
+            ExceptionFlags: EXCEPTION_NONCONTINUABLE,
+            ExceptionRecord: 0,
+            ExceptionAddress: 0x7ff6_3074_28f9,
+            NumberParameters: 3,
+            __unusedAlignment: 0,
+            ExceptionInformation: [0; 15],
+        };
+        // WIL's shape, and a fourth slot holding whatever the last exception on this thread left.
+        raw.ExceptionInformation[0] = 0x7;
+        raw.ExceptionInformation[1] = 0xffff_ffff_8000_ffff;
+        raw.ExceptionInformation[2] = 0x28f;
+        raw.ExceptionInformation[3] = 0xdead_beef;
+
+        let record = ExceptionRecord::from_raw(&raw);
+        assert_eq!(record.code, 0xc000_0409, "the code was not read as a u32");
+        assert_eq!(
+            record.parameters,
+            vec![0x7, 0xffff_ffff_8000_ffff, 0x28f],
+            "the leftover in slot 3 was read as a parameter"
+        );
+        assert!(record.noncontinuable(), "the flag was not decoded");
+        assert_eq!(
+            record.nested, None,
+            "a zero nested pointer is no nested record, not a record at address zero"
+        );
+
+        // **A record claiming more than it can hold is corrupt, not an excuse to read past the
+        // array.** Fifteen is how many slots there are; sixteen is a fact about the dump.
+        raw.NumberParameters = 99;
+        assert_eq!(
+            ExceptionRecord::from_raw(&raw).parameters.len(),
+            15,
+            "an over-large NumberParameters was not clamped to the array"
+        );
+
+        // A nested record is a pointer into the target, reported as one rather than chased.
+        raw.NumberParameters = 0;
+        raw.ExceptionRecord = 0x1234;
+        let nested = ExceptionRecord::from_raw(&raw);
+        assert_eq!(nested.nested, Some(0x1234));
+        assert!(
+            nested.parameters.is_empty(),
+            "a zero-parameter record carried parameters"
+        );
+    }
+
+    /// The extra-information buffer is read as an exception only when it holds one.
+    ///
+    /// Both guards, because they fail in the same silent direction: for any other event kind these
+    /// same bytes are an exit code or a module base, and a short write is not this struct however
+    /// the kind reads. Either one missing invents a record out of whatever was in the buffer.
+    #[test]
+    fn test_extra_event_info_is_read_as_an_exception_only_when_it_holds_one() {
+        let mut extra = ExtraEventInfo::default();
+        let info = DEBUG_LAST_EVENT_INFO_EXCEPTION {
+            ExceptionRecord: EXCEPTION_RECORD64 {
+                ExceptionCode: windows::Win32::Foundation::NTSTATUS(0x8000_0003_u32 as i32),
+                ExceptionFlags: 0,
+                ExceptionRecord: 0,
+                ExceptionAddress: 0x7ffc_9b83_d78d,
+                NumberParameters: 1,
+                __unusedAlignment: 0,
+                ExceptionInformation: [0; 15],
+            },
+            FirstChance: 1,
+        };
+        // SAFETY: writing the struct the engine would have written, into a buffer sized and
+        // aligned for exactly it.
+        unsafe { std::ptr::write(extra.as_mut_ptr().cast(), info) };
+
+        let (record, first_chance) = extra
+            .exception(DEBUG_EVENT_EXCEPTION, ExtraEventInfo::SIZE)
+            .expect("an exception event with a full write reported no exception");
+        assert_eq!(record.code, 0x8000_0003);
+        assert_eq!(record.address, 0x7ffc_9b83_d78d);
+        assert_eq!(record.parameters, vec![0]);
+        assert!(first_chance, "the first-chance flag was dropped");
+
+        assert!(
+            extra
+                .exception(DEBUG_EVENT_BREAKPOINT, ExtraEventInfo::SIZE)
+                .is_none(),
+            "a breakpoint event's extra information was read as an exception record"
+        );
+        assert!(
+            extra
+                .exception(DEBUG_EVENT_EXCEPTION, ExtraEventInfo::SIZE - 1)
+                .is_none(),
+            "a write shorter than the struct was read as the whole struct"
+        );
+    }
+
+    /// `E_UNEXPECTED` is "no stored event"; nothing else is.
+    ///
+    /// Pinned by `examples/stored_event_probe.rs` against a live process and a kernel crash dump,
+    /// and asserted here so that widening it to "any failure" -- which would turn every real error
+    /// into a silent `Ok(None)` -- fails a test rather than a user.
+    #[test]
+    fn test_only_e_unexpected_means_there_is_no_stored_event() {
+        assert!(no_stored_event(E_UNEXPECTED));
+        for other in [E_INVALIDARG, E_NOINTERFACE, S_OK, S_FALSE] {
+            assert!(
+                !no_stored_event(other),
+                "{other:?} was taken for the absence of a stored event"
+            );
+        }
     }
 }
 

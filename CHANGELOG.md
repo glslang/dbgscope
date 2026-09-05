@@ -8,6 +8,36 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Exception events are readable as values.** `DebugEngine::last_event` returns a `DebugEvent` —
+  kind, engine process and thread, and, when the event carried one, an `ExceptionRecord` with the
+  code, flags, faulting address and parameters. That is `.exr -1` typed, and it is the user-mode
+  counterpart to `bug_check`: on a target stopped by a fault it is the record that stopped it.
+  `ExceptionRecord::parameters` arrives already cut to the record's own `NumberParameters` (and
+  clamped to the fifteen slots there are), because the count is the field that tells the two shapes
+  of a `0xc0000409` apart — one parameter is the CRT's `abort`, three is WIL's, whose second is the
+  `HRESULT` — and a leftover read as a parameter would answer the question wrongly rather than
+  cosmetically.
+- `DebugEngine::stored_event` returns the event a dump was **written for**, with the register
+  context it was written with, as an opaque `ThreadContext`. Unlike `last_event` it does not move:
+  it still answers after a caller has stepped, gone, or changed threads. `Ok(None)` where there is
+  no stored event — every live target, and every dump not written for a fault, including kernel
+  crash dumps, whose bug check `ReadBugCheckData` reads instead. That is read off the engine's own
+  refusal (`E_UNEXPECTED`, measured on both) rather than probed for, so a genuine failure still
+  reaches the caller as one.
+- `DebugEngine::stack_frames_from` walks the stack a recorded context was in, which is what
+  `.ecxr; k` produces without `.ecxr`'s effect on the session: the caller's selected thread and
+  frame are left exactly where they were, so a triage built on it is still a read. **What makes it
+  differ from `stack_frames` is the selected thread and only that** — measured on a two-thread
+  fail-fast dump, after `~1s` the other walk returns the parked thread's six frames while this one
+  still returns the crash's twelve, while `.frame`, `.cxr` and `.ecxr` move neither, since they
+  change the symbol scope and `GetStackTrace` walks from the thread's registers.
+- `examples/stored_event_probe.rs`, the measurements behind the three. It also caught the one that
+  would otherwise have shipped: `GetStoredEventInformation` does **not** refuse a context buffer
+  that is too small the way `GetScope` does. It truncates — offered 716 bytes for an x64 dump it
+  writes 716, reports 716 and returns success, and the damage surfaces three calls later when
+  `GetContextStackTrace` rejects the truncated context with `E_INVALIDARG`. So the context ladder
+  here starts *above* every real `CONTEXT` rather than below it, and grows only on the one signal
+  the call gives that there was more to write.
 - Breakpoints can be **set**, not only listed. `DebugEngine::set_breakpoint` and
   `set_breakpoint_bounded` take a `BreakpointSpec` — a location (`BreakpointAt::Address` or
   `::Expression`), an optional command, match thread, pass count, one-shot flag, and a `DataWatch`
