@@ -40,6 +40,16 @@ All notable changes to this project are documented here. The format follows
   `set_scope` refuses a stale `Scope` — and for a sharper reason: a stale scope points the session
   somewhere visibly wrong, while a stale context comes back as frames, which is an answer a caller
   cannot tell from the right one.
+
+### Fixed
+
+- **An opener that replaces the session now reissues the target identity.** Only `end_session` did,
+  so a caller who opened dump A, saved a `Scope` or a `ThreadContext`, and opened dump B *through
+  the same engine* got the same identity back — and the stale registers were accepted against the
+  new target. The three openers that replace a session (`open_dump`, which `open_trace` delegates
+  to, and both kernel attaches) already funnel through `forget_the_previous_session`, so the
+  reissue lives there rather than in each of them: "the previous session is gone" now means all of
+  what it says, and the next opener gets it without remembering to.
 - `examples/stored_event_probe.rs`, the measurements behind the three. It also caught the one that
   would otherwise have shipped: `GetStoredEventInformation` does **not** refuse a context buffer
   that is too small the way `GetScope` does. It truncates — offered 716 bytes for an x64 dump it

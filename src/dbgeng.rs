@@ -6155,7 +6155,19 @@ impl DebugEngine {
     /// is a guard held *across* a session replacement, whose `(engine id, pid)` predicate would
     /// otherwise be evaluated against a session it never asked about. Forgetting the entry leaves
     /// [`Arrivals::presence`] answering [`Presence::Absent`] for it, which is the truth.
+    ///
+    /// **And it reissues the target identity, which is why that lives here rather than in the
+    /// openers.** [`Scope`] and [`ThreadContext`] both carry the identity they were read from and
+    /// are refused by an engine that no longer holds it — a check worth nothing if the identity
+    /// survives a replacement. It did: only [`Self::end_session`] reissued, so a caller who opened
+    /// dump A, saved a context, and opened dump B *through this engine* got the same identity back
+    /// and the stale registers were accepted (dbgscope#144). Doing it in the three openers would
+    /// have been a fourth thing for the next opener to remember; doing it here makes "the previous
+    /// session is gone" mean all of what it says, once.
     fn forget_the_previous_session(&self) {
+        // Ordered before the clears only so that a reader meets the invalidation first; nothing
+        // observes this function part-way through, since every caller holds `&self`.
+        reissue_identity(&self.client);
         self.state
             .attached_processes
             .lock()
@@ -10945,13 +10957,99 @@ mod tests {
     /// (dbgscope#144). An engine holding nothing is the cheapest way to reach that state; the
     /// other is a dump named but not pumped, which needs a file and is in the probe.
     #[test]
+    #[cfg(not(miri))]
     fn test_an_engine_with_no_event_reports_none_rather_than_a_kind_of_zero() {
+        // **Even a test that opens no target needs this.** `DebugEngine::drop` ends the process's
+        // debuggee session, so an engine built and dropped beside another test's live target ends
+        // *that* target's session -- which surfaces over there as a pump failing `E_UNEXPECTED`,
+        // with nothing pointing back here. Found exactly that way (dbgscope#144, round two): the
+        // suite was green single-threaded and red under the default harness.
+        let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         assert!(
             matches!(e.last_event(), Ok(None)),
             "an engine that has seen no event did not report none — which means either it failed \
              the call, or kind 0 was dressed up as an event"
         );
+    }
+
+    /// **An opener that replaces the session invalidates the contexts read from the old one.**
+    ///
+    /// The check that `stack_frames_from` and `set_scope` make is worth exactly nothing if the
+    /// identity survives a replacement, and it did: only `end_session` reissued, so a caller who
+    /// opened dump A, saved a context and opened dump B *through this engine* got the same
+    /// identity back and the stale registers were accepted (dbgscope#144, round two).
+    ///
+    /// **The dump is written by the engine rather than checked in**, which is what makes this a
+    /// test rather than a probe: `.dump /m` on a launched target gives a real dump to reopen, so
+    /// nothing here depends on a fixture or on this host having one.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_an_opener_that_replaces_the_session_invalidates_the_old_contexts() {
+        let _guard = one_debuggee();
+        let dump = std::env::temp_dir().join(format!(
+            "dbgscope-replace-{}-{}.dmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let _ = std::fs::remove_file(&dump);
+
+        // A target to dump. Any stopped process will do; this one exits on its own if the test
+        // dies holding it.
+        let e = DebugEngine::new();
+        if e.launch_process("cmd.exe /c ping -n 30 127.0.0.1").is_err() {
+            // No engine on this host is a reason to skip, not to fail -- same standing rule as
+            // the other tests that need a real `dbgeng.dll`.
+            println!("SKIPPED: could not launch a target to dump");
+            return;
+        }
+        let written = e.execute_command(&format!(".dump /m \"{}\"", dump.display()));
+        let _ = e.end_session();
+        drop(e);
+        if written.is_err() || !dump.exists() {
+            println!("SKIPPED: this engine would not write a dump ({written:?})");
+            return;
+        }
+
+        let e = DebugEngine::new();
+        let path = dump.display().to_string();
+        assert!(
+            e.open_dump(&path).is_ok(),
+            "could not open the dump written"
+        );
+        let _ = e.wait_for_event(60_000);
+        let first = e.target_identity();
+        let stale = ThreadContext {
+            bytes: vec![0u8; 1232],
+            target: first,
+        };
+
+        // The same engine, opening a target again. This is the replacement path: no
+        // `end_session` between them, which is exactly the case that was accepted before.
+        assert!(
+            e.open_dump(&path).is_ok(),
+            "could not reopen the dump through the same engine"
+        );
+        let _ = e.wait_for_event(60_000);
+        assert_ne!(
+            e.target_identity(),
+            first,
+            "an opener replaced the session without reissuing the identity, so every context and \
+             scope saved from the previous target is still accepted against this one"
+        );
+        assert!(
+            matches!(
+                e.stack_frames_from(&stale, 8),
+                Err(DbgEngError::ContextFromAnotherTarget)
+            ),
+            "a context from the replaced target was walked against the new one"
+        );
+
+        let _ = e.end_session();
+        drop(e);
+        let _ = std::fs::remove_file(&dump);
     }
 
     /// A context is refused by an engine that no longer holds the target it was read from.
@@ -10962,7 +11060,14 @@ mod tests {
     /// `target_identity` is engine state, and with **no target at all**, since the check has to
     /// come before the engine sees the bytes rather than after it declines them.
     #[test]
+    #[cfg(not(miri))]
     fn test_a_context_from_another_target_is_refused() {
+        // **Even a test that opens no target needs this.** `DebugEngine::drop` ends the process's
+        // debuggee session, so an engine built and dropped beside another test's live target ends
+        // *that* target's session -- which surfaces over there as a pump failing `E_UNEXPECTED`,
+        // with nothing pointing back here. Found exactly that way (dbgscope#144, round two): the
+        // suite was green single-threaded and red under the default harness.
+        let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         // Read from an engine whose identity is whatever it is now, and then invalidated the only
         // way this crate can: by construction, since `target_identity` is per-engine.
