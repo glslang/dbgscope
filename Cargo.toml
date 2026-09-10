@@ -29,6 +29,16 @@ exclude = [
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+# The x86/x64 instruction decoder behind `Instruction`'s typed fields. The engine renders
+# disassembly as text and offers no structured form, and recovering operands from that rendering
+# means deciding what a character means from the fact that it is present -- which does not survive
+# real symbols: `std::map<int,int>` puts a comma inside one, `operator()` a parenthesis,
+# `operator[]` a bracket, and each of those severed a direct call edge in turn. Decoding the
+# encoding the engine already hands back has none of those ambiguities and needs no extra round
+# trip. Default features off: `decoder` and `instr_info` are the whole of what is used -- no
+# formatter, because the engine's own rendering is what this crate promises, and no encoder. It
+# brings one transitive dependency, `lazy_static`, for the tables `instr_info` reads.
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 hex = "0.4.3"
 thiserror = "2.0.18"
 windows-core = "0.62.2"

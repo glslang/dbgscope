@@ -176,10 +176,57 @@ fn main() {
                 .unwrap_or_else(|| format!("{target:#x}"));
             calls.push((instruction.address, name));
         }
+        // An import thunk: an indirect call through a slot whose address the encoding pins. The
+        // operand carries no symbol — nothing here parses one — so the slot is named by asking.
         if let Some(Operand::Memory(memory)) = instruction.operands.first()
-            && let (Flow::Call(None), Some(symbol)) = (instruction.flow, &memory.symbol)
+            && let (Flow::Call(None), Some(slot)) = (instruction.flow, memory.address)
         {
-            calls.push((instruction.address, format!("[{symbol}]")));
+            let name = e
+                .symbol_for(slot)
+                .map(|(name, _)| name)
+                .unwrap_or_else(|| format!("{slot:#x}"));
+            calls.push((instruction.address, format!("[{name}]")));
+        }
+    }
+
+    // The two decode paths, over the same bytes, compared. `disassemble` asks the engine to render
+    // each instruction and walks by the end it reports; `decode_range` reads the span once and
+    // decodes it locally. They should agree instruction for instruction, and a disagreement is
+    // worth more than either count on its own — it is the only signal that the local decoder and
+    // the engine's own read of the same bytes have diverged.
+    if let Ok(FunctionExtent::Region { begin, end }) = e.function_extent(entry) {
+        match e.decode_range(begin, (end - begin) as usize) {
+            Ok(ranged) => {
+                let walked: std::collections::HashMap<u64, &dbgscope::dbgeng::Instruction> =
+                    instructions
+                        .iter()
+                        .map(|instruction| (instruction.address, instruction))
+                        .collect();
+                let mut compared = 0usize;
+                let mut disagreed = 0usize;
+                for one in &ranged {
+                    let Some(other) = walked.get(&one.address) else {
+                        continue;
+                    };
+                    compared += 1;
+                    if one.bytes != other.bytes
+                        || one.mnemonic != other.mnemonic
+                        || one.flow != other.flow
+                    {
+                        disagreed += 1;
+                        println!(
+                            "  DISAGREE {:#x}  ranged {} {:?}  walked {} {:?}",
+                            one.address, one.mnemonic, one.flow, other.mnemonic, other.flow
+                        );
+                    }
+                }
+                println!(
+                    "\n--- the two decode paths over the first region ---\nrange-decoded {}, \
+                     compared {compared}, disagreed {disagreed}",
+                    ranged.len()
+                );
+            }
+            Err(error) => println!("\nrange decode unavailable: {error}"),
         }
     }
 
