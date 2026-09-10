@@ -1861,6 +1861,37 @@ impl Flow {
     }
 }
 
+/// What a target's unwind data says about the region holding an address, as
+/// [`DebugEngine::function_extent`] reports it.
+///
+/// Three outcomes rather than an [`Option`], because the two that are not a region are different
+/// facts with different remedies: one says this image has no entry covering that address, the
+/// other says this build does not decode that target's entry layout at all. Collapsing them lets a
+/// caller read "not decoded" as "a leaf function", which is the reading that turns an
+/// architecture this cannot answer for into an architecture it answers wrongly for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionExtent {
+    /// The region containing the address, rebased into the target's address space.
+    Region { begin: u64, end: u64 },
+    /// The image has no unwind entry covering the address — a leaf function, or an address that
+    /// is not code. Every x86 address answers this, 32-bit Windows having no unwind table.
+    NoEntry,
+    /// This instruction set's entry layout is not decoded here, so nothing is claimed about the
+    /// address at all.
+    Unsupported(InstructionSet),
+}
+
+impl FunctionExtent {
+    /// The region, where there is one. `None` covers both of the other outcomes, so use it only
+    /// where "no bound available" is the whole question.
+    pub fn region(self) -> Option<(u64, u64)> {
+        match self {
+            Self::Region { begin, end } => Some((begin, end)),
+            _ => None,
+        }
+    }
+}
+
 /// A memory operand, as the engine renders it — `qword ptr [rdx+0B8h]`, `gs:[188h]`,
 /// `[rax+rcx*8+20h]`, ``qword ptr [nt!_imp_ExAllocatePool2 (fffff803`…)]``.
 ///
@@ -2759,7 +2790,16 @@ fn classify_flow(mnemonic: &str, operands: &[Operand]) -> Flow {
         "jmp" | "jmpf" => Flow::Jmp(destination()),
         "ret" | "retf" | "retn" | "iret" | "iretd" | "iretq" | "sysret" | "sysexit" => Flow::Return,
         "ud0" | "ud1" | "ud2" | "hlt" => Flow::Trap,
-        "int" | "int1" | "int3" | "into" => Flow::Trap,
+        "int1" | "int3" => Flow::Trap,
+        // A software interrupt is classified by its **vector**, not by its mnemonic. Most of them
+        // return, and the one that matters is `int 2eh` — the 32-bit system-call path — where
+        // stopping the walk discards every instruction after a syscall. Two do not return:
+        // `int 29h` is `__fastfail`, and `int 3` is the breakpoint a compiler emits as padding
+        // behind unreachable code. `into` traps only on overflow, so it returns.
+        "int" => match operands.first() {
+            Some(Operand::Immediate(0x29 | 0x3)) => Flow::Trap,
+            _ => Flow::Fallthrough,
+        },
         _ if is_conditional_branch(mnemonic) => Flow::Branch(destination()),
         _ => Flow::Fallthrough,
     }
@@ -5947,8 +5987,22 @@ impl DebugEngine {
     /// So this is a sanity bound and a "which region is this" answer, **not** a function's extent.
     /// A walk over a whole function follows [`Instruction::flow`] from its entry.
     ///
-    /// `None` is a fact rather than a failure: a leaf function may have no entry, and neither has
-    /// an address that is not code. A caller that needs the distinction has [`Self::symbol_for`].
+    /// # Three outcomes, because collapsing them hides two different wrong answers
+    ///
+    /// [`FunctionExtent::NoEntry`] is a fact rather than a failure — a leaf function has no entry,
+    /// and neither has an address that is not code. It is reported for the **one** measured
+    /// failure that means it, `E_NOINTERFACE` (`0x80004002`), which is what a real dbgeng 10.x
+    /// answers for address zero, for a module's header page and for every x86 address (32-bit
+    /// Windows has no unwind table at all — measured against `cppthrow-fastfail-x86.dmp`). Any
+    /// other failure is returned as one, so a broken engine is not read as a leaf.
+    ///
+    /// [`FunctionExtent::Unsupported`] is every instruction set but x64, and it is not caution.
+    /// ARM64's record is **two** words whose second is packed unwind data or an `.xdata` RVA, not
+    /// an end address: measured on an ARM64 kernel dump, `nt!KeBugCheckEx` fills `needed = 8` with
+    /// `[0x0025df60, 0x0005f218]`. Read as an end that is a bogus extent, and for any function
+    /// whose `BeginAddress` is below the `.xdata` RVA it is a bogus extent that **contains the
+    /// address asked about** and so passes every sanity check below. A wrong region that looks
+    /// right is worse than no region.
     ///
     /// # The shape, which is not the one the name suggests
     ///
@@ -5958,11 +6012,17 @@ impl DebugEngine {
     /// and yields an extent that fails its own sanity check, which is how this was first written
     /// and how it reported "no entry" for a 2,108-byte dispatch routine that plainly had one.
     /// They are also relative, so they are rebased here against the module that holds the address
-    /// — what `.fnent` prints, at the RVAs it prints them.
-    pub fn function_extent(&self, address: u64) -> Result<Option<(u64, u64)>, DbgEngError> {
+    /// — what `.fnent` prints, at the RVAs it prints them. The engine's own `needed` is checked
+    /// against that shape rather than assumed, since it is the field that says ARM64's is
+    /// different.
+    pub fn function_extent(&self, address: u64) -> Result<FunctionExtent, DbgEngError> {
+        let set = self.instruction_set();
+        if set != InstructionSet::Amd64 {
+            return Ok(FunctionExtent::Unsupported(set));
+        }
         let mut entry = [0u32; 3];
         let mut needed = 0u32;
-        if unsafe {
+        if let Err(source) = unsafe {
             self.symbols.GetFunctionEntryByOffset(
                 address,
                 0,
@@ -5970,26 +6030,35 @@ impl DebugEngine {
                 std::mem::size_of_val(&entry) as u32,
                 Some(&mut needed),
             )
+        } {
+            // The one failure that means "this address has no unwind entry".
+            if source.code() == E_NOINTERFACE {
+                return Ok(FunctionExtent::NoEntry);
+            }
+            return Err(DbgEngError::Context {
+                operation: format!("reading the function entry for {address:#x}"),
+                source,
+            });
         }
-        .is_err()
-        {
-            // No entry for this address is the ordinary answer for a leaf or for data.
-            return Ok(None);
+        // The engine says how big the record it filled is. An x64 `RUNTIME_FUNCTION` is twelve
+        // bytes; anything else is a layout this does not decode, whatever the processor said.
+        if needed as usize != std::mem::size_of_val(&entry) {
+            return Ok(FunctionExtent::Unsupported(set));
         }
         let (begin, end) = (entry[0] as u64, entry[1] as u64);
         if begin == 0 || end <= begin {
-            return Ok(None);
+            return Ok(FunctionExtent::NoEntry);
         }
         let Some(module) = self.module_at(address)? else {
-            return Ok(None);
+            return Ok(FunctionExtent::NoEntry);
         };
         let (begin, end) = (module.base + begin, module.base + end);
-        // The extent has to contain the address it was asked about; anything else means the entry
-        // read back does not describe this function and is not worth returning.
+        // The region has to contain the address it was asked about; anything else means the entry
+        // read back does not describe this code and is not worth returning.
         if !(begin..end).contains(&address) {
-            return Ok(None);
+            return Ok(FunctionExtent::NoEntry);
         }
-        Ok(Some((begin, end)))
+        Ok(FunctionExtent::Region { begin, end })
     }
 
     /// The `module!Symbol` an address resolves to and how far past it the address is.
@@ -8419,7 +8488,6 @@ mod tests {
             Flow::Branch(Some(0xfffff803_3e2547f0))
         );
         assert_eq!(one("ret"), Flow::Return);
-        assert_eq!(one("int     29h"), Flow::Trap);
         assert_eq!(one("ud2"), Flow::Trap);
         assert_eq!(one("call    rax"), Flow::Call(None));
         assert_eq!(one("jmp     rax"), Flow::Jmp(None));
@@ -8437,6 +8505,40 @@ mod tests {
         // Sound in the one direction that matters: an unresolved destination is `None`, never a
         // borrowed address from somewhere else on the line.
         assert_eq!(one("jmp     qword ptr [rax*8+1234h]").target(), None);
+    }
+
+    /// A software interrupt is classified by its vector, because most of them return.
+    ///
+    /// `int 2eh` is the 32-bit system-call path: a walk that stops there discards every
+    /// instruction after a syscall, which on that architecture is most of a function. The two that
+    /// do not return are `int 29h` (`__fastfail`) and `int 3` — the breakpoint a compiler emits as
+    /// padding behind unreachable code, and the form the engine renders `0xcc` as, so it has to be
+    /// caught by vector rather than by the `int3` spelling alone.
+    #[test]
+    fn test_a_software_interrupt_is_classified_by_its_vector() {
+        let one = |text: &str| {
+            split_instruction(
+                0x1000,
+                &format!("00001000 90 {text}"),
+                InstructionSet::Amd64,
+            )
+            .flow
+        };
+
+        assert_eq!(one("int     29h"), Flow::Trap, "__fastfail does not return");
+        assert_eq!(one("int     3"), Flow::Trap, "a breakpoint stops the walk");
+        assert_eq!(one("int3"), Flow::Trap);
+        assert_eq!(
+            one("int     2Eh"),
+            Flow::Fallthrough,
+            "the 32-bit system call returns, and the walk must go on past it"
+        );
+        assert_eq!(one("int     2Dh"), Flow::Fallthrough);
+        // `into` traps only on overflow, so it returns.
+        assert_eq!(one("into"), Flow::Fallthrough);
+
+        assert!(one("int     2Eh").falls_through());
+        assert!(!one("int     29h").falls_through());
     }
 
     /// `ah`, `bh`, `ch` and `dh` are registers *and* well-formed `h`-suffixed hexadecimal, and

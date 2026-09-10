@@ -21,7 +21,7 @@
 //! driver that is not `nt`: without it every instruction reads `???` and the run reports exactly
 //! that, which is itself the measurement of what a dump alone can answer.
 
-use dbgscope::dbgeng::{DebugEngine, Flow, Operand};
+use dbgscope::dbgeng::{DebugEngine, Flow, FunctionExtent, Operand};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -58,11 +58,14 @@ fn main() {
     println!("{symbol} at {entry:#x}");
 
     match e.function_extent(entry) {
-        Ok(Some((begin, end))) => println!(
+        Ok(FunctionExtent::Region { begin, end }) => println!(
             "unwind region: {begin:#x}..{end:#x} ({} bytes) — a region, not the function",
             end - begin
         ),
-        Ok(None) => println!("unwind region: none (leaf, or not code)"),
+        Ok(FunctionExtent::NoEntry) => println!("unwind region: no entry (leaf, or not code)"),
+        Ok(FunctionExtent::Unsupported(set)) => {
+            println!("unwind region: not decoded for {set:?}")
+        }
         Err(error) => println!("unwind region: unavailable ({error})"),
     }
 
