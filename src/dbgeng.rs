@@ -1776,6 +1776,149 @@ pub struct StackFrame {
     pub displacement: u64,
 }
 
+/// The instruction set a rendering is in, which decides whether its operands can be read.
+///
+/// The engine renders every architecture through the same three columns, and the columns are all
+/// [`split_instruction`] needs — but *inside* the third one the syntaxes diverge completely
+/// (`sub rsp,40h` against `stp fp,lr,[sp,#-0x10]!`). So operand reading is gated on the set, and
+/// anything this does not implement is [`Self::Other`]: mnemonic kept, operands empty,
+/// [`Flow::Unknown`]. That is a refusal rather than a guess, and it is why a caller can tell "no
+/// operands were read" apart from "this instruction has none" by looking at the flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionSet {
+    /// x86, 32-bit.
+    X86,
+    /// x86-64.
+    Amd64,
+    /// Anything else — ARM64 today. The `IMAGE_FILE_MACHINE_*` value is kept so a caller can say
+    /// which one it declined to read.
+    Other(u32),
+}
+
+impl InstructionSet {
+    /// The set a `GetActualProcessorType` value names.
+    pub fn from_processor_type(machine: u32) -> Self {
+        match machine {
+            0x014c => Self::X86,
+            0x8664 => Self::Amd64,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Whether operands and flow are read for this set. False means every instruction comes back
+    /// [`Flow::Unknown`] with no operands.
+    pub fn operands_are_read(self) -> bool {
+        matches!(self, Self::X86 | Self::Amd64)
+    }
+}
+
+/// What one instruction does to control flow, as far as the **rendering** says.
+///
+/// Every destination is an [`Option`] for one reason: the engine prints a resolvable target as a
+/// parenthesised address and prints nothing resolvable for an indirect one, and those are
+/// different facts. `Call(None)` is `call rax` or `call qword ptr [rax*8+…]`; `Jmp(None)` is a
+/// jump table or a function pointer. A caller that treats `None` as "no edge" stays sound — it
+/// never invents one — which is the property [`Self::target`] exists to keep obvious.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    /// Falls through to the next instruction — the common case.
+    Fallthrough,
+    /// A `call`: schedules the destination, then falls through. `None` when it is indirect.
+    Call(Option<u64>),
+    /// An unconditional `jmp`: control goes to the destination only, never to the next
+    /// instruction. `None` when it is indirect.
+    Jmp(Option<u64>),
+    /// A conditional branch: the destination **or** the next instruction.
+    Branch(Option<u64>),
+    /// `ret`/`iret`: flow stops.
+    Return,
+    /// A `noreturn` trap — `int 29h` (`__fastfail`), `int 3`, `ud2`, `hlt`. Flow stops, so a walk
+    /// must not fall through one.
+    Trap,
+    /// Not read: an instruction set whose operands this does not decode, or a rendering the
+    /// split did not recognise. Says nothing about what the instruction does.
+    Unknown,
+}
+
+impl Flow {
+    /// The destination this instruction names, when it named one resolvably.
+    pub fn target(self) -> Option<u64> {
+        match self {
+            Self::Call(target) | Self::Jmp(target) | Self::Branch(target) => target,
+            _ => None,
+        }
+    }
+
+    /// Whether control can continue at the next instruction.
+    ///
+    /// [`Flow::Unknown`] answers **true**, because a walk that stopped there would silently drop
+    /// the rest of a function on an architecture whose operands are not read.
+    pub fn falls_through(self) -> bool {
+        matches!(
+            self,
+            Self::Fallthrough | Self::Call(_) | Self::Branch(_) | Self::Unknown
+        )
+    }
+}
+
+/// A memory operand, as the engine renders it — `qword ptr [rdx+0B8h]`, `gs:[188h]`,
+/// `[rax+rcx*8+20h]`, ``qword ptr [nt!_imp_ExAllocatePool2 (fffff803`…)]``.
+///
+/// Every field is what was *printed*. Nothing here is computed against a register context, so
+/// `[rdx+0B8h]` is the displacement `0xb8` off whatever `rdx` held, and this says only that.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryOperand {
+    /// The access width in bytes, from the `qword ptr` prefix; `None` when the engine printed
+    /// none, which it omits where the mnemonic already fixes the width.
+    pub size: Option<u32>,
+    /// A segment override — `gs` in `gs:[188h]`, which is how kernel code reaches the KPCR.
+    pub segment: Option<String>,
+    /// The base register, when one was printed.
+    pub base: Option<String>,
+    /// The index register of a `base+index*scale` form.
+    pub index: Option<String>,
+    /// The index's scale; 1 when none was printed.
+    pub scale: u8,
+    /// The signed displacement, zero when none was printed.
+    pub displacement: i64,
+    /// A symbol printed inside the brackets — `nt!_imp_ExAllocatePool2`, which is what an import
+    /// thunk looks like on a driver whose symbols resolve.
+    pub symbol: Option<String>,
+    /// An absolute address printed inside the brackets, whether bare or beside a symbol.
+    pub address: Option<u64>,
+}
+
+/// One operand of an instruction.
+///
+/// [`Self::Other`] is the whole safety story: an operand this does not recognise keeps its text
+/// and is never forced into one of the shapes above. Order matters in the reading, and one
+/// collision is worth knowing about — `ah`, `bh`, `ch` and `dh` are registers *and* well-formed
+/// `h`-suffixed hexadecimal literals, so registers are matched first and `mov ah,5` does not
+/// report a destination of `0xa`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operand {
+    /// A register, by the engine's own name for it.
+    Register(String),
+    /// A literal, as the bit pattern the engine printed. `40h` is hexadecimal by its suffix; a
+    /// bare digit run is decimal, which agrees with hexadecimal below ten and is what the engine
+    /// prints for small counts. Unsigned because a real routine renders `8000000000000000h` and
+    /// `0FFFFFFFFFFFFFFFFh`, and a leading `-` is two's complement for the same reason.
+    Immediate(u64),
+    /// A memory reference.
+    Memory(MemoryOperand),
+    /// A branch or call destination as rendered: ``nt!KeBugCheckEx (fffff803`3e2547f0)``, a symbol
+    /// with no address, or a bare address. An address here has at least eight hexadecimal digits,
+    /// which is what keeps a short immediate from being read as one.
+    Target {
+        /// `module!Symbol` or `module!Symbol+0x1c`, when the engine resolved one.
+        symbol: Option<String>,
+        /// The absolute destination, when the engine printed one.
+        address: Option<u64>,
+    },
+    /// Anything else, verbatim.
+    Other(String),
+}
+
 /// One disassembled instruction, as [`DebugEngine::disassemble`] reports it.
 ///
 /// The engine has no structured disassembly — `IDebugControl::Disassemble` renders one line of
@@ -1783,6 +1926,11 @@ pub struct StackFrame {
 /// boundaries, with the address taken from the walk rather than parsed back out of it. A line the
 /// split does not recognise keeps everything after the address in [`Self::text`] and leaves
 /// [`Self::bytes`] empty, rather than guessing.
+///
+/// [`Self::mnemonic`], [`Self::operands`] and [`Self::flow`] read that third column, so a caller
+/// asking what an instruction *compares against* or *branches to* reads a field rather than
+/// re-parsing a rendering downstream. [`Self::text`] stays verbatim beside them: it is what a
+/// listing prints, and the fields do not replace it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instruction {
     /// Where the instruction is. **Not** parsed from the rendered line: it is the offset this
@@ -1793,8 +1941,18 @@ pub struct Instruction {
     pub bytes: String,
     /// The mnemonic and its operands — `mov qword ptr [rsp+8],rbx` — with the engine's column
     /// padding collapsed to single spaces, since the columns it was aligning are separate fields
-    /// here. Operand symbols are the engine's own (`call nt!KeBugCheckEx (fffff803`...)`).
+    /// here. Operand symbols are the engine's own (``call nt!KeBugCheckEx (fffff803`...)``).
     pub text: String,
+    /// The operative mnemonic — `mov`, `cmp`, `call`. A `lock`/`rep` prefix is **skipped** rather
+    /// than joined to it, so `lock inc dword ptr [rax]` reports `inc`; the prefix is still in
+    /// [`Self::text`]. Empty only when the rendering was.
+    pub mnemonic: String,
+    /// The operands, in the order printed. Empty for an instruction that takes none — and also
+    /// for an instruction set whose operands are not read, which [`Self::flow`] tells apart by
+    /// being [`Flow::Unknown`].
+    pub operands: Vec<Operand>,
+    /// What the instruction does to control flow.
+    pub flow: Flow,
 }
 
 /// The engine's current **scope**: which instruction, which frame, and the register context
@@ -2288,27 +2446,338 @@ fn read_engine_string(
 /// on a rendering it does not otherwise trust. Anything the shape does not fit keeps its whole
 /// remainder as text, so an engine that renders differently loses a column rather than an
 /// instruction.
-fn split_instruction(address: u64, line: &str) -> Instruction {
+fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instruction {
     let mut columns = line.trim().splitn(3, char::is_whitespace);
     let (_address, bytes, rest) = (columns.next(), columns.next(), columns.next());
-    match (bytes, rest) {
-        (Some(bytes), Some(rest)) => Instruction {
-            address,
-            bytes: bytes.to_string(),
-            text: collapse_spaces(rest),
-        },
+    let (bytes, text) = match (bytes, rest) {
+        (Some(bytes), Some(rest)) => (bytes.to_string(), collapse_spaces(rest)),
         // One column past the address, or none: keep it whole rather than calling it an encoding.
-        (Some(only), None) => Instruction {
-            address,
-            bytes: String::new(),
-            text: collapse_spaces(only),
-        },
-        _ => Instruction {
-            address,
-            bytes: String::new(),
-            text: collapse_spaces(line),
-        },
+        (Some(only), None) => (String::new(), collapse_spaces(only)),
+        _ => (String::new(), collapse_spaces(line)),
+    };
+    let (mnemonic, operands, flow) = read_operation(&text, set);
+    Instruction {
+        address,
+        bytes,
+        text,
+        mnemonic,
+        operands,
+        flow,
     }
+}
+
+/// Prefixes that are not the operation: `lock inc dword ptr [rax]` is an `inc`.
+const MNEMONIC_PREFIXES: [&str; 7] = ["lock", "rep", "repe", "repz", "repne", "repnz", "bnd"];
+
+/// The third column read as an operation — mnemonic, operands, control flow.
+///
+/// An instruction set whose operands are not read still reports its mnemonic, because the first
+/// token is the mnemonic in every syntax the engine renders. What it does not report is anything
+/// that would be a guess: no operands, and [`Flow::Unknown`] rather than the `Fallthrough` that
+/// most instructions happen to be — a walk told "falls through" about an unread `b.eq` would
+/// silently take one edge of two.
+fn read_operation(text: &str, set: InstructionSet) -> (String, Vec<Operand>, Flow) {
+    let mut tokens = text.trim().splitn(2, char::is_whitespace);
+    let mut mnemonic = tokens.next().unwrap_or_default().to_string();
+    let mut rest = tokens.next().unwrap_or_default().trim().to_string();
+    // A prefix is not the operation. Take the next token as the mnemonic, if there is one.
+    while MNEMONIC_PREFIXES.contains(&mnemonic.as_str()) && !rest.is_empty() {
+        let mut next = rest.splitn(2, char::is_whitespace);
+        mnemonic = next.next().unwrap_or_default().to_string();
+        rest = next.next().unwrap_or_default().trim().to_string();
+    }
+    if !set.operands_are_read() || mnemonic.is_empty() {
+        return (mnemonic, Vec::new(), Flow::Unknown);
+    }
+    // `???` is the engine saying it could not read the bytes, not an instruction.
+    if mnemonic.starts_with('?') {
+        return (mnemonic, Vec::new(), Flow::Unknown);
+    }
+    let operands: Vec<Operand> = split_operands(&rest)
+        .into_iter()
+        .map(|operand| read_operand(operand.trim()))
+        .collect();
+    let flow = classify_flow(&mnemonic, &operands);
+    (mnemonic, operands, flow)
+}
+
+/// Splits an operand list on the commas that separate operands — the ones outside brackets and
+/// parentheses. `[rax+rcx*8]` has no top-level comma; a symbolised target's `(fffff803`…)` has no
+/// comma at all, and both are stepped over the same way.
+fn split_operands(rest: &str) -> Vec<&str> {
+    if rest.is_empty() {
+        return Vec::new();
+    }
+    let (mut depth, mut start, mut out) = (0i32, 0usize, Vec::new());
+    for (index, character) in rest.char_indices() {
+        match character {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
+            ',' if depth <= 0 => {
+                out.push(&rest[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&rest[start..]);
+    out
+}
+
+/// The `qword ptr` family, as a width in bytes.
+fn operand_size(word: &str) -> Option<u32> {
+    Some(match word {
+        "byte" => 1,
+        "word" => 2,
+        "dword" => 4,
+        "fword" => 6,
+        "qword" => 8,
+        "tbyte" => 10,
+        "mmword" | "xmmword" => 16,
+        "ymmword" => 32,
+        "zmmword" => 64,
+        _ => return None,
+    })
+}
+
+/// One operand, read in an order that resolves the collisions rather than tripping over them.
+fn read_operand(text: &str) -> Operand {
+    if text.is_empty() {
+        return Operand::Other(String::new());
+    }
+    // Registers first: `ah`, `bh`, `ch` and `dh` are also well-formed `h`-suffixed literals.
+    if is_register(text) {
+        return Operand::Register(text.to_string());
+    }
+    if text.contains('[') {
+        if let Some(memory) = read_memory_operand(text) {
+            return Operand::Memory(memory);
+        }
+        return Operand::Other(text.to_string());
+    }
+    // A symbolised destination, or a bare address. `!` is what makes it a symbol; the address is
+    // the parenthesised one the engine prints beside it.
+    if text.contains('!') {
+        let (symbol, address) = split_symbol_and_address(text);
+        return Operand::Target { symbol, address };
+    }
+    if let Some(address) = parse_engine_address(text) {
+        return Operand::Target {
+            symbol: None,
+            address: Some(address),
+        };
+    }
+    if let Some(value) = parse_engine_number(text) {
+        return Operand::Immediate(value);
+    }
+    Operand::Other(text.to_string())
+}
+
+/// `nt!KeBugCheckEx (fffff803`3e2547f0)` as its two halves. Either may be missing.
+fn split_symbol_and_address(text: &str) -> (Option<String>, Option<u64>) {
+    let (name, address) = match text.split_once('(') {
+        Some((name, tail)) => (name.trim(), tail.trim_end_matches(')').trim().to_string()),
+        None => (text.trim(), String::new()),
+    };
+    let symbol = (!name.is_empty()).then(|| name.to_string());
+    (symbol, parse_engine_address(&address))
+}
+
+/// The inside of a memory operand, with whatever `qword ptr` and segment override preceded it.
+fn read_memory_operand(text: &str) -> Option<MemoryOperand> {
+    let mut memory = MemoryOperand {
+        scale: 1,
+        ..MemoryOperand::default()
+    };
+    let open = text.find('[')?;
+    let close = text.rfind(']')?;
+    if close < open {
+        return None;
+    }
+    // Everything before the bracket: an optional `qword ptr`, an optional `gs:`.
+    for word in text[..open]
+        .split(|c: char| c.is_whitespace() || c == ':')
+        .filter(|w| !w.is_empty())
+    {
+        if let Some(size) = operand_size(word) {
+            memory.size = Some(size);
+        } else if word != "ptr" {
+            memory.segment = Some(word.to_string());
+        }
+    }
+    // A segment override written `gs:[188h]` leaves `gs` immediately before the bracket, which
+    // the same split already caught; nothing else is expected there.
+    let inside = &text[open + 1..close];
+    if inside.contains('!') {
+        let (symbol, address) = split_symbol_and_address(inside);
+        memory.symbol = symbol;
+        memory.address = address;
+        return Some(memory);
+    }
+    let mut negative = false;
+    let mut term = String::new();
+    let flush = |term: &mut String, negative: &mut bool, memory: &mut MemoryOperand| {
+        let text = term.trim().to_string();
+        term.clear();
+        let was_negative = std::mem::replace(negative, false);
+        if text.is_empty() {
+            return;
+        }
+        if let Some((index, scale)) = text.split_once('*') {
+            memory.index = Some(index.trim().to_string());
+            memory.scale = scale.trim().parse().unwrap_or(1);
+        } else if is_register(&text) {
+            if memory.base.is_none() {
+                memory.base = Some(text);
+            } else {
+                memory.index = Some(text);
+            }
+        } else if let Some(address) = parse_engine_address(&text) {
+            memory.address = Some(address);
+        } else if let Some(value) = parse_engine_number(&text) {
+            let value = value as i64;
+            memory.displacement = if was_negative { -value } else { value };
+        }
+    };
+    for character in inside.chars() {
+        match character {
+            '+' => flush(&mut term, &mut negative, &mut memory),
+            '-' => {
+                flush(&mut term, &mut negative, &mut memory);
+                negative = true;
+            }
+            _ => term.push(character),
+        }
+    }
+    flush(&mut term, &mut negative, &mut memory);
+    Some(memory)
+}
+
+/// An engine-rendered address: the `hi`lo` backtick form or a plain hexadecimal run, requiring
+/// **eight** digits so a short immediate is never read as an address.
+fn parse_engine_address(token: &str) -> Option<u64> {
+    let cleaned: String = token
+        .trim()
+        .trim_matches(|c| c == '(' || c == ')' || c == ',')
+        .chars()
+        .filter(|&c| c != '`')
+        .collect();
+    if cleaned.len() < 8 || !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(&cleaned, 16).ok()
+}
+
+/// A literal, as the **bit pattern** the engine printed. `40h` is hexadecimal by its suffix,
+/// `0x40` by its prefix, and a bare digit run is decimal — which is what the engine prints for a
+/// small count, and agrees with hexadecimal below ten either way.
+///
+/// Unsigned on purpose, and measured rather than assumed: a real dispatch routine renders
+/// `mov rax,8000000000000000h` and `mov qword ptr [rbp+0A8h],0FFFFFFFFFFFFFFFFh`, both of which
+/// overflow a signed parse and came back as unread operands until this stopped being an `i64`.
+/// A leading `-` is taken as two's complement for the same reason: what a caller compares against
+/// a control code or a mask is the pattern, not an arithmetic sign.
+fn parse_engine_number(token: &str) -> Option<u64> {
+    let token = token.trim();
+    let (negative, token) = match token.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, token),
+    };
+    let value = if let Some(hex) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()?
+    } else if let Some(hex) = token.strip_suffix('h').or_else(|| token.strip_suffix('H')) {
+        u64::from_str_radix(hex, 16).ok()?
+    } else if token.chars().all(|c| c.is_ascii_digit()) && !token.is_empty() {
+        token.parse().ok()?
+    } else {
+        return None;
+    };
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
+}
+
+/// Whether a token is one of the engine's register names.
+fn is_register(token: &str) -> bool {
+    const NAMED: [&str; 24] = [
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "eax", "ebx", "ecx", "edx", "esi",
+        "edi", "ebp", "esp", "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+    ];
+    const BYTE: [&str; 12] = [
+        "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh", "sil", "dil", "bpl", "spl",
+    ];
+    const SEGMENT: [&str; 6] = ["cs", "ds", "es", "fs", "gs", "ss"];
+    const POINTER: [&str; 4] = ["rip", "eip", "ip", "eflags"];
+    let token = token.trim();
+    if NAMED.contains(&token) || BYTE.contains(&token) || SEGMENT.contains(&token) {
+        return true;
+    }
+    if POINTER.contains(&token) {
+        return true;
+    }
+    // `r8`..`r15` with their `d`/`w`/`b` widths, and the vector and control/debug files.
+    for (prefix, count) in [
+        ("r", 16u32),
+        ("xmm", 32),
+        ("ymm", 32),
+        ("zmm", 32),
+        ("cr", 16),
+        ("dr", 16),
+    ] {
+        if let Some(tail) = token.strip_prefix(prefix) {
+            let digits = tail.trim_end_matches(['d', 'w', 'b']);
+            if prefix != "r" && digits.len() != tail.len() {
+                continue;
+            }
+            if let Ok(number) = digits.parse::<u32>()
+                && number < count
+                && (prefix != "r" || number >= 8)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The control flow an x86 mnemonic implies, with its destination taken from the operand that
+/// was already read rather than from the line.
+fn classify_flow(mnemonic: &str, operands: &[Operand]) -> Flow {
+    let destination = || match operands.first() {
+        Some(Operand::Target { address, .. }) => *address,
+        // A near jump to an absolute the engine printed bare, without eight digits, is not one
+        // this reads: an immediate here is a relative displacement, not a destination.
+        _ => None,
+    };
+    match mnemonic {
+        "call" | "callf" => Flow::Call(destination()),
+        "jmp" | "jmpf" => Flow::Jmp(destination()),
+        "ret" | "retf" | "retn" | "iret" | "iretd" | "iretq" | "sysret" | "sysexit" => Flow::Return,
+        "ud0" | "ud1" | "ud2" | "hlt" => Flow::Trap,
+        "int" | "int1" | "int3" | "into" => Flow::Trap,
+        _ if is_conditional_branch(mnemonic) => Flow::Branch(destination()),
+        _ => Flow::Fallthrough,
+    }
+}
+
+/// `jcc`, `loop` and `jcxz` — the conditional transfers, which take one edge or the other.
+fn is_conditional_branch(mnemonic: &str) -> bool {
+    const CONDITIONS: [&str; 32] = [
+        "o", "no", "b", "c", "nae", "ae", "nb", "nc", "e", "z", "ne", "nz", "be", "na", "a", "nbe",
+        "s", "ns", "p", "pe", "np", "po", "l", "nge", "ge", "nl", "le", "ng", "g", "nle", "cxz",
+        "ecxz",
+    ];
+    if let Some(condition) = mnemonic.strip_prefix('j')
+        && (condition == "rcxz" || CONDITIONS.contains(&condition))
+    {
+        return true;
+    }
+    matches!(mnemonic, "loop" | "loope" | "loopne" | "loopz" | "loopnz")
 }
 
 /// Runs of whitespace as one space. The engine pads its columns to align them in a listing, and
@@ -5408,6 +5877,9 @@ impl DebugEngine {
     /// annotation, which is a fact about the *current register context* rather than about the
     /// instruction and would make two identical calls differ.
     pub fn disassemble(&self, address: u64, count: usize) -> Result<Vec<Instruction>, DbgEngError> {
+        // Asked once for the whole walk: the target's architecture cannot change inside one, and
+        // asking per instruction would put a COM call between every pair of them.
+        let set = self.instruction_set();
         let mut out = Vec::with_capacity(count.min(64));
         let mut at = address;
         for _ in 0..count {
@@ -5433,7 +5905,7 @@ impl DebugEngine {
                     });
                 }
             };
-            out.push(split_instruction(at, &line));
+            out.push(split_instruction(at, &line, set));
             // An engine that does not advance would spin here forever rendering one instruction.
             if next <= at {
                 break;
@@ -5441,6 +5913,93 @@ impl DebugEngine {
             at = next;
         }
         Ok(out)
+    }
+
+    /// The instruction set the target's disassembly is rendered in.
+    ///
+    /// Falls back to [`InstructionSet::Other`] when the engine will not say, which reads
+    /// operands out of nothing rather than reading them wrongly — a target that cannot name its
+    /// processor is not one to guess x86 for.
+    pub fn instruction_set(&self) -> InstructionSet {
+        match self.processor_type() {
+            Ok(machine) => InstructionSet::from_processor_type(machine),
+            Err(_) => InstructionSet::Other(0),
+        }
+    }
+
+    /// Where the unwind **region** containing `address` begins and ends, from the target's own
+    /// unwind data rather than from a guess or a symbol's extent.
+    ///
+    /// `IDebugSymbols3::GetFunctionEntryByOffset` reads the `RUNTIME_FUNCTION` the image's
+    /// `.pdata` carries, so it is exact for the x64 code this crate walks, and the table is in a
+    /// read-only section — which is why it still answers on a dump whose data pages were never
+    /// captured.
+    ///
+    /// # A region is not a function, and using it as one loses code
+    ///
+    /// MSVC splits a function into **several** `RUNTIME_FUNCTION` entries whenever it separates
+    /// cold or shared blocks, and each entry bounds only its own region. Measured against
+    /// `mountmgr!MountMgrDeviceControl` on a 26100 image: this answers `0x14750..0x147a3`, an
+    /// 83-byte region of 23 instructions, and `.fnent` agrees exactly — while the routine's IOCTL
+    /// compare chain lives past `0x147dd`, in regions this entry says nothing about. Bounding a
+    /// walk with it recovered **zero** control codes where following the flow recovered twelve.
+    ///
+    /// So this is a sanity bound and a "which region is this" answer, **not** a function's extent.
+    /// A walk over a whole function follows [`Instruction::flow`] from its entry.
+    ///
+    /// `None` is a fact rather than a failure: a leaf function may have no entry, and neither has
+    /// an address that is not code. A caller that needs the distinction has [`Self::symbol_for`].
+    ///
+    /// # The shape, which is not the one the name suggests
+    ///
+    /// On x64 the engine fills an `IMAGE_RUNTIME_FUNCTION_ENTRY` — **three `u32` RVAs**
+    /// (`BeginAddress`, `EndAddress`, `UnwindInfoAddress`), not the 64-bit addresses
+    /// `IMAGE_FUNCTION_ENTRY64` would carry. Reading them as `u64` packs two RVAs into one number
+    /// and yields an extent that fails its own sanity check, which is how this was first written
+    /// and how it reported "no entry" for a 2,108-byte dispatch routine that plainly had one.
+    /// They are also relative, so they are rebased here against the module that holds the address
+    /// — what `.fnent` prints, at the RVAs it prints them.
+    pub fn function_extent(&self, address: u64) -> Result<Option<(u64, u64)>, DbgEngError> {
+        let mut entry = [0u32; 3];
+        let mut needed = 0u32;
+        if unsafe {
+            self.symbols.GetFunctionEntryByOffset(
+                address,
+                0,
+                Some(entry.as_mut_ptr().cast()),
+                std::mem::size_of_val(&entry) as u32,
+                Some(&mut needed),
+            )
+        }
+        .is_err()
+        {
+            // No entry for this address is the ordinary answer for a leaf or for data.
+            return Ok(None);
+        }
+        let (begin, end) = (entry[0] as u64, entry[1] as u64);
+        if begin == 0 || end <= begin {
+            return Ok(None);
+        }
+        let Some(module) = self.module_at(address)? else {
+            return Ok(None);
+        };
+        let (begin, end) = (module.base + begin, module.base + end);
+        // The extent has to contain the address it was asked about; anything else means the entry
+        // read back does not describe this function and is not worth returning.
+        if !(begin..end).contains(&address) {
+            return Ok(None);
+        }
+        Ok(Some((begin, end)))
+    }
+
+    /// The `module!Symbol` an address resolves to and how far past it the address is.
+    ///
+    /// The public half of [`Self::symbol_at`]: what names a call's destination once a walk has
+    /// one. Infallible for the same reason — an address that resolves to nothing is the normal
+    /// case for a driver with no PDB, and a caller reads `None` rather than an error.
+    pub fn symbol_for(&self, address: u64) -> Option<(String, u64)> {
+        let (name, displacement) = self.symbol_at(address);
+        name.map(|name| (name, displacement))
     }
 
     /// The `module!Symbol` an address resolves to and how far past it the address is.
@@ -7697,6 +8256,7 @@ mod tests {
         let x64 = split_instruction(
             0xfffff803_89201234,
             "fffff803`89201234 48895c2408      mov     qword ptr [rsp+8],rbx\n",
+            InstructionSet::Amd64,
         );
         assert_eq!(x64.address, 0xfffff803_89201234);
         assert_eq!(x64.bytes, "48895c2408");
@@ -7705,6 +8265,7 @@ mod tests {
         let arm64 = split_instruction(
             0xfffff803_89201234,
             "fffff803`89201234 a9bf7bfd     stp         fp,lr,[sp,#-0x10]!\n",
+            InstructionSet::Other(0xaa64),
         );
         assert_eq!(arm64.bytes, "a9bf7bfd");
         assert_eq!(arm64.text, "stp fp,lr,[sp,#-0x10]!");
@@ -7714,7 +8275,7 @@ mod tests {
     /// agreeing lines cannot tell the two sources apart.
     #[test]
     fn test_an_instructions_address_comes_from_the_walk_not_the_rendering() {
-        let one = split_instruction(0x1000, "deadbeef`deadbeef 90    nop");
+        let one = split_instruction(0x1000, "deadbeef`deadbeef 90    nop", InstructionSet::Amd64);
         assert_eq!(one.address, 0x1000);
         assert_eq!(one.text, "nop");
     }
@@ -7723,13 +8284,213 @@ mod tests {
     /// the remainder is kept as text and nothing is presented as an encoding that is not one.
     #[test]
     fn test_an_unrecognised_line_keeps_its_text_rather_than_inventing_an_encoding() {
-        let two_columns = split_instruction(0x1000, "fffff803`89201234 ????");
+        let two_columns =
+            split_instruction(0x1000, "fffff803`89201234 ????", InstructionSet::Amd64);
         assert!(two_columns.bytes.is_empty(), "{two_columns:?}");
         assert_eq!(two_columns.text, "????");
 
-        let one_column = split_instruction(0x1000, "???");
+        let one_column = split_instruction(0x1000, "???", InstructionSet::Amd64);
         assert!(one_column.bytes.is_empty(), "{one_column:?}");
         assert_eq!(one_column.text, "???");
+
+        // An unreadable rendering must not claim a flow either — `???` is the engine saying it
+        // could not read the bytes, and `Fallthrough` there would walk a walk into nothing.
+        assert_eq!(one_column.flow, Flow::Unknown, "{one_column:?}");
+        assert_eq!(two_columns.flow, Flow::Unknown, "{two_columns:?}");
+    }
+
+    /// An instruction set whose operands are not read refuses rather than guesses.
+    ///
+    /// The mnemonic survives — the first token is the mnemonic in every syntax the engine renders
+    /// — and nothing else is claimed. The flow matters most: ARM64's `b.eq` is a conditional
+    /// branch, and reporting the `Fallthrough` that an unread instruction would otherwise default
+    /// to would hand a caller one edge of two and call the walk complete.
+    #[test]
+    fn test_an_unread_instruction_set_reports_no_operands_and_no_flow() {
+        let arm64 = split_instruction(
+            0xfffff803_89201234,
+            "fffff803`89201234 54000060     b.eq        nt!KiFoo+0x1c (fffff803`89201240)",
+            InstructionSet::Other(0xaa64),
+        );
+        assert_eq!(arm64.mnemonic, "b.eq");
+        assert!(arm64.operands.is_empty(), "{arm64:?}");
+        assert_eq!(arm64.flow, Flow::Unknown);
+        assert!(
+            arm64.text.contains("nt!KiFoo"),
+            "the rendering is still the rendering: {arm64:?}"
+        );
+    }
+
+    /// The operands of the shapes this crate's callers actually walk.
+    ///
+    /// Every one of these is a rendering taken from a real x64 kernel target rather than
+    /// composed: the compare against an IOCTL code, the `IO_STACK_LOCATION` field load, the
+    /// symbolised call, the import thunk, the scaled index of a jump table, and the KPCR read
+    /// through a segment override.
+    #[test]
+    fn test_x64_operands_are_read_as_values() {
+        let one = |text: &str| {
+            split_instruction(
+                0x1000,
+                &format!("00001000 90 {text}"),
+                InstructionSet::Amd64,
+            )
+        };
+
+        // The compare an IOCTL map is recovered from.
+        let cmp = one("cmp     r13d,6D0030h");
+        assert_eq!(cmp.mnemonic, "cmp");
+        assert_eq!(
+            cmp.operands,
+            vec![
+                Operand::Register("r13d".into()),
+                Operand::Immediate(0x6d_0030)
+            ]
+        );
+        assert_eq!(cmp.flow, Flow::Fallthrough);
+
+        // `IRP_SP = [Irp+0xb8]`, the load every dispatch routine opens with.
+        let load = one("mov     rax,qword ptr [rdx+0B8h]");
+        let Some(Operand::Memory(memory)) = load.operands.get(1) else {
+            panic!("the memory operand was not read: {load:?}");
+        };
+        assert_eq!(memory.size, Some(8));
+        assert_eq!(memory.base.as_deref(), Some("rdx"));
+        assert_eq!(memory.displacement, 0xb8);
+        assert_eq!(memory.index, None);
+
+        // A symbolised direct call: the destination is the parenthesised address.
+        let call = one("call    nt!KeBugCheckEx (fffff803`3e2547f0)");
+        assert_eq!(call.flow, Flow::Call(Some(0xfffff803_3e2547f0)));
+        assert_eq!(
+            call.operands,
+            vec![Operand::Target {
+                symbol: Some("nt!KeBugCheckEx".into()),
+                address: Some(0xfffff803_3e2547f0),
+            }]
+        );
+
+        // An import thunk: indirect, so no destination — and the symbol names the slot.
+        let thunk = one("call    qword ptr [mountmgr!_imp_ExAllocatePool2 (fffff803`3e25a018)]");
+        assert_eq!(thunk.flow, Flow::Call(None));
+        let Some(Operand::Memory(slot)) = thunk.operands.first() else {
+            panic!("the thunk's operand was not read as memory: {thunk:?}");
+        };
+        assert_eq!(
+            slot.symbol.as_deref(),
+            Some("mountmgr!_imp_ExAllocatePool2")
+        );
+        assert_eq!(slot.address, Some(0xfffff803_3e25a018));
+
+        // A jump table: base, scaled index and the table's own address.
+        let table = one("jmp     qword ptr [rax*8+fffff803`3e25a000]");
+        assert_eq!(table.flow, Flow::Jmp(None));
+        let Some(Operand::Memory(entry)) = table.operands.first() else {
+            panic!("the jump table's operand was not read as memory: {table:?}");
+        };
+        assert_eq!(entry.index.as_deref(), Some("rax"));
+        assert_eq!(entry.scale, 8);
+        assert_eq!(entry.address, Some(0xfffff803_3e25a000));
+
+        // A segment override, which is how kernel code reaches the KPCR.
+        let kpcr = one("mov     rax,qword ptr gs:[188h]");
+        let Some(Operand::Memory(pcr)) = kpcr.operands.get(1) else {
+            panic!("the segment-overridden operand was not read: {kpcr:?}");
+        };
+        assert_eq!(pcr.segment.as_deref(), Some("gs"));
+        assert_eq!(pcr.displacement, 0x188);
+        assert_eq!(pcr.base, None);
+    }
+
+    /// The flow classification, including the three endings a walk must not fall through.
+    #[test]
+    fn test_flow_separates_the_edges_a_walk_may_take() {
+        let one = |text: &str| {
+            split_instruction(
+                0x1000,
+                &format!("00001000 90 {text}"),
+                InstructionSet::Amd64,
+            )
+            .flow
+        };
+
+        assert_eq!(
+            one("je      mountmgr!MountMgrQueryPoints+0x1c (fffff803`3e2547f0)"),
+            Flow::Branch(Some(0xfffff803_3e2547f0))
+        );
+        assert_eq!(one("ret"), Flow::Return);
+        assert_eq!(one("int     29h"), Flow::Trap);
+        assert_eq!(one("ud2"), Flow::Trap);
+        assert_eq!(one("call    rax"), Flow::Call(None));
+        assert_eq!(one("jmp     rax"), Flow::Jmp(None));
+        assert_eq!(one("xor     ebx,ebx"), Flow::Fallthrough);
+
+        // A prefix is not the operation, and skipping it must not lose the operation's flow.
+        let locked = split_instruction(
+            0x1000,
+            "00001000 f0ff05 lock inc dword ptr [rax]",
+            InstructionSet::Amd64,
+        );
+        assert_eq!(locked.mnemonic, "inc");
+        assert_eq!(locked.flow, Flow::Fallthrough);
+
+        // Sound in the one direction that matters: an unresolved destination is `None`, never a
+        // borrowed address from somewhere else on the line.
+        assert_eq!(one("jmp     qword ptr [rax*8+1234h]").target(), None);
+    }
+
+    /// `ah`, `bh`, `ch` and `dh` are registers *and* well-formed `h`-suffixed hexadecimal, and
+    /// reading them as literals silently turns a destination register into a number.
+    ///
+    /// Pinned because the ordering that avoids it is invisible: registers are matched before
+    /// numbers, and swapping those two arms passes every other test in this file.
+    #[test]
+    fn test_a_byte_register_is_not_read_as_a_hexadecimal_literal() {
+        let one = split_instruction(0x1000, "00001000 b405 mov ah,5", InstructionSet::Amd64);
+        assert_eq!(
+            one.operands,
+            vec![Operand::Register("ah".into()), Operand::Immediate(5)],
+            "a register was read as a literal: {one:?}"
+        );
+
+        // And the literal case still reads: the same four letters with more digits in front.
+        let two = split_instruction(0x1000, "00001000 b40a mov al,0Ah", InstructionSet::Amd64);
+        assert_eq!(
+            two.operands,
+            vec![Operand::Register("al".into()), Operand::Immediate(0xa)]
+        );
+    }
+
+    /// A literal that does not fit a signed 64-bit integer is still a literal.
+    ///
+    /// Both renderings here are real, from a walk of `mountmgr!MountMgrDeviceControl` on a 26100
+    /// image, and both came back as unread `Other` operands while this parsed into an `i64` —
+    /// three of the three unread operands in that whole routine were this one bug. A caller
+    /// matching an operand against a mask or a control code wants the bit pattern, so the value
+    /// is unsigned and a leading `-` is two's complement.
+    #[test]
+    fn test_a_literal_too_wide_for_a_signed_integer_is_still_read() {
+        let one = |text: &str| {
+            split_instruction(
+                0x1000,
+                &format!("00001000 90 {text}"),
+                InstructionSet::Amd64,
+            )
+            .operands
+        };
+
+        assert_eq!(
+            one("mov rax,8000000000000000h").get(1),
+            Some(&Operand::Immediate(0x8000_0000_0000_0000))
+        );
+        assert_eq!(
+            one("mov qword ptr [rbp+0A8h],0FFFFFFFFFFFFFFFFh").get(1),
+            Some(&Operand::Immediate(u64::MAX))
+        );
+        assert_eq!(
+            one("sub rsp,-8").get(1),
+            Some(&Operand::Immediate(8u64.wrapping_neg()))
+        );
     }
 
     /// glslang/dbgscope#82: a borrowed engine's lifecycle used to die with the wrapper.
