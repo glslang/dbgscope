@@ -38,8 +38,14 @@ All notable changes to this project are documented here. The format follows
   `Call(None)`, which a walk reads as an indirect call and drops. Angle-bracket depth is
   deliberately not tracked instead — `operator<<` and `operator<` leave it unbalanced, and an
   unbalanced opener swallows a following operand, which on a `cmp` would take the control code
-  with it. `xbegin` is a conditional branch: it falls through into the transaction and takes its
-  operand on an abort, where the lock-based fallback usually lives.
+  with it. A symbol's own **parentheses** cost the same edge the same way, so a destination is
+  split from the *last* parenthesis and only when what follows it parses as an address:
+  `call module!Functor::operator() (…)` keeps both halves, and a name whose last parenthesis is
+  its own stays whole. `xbegin` is a conditional branch: it falls through into the transaction and
+  takes its operand on an abort, where the lock-based fallback usually lives. `xabort` is listed
+  as a fall-through on purpose — inside a transaction it resumes at the fallback, but the SDM
+  makes it a NOP when `RTM_ACTIVE = 0`, and no static reading can tell which, so classifying it as
+  a transfer would drop everything after it wherever RTM is inactive.
 - `DebugEngine::effective_processor_type` reports the processor the engine is **rendering** in, as
   against the physical one `processor_type` already answered. The two diverge wherever one machine
   runs another's code — a WOW64 process, x64 emulated on ARM64, any target after `.effmach` — and

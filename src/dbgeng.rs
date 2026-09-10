@@ -2634,14 +2634,25 @@ fn read_operand(text: &str) -> Operand {
     Operand::Other(text.to_string())
 }
 
-/// `nt!KeBugCheckEx (fffff803`3e2547f0)` as its two halves. Either may be missing.
+/// ``nt!KeBugCheckEx (fffff803`3e2547f0)`` as its two halves. Either may be missing.
+///
+/// Split from the **last** parenthesis, and only when what follows it is an address. A symbol can
+/// contain parentheses of its own — `module!Functor::operator()` is the demangled name of a call
+/// operator — and splitting at the first one takes the name apart at `operator`, leaves `) (…` to
+/// parse as an address, and hands back a truncated symbol with no destination. The instruction is
+/// then `Call(None)`, which a reachability walk reads as indirect and drops: a direct edge lost to
+/// a name. Requiring the tail to *parse* is what makes the rule safe for a symbol whose last
+/// parenthesis is its own, since then there is no address there and the whole text is the name.
 fn split_symbol_and_address(text: &str) -> (Option<String>, Option<u64>) {
-    let (name, address) = match text.split_once('(') {
-        Some((name, tail)) => (name.trim(), tail.trim_end_matches(')').trim().to_string()),
-        None => (text.trim(), String::new()),
-    };
-    let symbol = (!name.is_empty()).then(|| name.to_string());
-    (symbol, parse_engine_address(&address))
+    let text = text.trim();
+    if let Some(open) = text.rfind('(') {
+        let inside = text[open + 1..].trim().trim_end_matches(')');
+        if let Some(address) = parse_engine_address(inside) {
+            let name = text[..open].trim();
+            return ((!name.is_empty()).then(|| name.to_string()), Some(address));
+        }
+    }
+    ((!text.is_empty()).then(|| text.to_string()), None)
 }
 
 /// The inside of a memory operand, with whatever `qword ptr` and segment override preceded it.
@@ -2812,13 +2823,19 @@ fn is_register(token: &str) -> bool {
 /// # What a missing entry costs, which is why the table need not be complete
 ///
 /// This is a hand-maintained list, so an exotic transfer will be missing from it, and the default
-/// arm calls anything unlisted [`Flow::Fallthrough`]. That error has a **direction**: a transfer
-/// read as a fall-through costs a walk one edge, so a reachable block can be missed, while nothing
-/// unlisted ever invents an edge that does not exist. Which is exactly the boundary a reachability
-/// walk over this already documents — "reachable" is sound and "not reachable" is best-effort
-/// within bounds — so a gap here degrades along the axis callers are already told about rather
-/// than opening a new one. Add to the table when a real target turns up an instruction it misses;
-/// do not treat its incompleteness as a soundness hole.
+/// arm calls anything unlisted [`Flow::Fallthrough`]. What that costs is **not** one thing, and
+/// saying so was wrong the first time this paragraph was written:
+///
+/// - A missing **conditional** transfer keeps its fall-through and loses its taken edge, so a
+///   reachable block can be missed. That is the direction a reachability walk already documents —
+///   "reachable" sound, "not reachable" best-effort within bounds.
+/// - A missing **unconditional** one is worse, because the fall-through it is given does not
+///   exist: instructions after it are reported reachable when nothing reaches them. That invents
+///   an edge, which is the direction the walk does *not* have slack in.
+///
+/// So the table is complete for the second kind — every unconditional transfer x86 has is listed —
+/// and best-effort for the first. Add to it when a real target turns up something it misses, and
+/// weigh a new entry by which of those two it would be.
 fn classify_flow(mnemonic: &str, operands: &[Operand]) -> Flow {
     let destination = || match operands.first() {
         Some(Operand::Target { address, .. }) => *address,
@@ -2845,6 +2862,14 @@ fn classify_flow(mnemonic: &str, operands: &[Operand]) -> Flow {
         // or a failure to start, and the abort path is commonly where the lock-based fallback
         // lives — so a walk that only falls through misses that whole implementation.
         "xbegin" => Flow::Branch(destination()),
+        // And `xabort` is a fall-through **on purpose**, though it reads like a transfer. Inside a
+        // transaction it resumes at the outer `xbegin`'s fallback and the next instruction is not
+        // reached — but the SDM makes it a NOP when `RTM_ACTIVE = 0`, so outside one it falls
+        // straight through, and no static reading can tell which it is. Classifying it as a
+        // transfer would drop every instruction after it on any target where RTM is inactive,
+        // which today is most of them. Listed rather than left to the default so the decision is
+        // visible.
+        "xabort" => Flow::Fallthrough,
         _ if is_conditional_branch(mnemonic) => Flow::Branch(destination()),
         _ => Flow::Fallthrough,
     }
@@ -6063,9 +6088,18 @@ impl DebugEngine {
     /// [`FunctionExtent::NoEntry`] is a fact rather than a failure — a leaf function has no entry,
     /// and neither has an address that is not code. It is reported for the **one** measured
     /// failure that means it, `E_NOINTERFACE` (`0x80004002`), which is what a real dbgeng 10.x
-    /// answers for address zero, for a module's header page and for every x86 address (32-bit
-    /// Windows has no unwind table at all — measured against `cppthrow-fastfail-x86.dmp`). Any
-    /// other failure is returned as one, so a broken engine is not read as a leaf.
+    /// answers for address zero and for a module's header page. Any other failure is returned as
+    /// one, so a broken engine is not read as a leaf.
+    ///
+    /// **x86 answers [`FunctionExtent::Unsupported`], not `NoEntry`**, and an earlier draft of
+    /// this paragraph promised the opposite — which the gate below has never done. Both readings
+    /// are defensible and only one can be true, so: 32-bit Windows has no unwind table, and every
+    /// x86 address measured here answers `E_NOINTERFACE` (`cppthrow-fastfail-x86.dmp`), so
+    /// implementing x86 would buy nothing. But that is a fact about a *platform*, and returning
+    /// `NoEntry` would assert it about an *address* this never asked about. x86's record is also a
+    /// different structure — `IMAGE_FUNCTION_ENTRY`, whose fields are addresses rather than the
+    /// RVAs rebased below — and nothing here has measured one. So the rule is the same rule
+    /// everywhere: decode the one layout that has been measured, and refuse the rest by name.
     ///
     /// [`FunctionExtent::Unsupported`] is every instruction set but x64, and it is not caution.
     /// ARM64's record is **two** words whose second is packed unwind data or an `.xdata` RVA, not
@@ -8623,6 +8657,59 @@ mod tests {
         let cmp = one("cmp     r13d,6D0030h");
         assert_eq!(cmp.operands.len(), 2, "{cmp:?}");
         assert_eq!(cmp.operands[1], Operand::Immediate(0x6d_0030));
+    }
+
+    /// A symbol that contains parentheses keeps its destination.
+    ///
+    /// `module!Functor::operator()` is the demangled name of a call operator, and splitting at the
+    /// *first* parenthesis takes it apart at `operator`, leaves `) (…` to parse as an address, and
+    /// reports `Call(None)` — a direct edge lost to a name, exactly as the comma case lost one.
+    /// The split is from the last parenthesis and only when what follows parses as an address,
+    /// which is also what keeps a symbol whose *last* parenthesis is its own intact.
+    #[test]
+    fn test_a_symbol_containing_parentheses_keeps_its_destination() {
+        let one = |text: &str| {
+            split_instruction(
+                0x1000,
+                &format!("00001000 90 {text}"),
+                InstructionSet::Amd64,
+            )
+        };
+
+        let call = one("call    module!Functor::operator() (00007ff6`12345678)");
+        assert_eq!(
+            call.flow,
+            Flow::Call(Some(0x00007ff6_12345678)),
+            "the direct edge was lost: {call:?}"
+        );
+        assert_eq!(
+            call.operands,
+            vec![Operand::Target {
+                symbol: Some("module!Functor::operator()".into()),
+                address: Some(0x00007ff6_12345678),
+            }]
+        );
+
+        // No address at all: the whole text is the name, parentheses and all.
+        let bare = one("call    module!Functor::operator()");
+        assert_eq!(
+            bare.operands,
+            vec![Operand::Target {
+                symbol: Some("module!Functor::operator()".into()),
+                address: None,
+            }]
+        );
+        assert_eq!(bare.flow, Flow::Call(None));
+
+        // And the ordinary shape still splits where it always did.
+        let plain = one("call    nt!KeBugCheckEx (fffff803`3e2547f0)");
+        assert_eq!(
+            plain.operands,
+            vec![Operand::Target {
+                symbol: Some("nt!KeBugCheckEx".into()),
+                address: Some(0xfffff803_3e2547f0),
+            }]
+        );
     }
 
     /// `xbegin` starts a transaction and takes its operand on an abort, so it has both edges.
