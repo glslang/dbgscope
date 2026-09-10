@@ -26,9 +26,17 @@ All notable changes to this project are documented here. The format follows
   `Operand` is `Register`, `Immediate`, `Memory`, `Target` or `Other`. `Flow` carries every
   destination as an `Option`, because a direct transfer encodes a displacement and an indirect one
   encodes a register, and a caller treating `None` as "no edge" stays sound. `Unknown` and
-  `Unreadable` are separate: an instruction set this does not decode still has an instruction
-  there, so it falls through, while a `???` rendering has none — a walk that fell through one would
-  step through *bytes*, one address at a time, to its own cap.
+  `Unreadable` are separate, and the line between them is whether there are bytes: a `???`
+  rendering has none and stops a walk, while an instruction set this does not decode — or an
+  encoding newer than the pinned decoder — has an instruction there and falls through. A walk that
+  fell through the first would step through *bytes*, one address at a time, to its own cap; one
+  that stopped at the second would discard the rest of a routine over a version skew.
+  A memory operand claims a static `address` only where the instruction alone determines one. A
+  segment override does not: `gs:[188h]` is the KPCR, its linear address is the segment base plus
+  the displacement, and that base is a runtime fact. A RIP-relative operand keeps the displacement
+  it **encodes** rather than the decoder's normalised target, which would otherwise report
+  `[rip+0xffa]` at `0x1000` as a displacement of `0x2000` — a second copy of `address` where the
+  addressing expression should be.
   Reading is gated on `InstructionSet`: x86 and x64 are decoded, and anything else — ARM64 today —
   reports its mnemonic, no operands and `Flow::Unknown`.
   Measured against a whole real dispatch routine rather than composed lines

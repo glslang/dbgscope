@@ -2571,7 +2571,12 @@ fn decode_operation(
         iced_x86::Decoder::with_ip(bitness, bytes, address, iced_x86::DecoderOptions::NONE);
     let decoded = decoder.decode();
     if decoded.is_invalid() {
-        return (String::new(), Vec::new(), Flow::Unreadable);
+        // Bytes that were read and did not decode. That is **not** [`Flow::Unreadable`], which
+        // means there is no instruction here: the engine rendered one, so there is, and this
+        // decoder simply does not know it — an extension newer than the version pinned, or a
+        // span entered mid-instruction. `Unknown` says exactly that, and falls through, where
+        // `Unreadable` would stop a walk and discard the rest of a routine over a version skew.
+        return (String::new(), Vec::new(), Flow::Unknown);
     }
 
     let mnemonic = format!("{:?}", decoded.mnemonic()).to_lowercase();
@@ -2609,26 +2614,40 @@ fn read_decoded_memory(decoded: &iced_x86::Instruction) -> MemoryOperand {
     let size = decoded.memory_size().size();
     let base = decoded.memory_base();
     let index = decoded.memory_index();
-    // Statically known only when nothing at run time contributes: an absolute displacement, or a
-    // RIP-relative reference, whose target the decoder has already computed against the
-    // instruction's own end.
-    let address = if base == iced_x86::Register::RIP || base == iced_x86::Register::EIP {
+    let rip_relative = base == iced_x86::Register::RIP || base == iced_x86::Register::EIP;
+    // A segment override means the linear address is the segment's base plus this, and that base
+    // is a runtime fact — `gs:[188h]` is the KPCR and emphatically not address `0x188`. So an
+    // override rules out a static address entirely, rather than being ignored because both the
+    // base and index registers happen to be absent.
+    let overridden = decoded.segment_prefix() != iced_x86::Register::None;
+    let address = if overridden {
+        None
+    } else if rip_relative {
         Some(decoded.ip_rel_memory_address())
     } else if base == iced_x86::Register::None && index == iced_x86::Register::None {
         Some(decoded.memory_displacement64())
     } else {
         None
     };
+    // For a RIP-relative operand the decoder's displacement is the **normalised target**, not the
+    // signed number the instruction encodes, so taking it verbatim would report `[rip+0xffa]` at
+    // `0x1000` as a displacement of `0x2000` — a duplicate of `address` where the addressing
+    // expression should be. Derived back against the instruction's own end, which is what the
+    // displacement is relative to.
+    let displacement = if rip_relative {
+        (decoded.ip_rel_memory_address() as i64).wrapping_sub(decoded.next_ip() as i64)
+    } else {
+        decoded.memory_displacement64() as i64
+    };
     MemoryOperand {
         size: (size != 0).then_some(size as u32),
         // The *prefix*, not the segment the encoding implies: `[rsp+8]` is `ss` by rule and prints
         // no override, and reporting one would say the instruction carried something it did not.
-        segment: (decoded.segment_prefix() != iced_x86::Register::None)
-            .then(|| register_name(decoded.segment_prefix())),
+        segment: overridden.then(|| register_name(decoded.segment_prefix())),
         base: (base != iced_x86::Register::None).then(|| register_name(base)),
         index: (index != iced_x86::Register::None).then(|| register_name(index)),
         scale: decoded.memory_index_scale() as u8,
-        displacement: decoded.memory_displacement64() as i64,
+        displacement,
         address,
     }
 }
@@ -5900,8 +5919,11 @@ impl DebugEngine {
                         .map(|index| read_decoded_operand(&decoded, index))
                         .collect()
                 },
+                // Bytes that were read and did not decode: `Unknown`, not `Unreadable`. A linear
+                // read runs into data and into the middle of instructions as a matter of course,
+                // and neither is "there is nothing here".
                 flow: if decoded.is_invalid() {
-                    Flow::Unreadable
+                    Flow::Unknown
                 } else {
                     decoded_flow(&decoded)
                 },
@@ -8533,6 +8555,86 @@ mod tests {
         let locked = split_instruction(0x1000, "00001000 f0ff00 x", InstructionSet::Amd64);
         assert_eq!(locked.mnemonic, "inc", "lock inc dword ptr [rax]");
         assert_eq!(locked.flow, Flow::Fallthrough);
+    }
+
+    /// Bytes that were read and did not decode are `Unknown`, never `Unreadable`.
+    ///
+    /// The two are separate facts and only one of them stops a walk. `Unreadable` means there is
+    /// no instruction here; if the engine rendered one and this decoder does not know it — an
+    /// extension newer than the pinned version, or a span entered mid-instruction — there *is* an
+    /// instruction and the walk should carry on. Getting that backwards discards the rest of a
+    /// routine over a version skew.
+    ///
+    /// `06` is the case with no version skew needed: `push es`, a perfectly good 32-bit
+    /// instruction and not an encoding at all in 64-bit mode.
+    #[test]
+    fn test_bytes_that_do_not_decode_are_unknown_rather_than_unreadable() {
+        let in_64 = split_instruction(0x1000, "00001000 06 x", InstructionSet::Amd64);
+        assert_eq!(in_64.flow, Flow::Unknown, "{in_64:?}");
+        assert!(
+            in_64.flow.falls_through(),
+            "a walk must not stop at an instruction this decoder does not know"
+        );
+
+        // And the same byte in the mode where it is an instruction.
+        let in_32 = split_instruction(0x1000, "00001000 06 x", InstructionSet::X86);
+        assert_eq!(in_32.mnemonic, "push");
+        assert_eq!(in_32.flow, Flow::Fallthrough);
+    }
+
+    /// A segment override rules out a static address, and a RIP-relative operand keeps the
+    /// displacement it encodes rather than a copy of its target.
+    ///
+    /// `gs:[188h]` is the KPCR and emphatically not address `0x188`: the linear address is the
+    /// segment base plus that, and the base is a runtime fact. Reporting one would invite a
+    /// consumer to read or symbolise a low address that means nothing.
+    ///
+    /// The RIP case is the mirror image. The decoder normalises a RIP-relative displacement to its
+    /// target, so taking it verbatim reports `[rip+0xffa]` at `0x1000` as `0x2000` — a duplicate
+    /// of `address`, where the addressing expression should be.
+    #[test]
+    fn test_a_static_address_is_only_claimed_where_one_exists() {
+        let one = |encoding: &str| {
+            let decoded = split_instruction(
+                0x1000,
+                &format!("00001000 {encoding} x"),
+                InstructionSet::Amd64,
+            );
+            decoded
+                .operands
+                .iter()
+                .find_map(|operand| match operand {
+                    Operand::Memory(memory) => Some(memory.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no memory operand in {decoded:?}"))
+        };
+
+        // `65 48 8b 04 25 88 01 00 00` — mov rax,qword ptr gs:[188h].
+        let kpcr = one("65488b042588010000");
+        assert_eq!(kpcr.segment.as_deref(), Some("gs"));
+        assert_eq!(kpcr.displacement, 0x188);
+        assert_eq!(
+            kpcr.address, None,
+            "a segment override has no address the instruction alone knows: {kpcr:?}"
+        );
+
+        // `ff 15 fa 0f 00 00` — call qword ptr [rip+0xffa], six bytes, so the next IP is 0x1006
+        // and the target is 0x2000.
+        let thunk = one("ff15fa0f0000");
+        assert_eq!(thunk.base.as_deref(), Some("rip"));
+        assert_eq!(thunk.address, Some(0x2000), "{thunk:?}");
+        assert_eq!(
+            thunk.displacement, 0xffa,
+            "the encoded displacement, not a second copy of the target: {thunk:?}"
+        );
+
+        // An absolute reference with no override still has one.
+        // `48 8b 04 25 00 20 00 00` — mov rax,qword ptr [2000h].
+        let absolute = one("488b042500200000");
+        assert_eq!(absolute.address, Some(0x2000));
+        assert_eq!(absolute.displacement, 0x2000);
+        assert_eq!(absolute.segment, None);
     }
 
     /// `hlt` is not an ending, though it is grouped with one in every mnemonic list.
