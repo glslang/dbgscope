@@ -51,6 +51,12 @@ All notable changes to this project are documented here. The format follows
   4 GB boundary, where inheriting would drag a correct target back four gigabytes. An **absolute**
   memory address is canonicalised the same way and for the same reason, absolute globals and
   import slots being ordinary in x86 kernel code.
+  Inherited rather than sign-extended, and that is measured rather than preferred: against a
+  32-bit target, `? 80002000` evaluates to `80002000` and `.formats` prints `Hex: 80002000` —
+  eight digits, unextended — so sign-extending would invent `ffffffff80002000` for an address the
+  engine calls `80002000`, and on a 32-bit kernel would do so for nearly every address. The cost
+  is one straddling case, a low instruction reaching a high absolute, which keeps the low half and
+  is pinned by a test naming the measurement.
   A displacement's signed width is the **effective address width**, and neither of the two simpler
   readings of that survives: the *index register's* width breaks a VSIB gather, whose index is an
   `xmm`/`ymm`/`zmm`, so the extension becomes a no-op and a negative displacement comes back as

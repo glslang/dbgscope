@@ -2781,9 +2781,24 @@ fn near_target(decoded: &iced_x86::Instruction) -> Option<u64> {
 ///
 /// **64-bit decoding is left alone**, and not merely because it needs no help: a `rel32` branch
 /// reaches ±2 GB, so it can legitimately cross a 4 GB boundary, and inheriting a high half there
-/// would drag a correct target backwards by four gigabytes. The one case this does not get right
-/// is the mirror of that — a 32-bit branch wrapping across its own sign boundary keeps the high
-/// half it started in.
+/// would drag a correct target backwards by four gigabytes.
+///
+/// # Inherited rather than sign-extended, and that is measured
+///
+/// The alternative is to sign-extend a 32-bit value, on the theory that the engine hands out high
+/// x86 addresses in sign-extended form; it has been proposed twice. **It does not.** Measured on
+/// this build against a 32-bit user target (`cppthrow-fastfail-x86.dmp`), `? 80002000` evaluates
+/// to `80002000` and `.formats` prints `Hex: 80002000` — eight digits, unextended. Sign-extending
+/// would therefore invent `ffffffff80002000` for an address the engine calls `80002000`, and on a
+/// 32-bit kernel, where most code lives above bit 31, it would do so for nearly every address.
+/// Inheriting the instruction's own half reproduces exactly what was measured, because a genuine
+/// 32-bit target's instructions have a zero high half.
+///
+/// What that leaves un-handled is one straddling case: a 32-bit instruction on one side of bit 31
+/// reaching a target on the other keeps the half it started in. It is pinned by test rather than
+/// left to be rediscovered, and it is the *narrower* of the two exposures — the sign-extending
+/// rule would be wrong for every high address rather than for the ones that straddle. Reopen this
+/// only with a measurement from a 32-bit **kernel** target, which no fixture here has.
 fn canonical_target(decoded: &iced_x86::Instruction) -> u64 {
     canonical_address(decoded, decoded.near_branch_target())
 }
@@ -8889,6 +8904,39 @@ mod tests {
             Flow::Call(Some(0xfffff806_00000ff0)),
             "a 64-bit branch across a 4 GB boundary was dragged back: {crossing:?}"
         );
+    }
+
+    /// A 32-bit address keeps the half its instruction is in, and is **not** sign-extended.
+    ///
+    /// Sign-extending has been proposed twice, on the theory that the engine hands out high x86
+    /// addresses in sign-extended form. Measured on this build against a 32-bit user target
+    /// (`cppthrow-fastfail-x86.dmp`): `? 80002000` evaluates to `80002000` and `.formats` prints
+    /// `Hex: 80002000` — eight digits, unextended. So sign-extending would invent
+    /// `ffffffff80002000` for an address the engine calls `80002000`, and on a 32-bit kernel,
+    /// where most code is above bit 31, it would do so for nearly every address.
+    ///
+    /// The cost of inheriting instead is one straddling case, asserted here so the choice is
+    /// pinned rather than merely written down: a low instruction reaching a high absolute keeps
+    /// the low half. That is the narrower exposure of the two, and the doc on `canonical_target`
+    /// says what would reopen it.
+    #[test]
+    fn test_a_32_bit_address_is_not_sign_extended() {
+        // `a1 00 20 00 80` — mov eax,dword ptr [80002000h], from a *low* instruction address.
+        let straddling =
+            split_instruction(0x00401000, "00401000 a100200080 x", InstructionSet::X86);
+        let Some(Operand::Memory(global)) = straddling.operands.get(1) else {
+            panic!("no absolute operand in {straddling:?}");
+        };
+        assert_eq!(
+            global.address,
+            Some(0x0000_0000_8000_2000),
+            "a 32-bit address was sign-extended into a space the engine does not use: {global:?}"
+        );
+
+        // And a genuine 32-bit target's addresses are all in the low half anyway, which is why
+        // inheriting reproduces the measurement exactly.
+        let ordinary = split_instruction(0x00401000, "00401000 e8fb0f0000 x", InstructionSet::X86);
+        assert_eq!(ordinary.flow, Flow::Call(Some(0x00402000)));
     }
 
     /// `hlt` is not an ending, though it is grouped with one in every mnemonic list.
