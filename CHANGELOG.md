@@ -29,6 +29,18 @@ All notable changes to this project are documented here. The format follows
   A software interrupt is classified by its **vector**, not by its mnemonic: `int 29h`
   (`__fastfail`) and `int 3` stop a walk, and every other one falls through — notably `int 2eh`,
   the 32-bit system-call path, where stopping would discard every instruction after a syscall.
+  An operand's width is the one its name means, and `mmword` is the trap: it is an MMX operand at
+  eight bytes, beside the `xmmword` that is sixteen, so folding the two doubles the width reported
+  for every MMX access while the rendering looks perfectly ordinary.
+- `DebugEngine::effective_processor_type` reports the processor the engine is **rendering** in, as
+  against the physical one `processor_type` already answered. The two diverge wherever one machine
+  runs another's code — a WOW64 process, x64 emulated on ARM64, any target after `.effmach` — and
+  it is the effective one that discriminates a *rendering*, so `instruction_set` reads it. Measured
+  by forcing the divergence: `.effmach x86` on an x64 kernel dump moves the effective type to
+  `0x14c` while the physical stays `0x8664`, and the reading follows it rather than decoding an x64
+  unwind record against x86 output. Anything reading the target's **structures** still wants the
+  physical type, a pointer's width being a fact about the machine rather than about a rendering,
+  so the pool and heap walkers are unchanged.
 - `DebugEngine::function_extent` returns the unwind **region** containing an address, from the
   image's `.pdata`, rebased. A region is **not** a function, and using it as one loses code: MSVC
   splits a function across several entries, and this answers `0x14750..0x147a3` for

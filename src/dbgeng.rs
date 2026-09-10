@@ -2556,15 +2556,20 @@ fn split_operands(rest: &str) -> Vec<&str> {
 }
 
 /// The `qword ptr` family, as a width in bytes.
+///
+/// `mmword` is an **MMX** operand and is eight bytes, not sixteen: it is the `xmmword` beside it
+/// that is 128 bits, and folding the two together doubles the width reported for every MMX access.
+/// `fword` is the 48-bit far pointer and `tbyte` the 80-bit float, neither of which is a power of
+/// two.
 fn operand_size(word: &str) -> Option<u32> {
     Some(match word {
         "byte" => 1,
         "word" => 2,
         "dword" => 4,
         "fword" => 6,
-        "qword" => 8,
+        "qword" | "mmword" => 8,
         "tbyte" => 10,
-        "mmword" | "xmmword" => 16,
+        "xmmword" => 16,
         "ymmword" => 32,
         "zmmword" => 64,
         _ => return None,
@@ -3664,6 +3669,21 @@ impl DebugEngine {
     pub fn processor_type(&self) -> Result<u32, DbgEngError> {
         unsafe { self.control.GetActualProcessorType() }.map_err(|source| DbgEngError::Context {
             operation: "querying target processor type".into(),
+            source,
+        })
+    }
+
+    /// The processor type the engine is currently **rendering** in, which is not always the one
+    /// the machine has.
+    ///
+    /// `.effmach` sets it, and it diverges from [`Self::processor_type`] wherever one machine runs
+    /// another's code: a WOW64 process on x64, x64 emulated on ARM64. Anything reading the
+    /// engine's *output* — a disassembly listing, a register file — is discriminated by this one,
+    /// while anything reading the target's *structures* wants the physical type, because a
+    /// pointer's width is a fact about the machine rather than about a rendering.
+    pub fn effective_processor_type(&self) -> Result<u32, DbgEngError> {
+        unsafe { self.control.GetEffectiveProcessorType() }.map_err(|source| DbgEngError::Context {
+            operation: "querying effective processor type".into(),
             source,
         })
     }
@@ -5957,11 +5977,18 @@ impl DebugEngine {
 
     /// The instruction set the target's disassembly is rendered in.
     ///
-    /// Falls back to [`InstructionSet::Other`] when the engine will not say, which reads
-    /// operands out of nothing rather than reading them wrongly — a target that cannot name its
-    /// processor is not one to guess x86 for.
+    /// The **effective** processor type and not the physical one, because that is what
+    /// `Disassemble` renders with: the two diverge wherever one machine runs another's code — a
+    /// WOW64 process on x64, x64 emulated on ARM64, or any target after `.effmach` — and
+    /// discriminating a rendering by the machine underneath it reads x86 output with x64 rules,
+    /// or refuses operands the engine did render. It also picks the unwind-entry layout in
+    /// [`Self::function_extent`], where the same divergence chooses the wrong record shape.
+    ///
+    /// Falls back to [`InstructionSet::Other`] when the engine will not say, which reads operands
+    /// out of nothing rather than reading them wrongly — a target that cannot name its processor
+    /// is not one to guess x86 for.
     pub fn instruction_set(&self) -> InstructionSet {
-        match self.processor_type() {
+        match self.effective_processor_type() {
             Ok(machine) => InstructionSet::from_processor_type(machine),
             Err(_) => InstructionSet::Other(0),
         }
@@ -8505,6 +8532,42 @@ mod tests {
         // Sound in the one direction that matters: an unresolved destination is `None`, never a
         // borrowed address from somewhere else on the line.
         assert_eq!(one("jmp     qword ptr [rax*8+1234h]").target(), None);
+    }
+
+    /// The `ptr` widths, each asserted against the width its name means rather than against the
+    /// table that produced it.
+    ///
+    /// `mmword` is the one worth a test of its own: it sits beside `xmmword` in every listing and
+    /// is **half** its width, so folding the two together doubles the reported width of every MMX
+    /// access and nothing about the rendering looks wrong. The two non-powers of two are here for
+    /// the same reason, being the ones a reader is most likely to round.
+    #[test]
+    fn test_an_operand_width_is_the_one_its_name_means() {
+        let width = |text: &str| {
+            let one = split_instruction(
+                0x1000,
+                &format!("00001000 90 mov {text} [rax],rbx"),
+                InstructionSet::Amd64,
+            );
+            match one.operands.first() {
+                Some(Operand::Memory(memory)) => memory.size,
+                other => panic!("{text} was not read as a memory operand: {other:?}"),
+            }
+        };
+
+        assert_eq!(width("byte ptr"), Some(1));
+        assert_eq!(width("word ptr"), Some(2));
+        assert_eq!(width("dword ptr"), Some(4));
+        assert_eq!(width("fword ptr"), Some(6), "a far pointer is 48 bits");
+        assert_eq!(width("qword ptr"), Some(8));
+        assert_eq!(width("mmword ptr"), Some(8), "an MMX operand is 64 bits");
+        assert_eq!(width("tbyte ptr"), Some(10), "an 80-bit float");
+        assert_eq!(width("xmmword ptr"), Some(16));
+        assert_eq!(width("ymmword ptr"), Some(32));
+        assert_eq!(width("zmmword ptr"), Some(64));
+
+        // No `ptr` prefix at all is no width, rather than a guessed one.
+        assert_eq!(width(""), None);
     }
 
     /// A software interrupt is classified by its vector, because most of them return.
