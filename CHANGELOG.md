@@ -41,6 +41,14 @@ All notable changes to this project are documented here. The format follows
   `0xfffffff8` and a straight widening cast reported the commonest local-variable reference there
   is as 4,294,967,288. An absolute reference with no register stays unsigned, a 32-bit
   `[0xfffff000]` being a high address rather than a negative offset.
+  A near branch's destination lands in the address space its instruction came from. Decoding 32-bit
+  code computes a 32-bit target, so an instruction whose own address carries a high half — a narrow
+  effective machine over a wide address, which `.effmach x86` produces — would otherwise name a
+  destination in a different address space from itself, which a module-bounds check rejects and a
+  reader follows to the wrong place. The high half is inherited from the instruction rather than
+  sign-extended, taking the address form from the caller's own value instead of assuming the
+  engine's. 64-bit decoding is left alone deliberately: a `rel32` reaches ±2 GB and so may cross a
+  4 GB boundary, where inheriting would drag a correct target back four gigabytes.
   Reading is gated on `InstructionSet`: x86 and x64 are decoded, and anything else — ARM64 today —
   reports its mnemonic, no operands and `Flow::Unknown`.
   Measured against a whole real dispatch routine rather than composed lines
