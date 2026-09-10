@@ -8,44 +8,38 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- **Disassembly carries its operands as values.** `Instruction` gains `mnemonic`, `operands` and
-  `flow` beside the `text` it already had, so a caller asking what an instruction *compares
-  against* or *branches to* reads a field instead of re-parsing a rendering downstream. `Operand`
-  is `Register`, `Immediate`, `Memory`, `Target` or `Other`, and `Other` is the whole safety
-  story — an operand this does not recognise keeps its text rather than being forced into a shape.
-  `Flow` carries every destination as an `Option`, because a resolvable target and an indirect one
-  are different facts, and a caller treating `None` as "no edge" stays sound.
-  Reading is gated on `InstructionSet`: x86 and x64 are read, and anything else — ARM64 today —
-  reports its mnemonic, no operands and `Flow::Unknown`. That is a refusal rather than a guess,
-  and the flow is `Unknown` rather than the `Fallthrough` most instructions happen to be, because
-  an unread `b.eq` reported as falling through hands a walk one edge of two.
+- **Disassembly carries its operands as values, decoded from the encoding.** `Instruction` gains
+  `mnemonic`, `operands` and `flow` beside the `text` it already had, so a caller asking what an
+  instruction *compares against* or *branches to* reads a field instead of re-parsing a rendering
+  downstream. They come from decoding `bytes` — the engine's own read of the instruction, so no
+  extra round trip — with `iced-x86`, and the rendering stays verbatim in `text` because it is what
+  a listing prints.
+  **Decoding, rather than reading the rendering, is the whole design and was arrived at the hard
+  way.** The first implementation parsed the third column, and a symbol's own punctuation kept
+  taking operands apart: a comma inside `std::map<int,int>`, a parenthesis inside `operator()`, a
+  bracket inside `operator[]` — three review rounds, three characters, each severing a direct call
+  edge that a walk then dropped as indirect. The mnemonic table had the same shape, growing an
+  entry a round for `int` by vector, `xbegin`, `xabort` and `hlt`, because a hand-written list of
+  what transfers control is never finished. An encoding has neither ambiguity, and a decoder's
+  flow control is complete by construction. Symbols leave the picture entirely: a destination is an
+  address, and naming it is `symbol_for`'s job.
+  `Operand` is `Register`, `Immediate`, `Memory`, `Target` or `Other`. `Flow` carries every
+  destination as an `Option`, because a direct transfer encodes a displacement and an indirect one
+  encodes a register, and a caller treating `None` as "no edge" stays sound. `Unknown` and
+  `Unreadable` are separate: an instruction set this does not decode still has an instruction
+  there, so it falls through, while a `???` rendering has none — a walk that fell through one would
+  step through *bytes*, one address at a time, to its own cap.
+  Reading is gated on `InstructionSet`: x86 and x64 are decoded, and anything else — ARM64 today —
+  reports its mnemonic, no operands and `Flow::Unknown`.
   Measured against a whole real dispatch routine rather than composed lines
   (`examples/typed_disassembly.rs`): 376 instructions of `mountmgr!MountMgrDeviceControl` on a
-  26100 image read with **zero** unrecognised operands and zero unknown flows, and its eleven
-  control-code compares came back as values. Two defects that measurement found, both now pinned:
-  literals are `u64` rather than `i64`, since the routine renders `8000000000000000h` and
-  `0FFFFFFFFFFFFFFFFh`; and registers are matched before literals, since `ah`, `bh`, `ch` and `dh`
-  are both.
-  A software interrupt is classified by its **vector**, not by its mnemonic: `int 29h`
-  (`__fastfail`) and `int 3` stop a walk, and every other one falls through — notably `int 2eh`,
-  the 32-bit system-call path, where stopping would discard every instruction after a syscall.
-  An operand's width is the one its name means, and `mmword` is the trap: it is an MMX operand at
-  eight bytes, beside the `xmmword` that is sixteen, so folding the two doubles the width reported
-  for every MMX access while the rendering looks perfectly ordinary.
-  A control transfer's operand text is **not** split on commas, because it takes exactly one
-  operand and a demangled C++ name carries commas of its own: split,
-  `call module!std::map<int,int>::insert (…)` loses its parenthesised address and reports
-  `Call(None)`, which a walk reads as an indirect call and drops. Angle-bracket depth is
-  deliberately not tracked instead — `operator<<` and `operator<` leave it unbalanced, and an
-  unbalanced opener swallows a following operand, which on a `cmp` would take the control code
-  with it. A symbol's own **parentheses** cost the same edge the same way, so a destination is
-  split from the *last* parenthesis and only when what follows it parses as an address:
-  `call module!Functor::operator() (…)` keeps both halves, and a name whose last parenthesis is
-  its own stays whole. `xbegin` is a conditional branch: it falls through into the transaction and
-  takes its operand on an abort, where the lock-based fallback usually lives. `xabort` is listed
-  as a fall-through on purpose — inside a transaction it resumes at the fallback, but the SDM
-  makes it a NOP when `RTM_ACTIVE = 0`, and no static reading can tell which, so classifying it as
-  a transfer would drop everything after it wherever RTM is inactive.
+  26100 image, **zero** unrecognised operands, zero unknown flows, and its eleven control-code
+  compares recovered as values — identical before and after the decoder replaced the parser.
+- `DebugEngine::decode_range` decodes a span from **one** memory read instead of one engine call
+  per instruction, which is what a bounded traversal over a hundred functions needs. Its
+  instructions carry no `text`, nothing having rendered them; a caller needing a rendering for the
+  few it displays asks `disassemble` for those. The two paths are compared against each other in
+  the example over a real function's first region: 23 instructions, 23 compared, 0 disagreements.
 - `DebugEngine::effective_processor_type` reports the processor the engine is **rendering** in, as
   against the physical one `processor_type` already answered. The two diverge wherever one machine
   runs another's code — a WOW64 process, x64 emulated on ARM64, any target after `.effmach` — and
