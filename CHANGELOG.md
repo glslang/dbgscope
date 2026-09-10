@@ -26,6 +26,9 @@ All notable changes to this project are documented here. The format follows
   literals are `u64` rather than `i64`, since the routine renders `8000000000000000h` and
   `0FFFFFFFFFFFFFFFFh`; and registers are matched before literals, since `ah`, `bh`, `ch` and `dh`
   are both.
+  A software interrupt is classified by its **vector**, not by its mnemonic: `int 29h`
+  (`__fastfail`) and `int 3` stop a walk, and every other one falls through — notably `int 2eh`,
+  the 32-bit system-call path, where stopping would discard every instruction after a syscall.
 - `DebugEngine::function_extent` returns the unwind **region** containing an address, from the
   image's `.pdata`, rebased. A region is **not** a function, and using it as one loses code: MSVC
   splits a function across several entries, and this answers `0x14750..0x147a3` for
@@ -34,6 +37,16 @@ All notable changes to this project are documented here. The format follows
   following the flow recovered twelve. The x64 entry is three `u32` RVAs and not the 64-bit
   addresses the API's name suggests; reading them as `u64` reports "no entry" for a function that
   plainly has one.
+  It answers a three-state `FunctionExtent` rather than an `Option`, because the two non-answers
+  are different facts. `NoEntry` is reported for the one measured failure that means it —
+  `E_NOINTERFACE`, which a real dbgeng 10.x gives for address zero, for a header page, and for
+  every x86 address, 32-bit Windows having no unwind table — and any other failure is returned as
+  an error rather than read as a leaf. `Unsupported` covers every instruction set but x64:
+  ARM64's record is two words whose second is packed unwind data, measured as `needed = 8` with
+  `[0x0025df60, 0x0005f218]` for `nt!KeBugCheckEx` on an ARM64 kernel dump, and read as an end
+  address that is a bogus region which — for any function below the `.xdata` RVA — contains the
+  address asked about and passes every sanity check. The engine's own `needed` is checked against
+  the x64 shape rather than assumed.
 - `DebugEngine::symbol_for` is the public half of the existing symbol lookup: the `module!Symbol`
   an address resolves to and how far past it, or `None` for a driver with no PDB.
 - **Exception events are readable as values.** `DebugEngine::last_event` returns a `DebugEvent` —
