@@ -2623,12 +2623,16 @@ fn read_decoded_memory(decoded: &iced_x86::Instruction) -> MemoryOperand {
     // override rules out a static address entirely, rather than being ignored because both the
     // base and index registers happen to be absent.
     let overridden = decoded.segment_prefix() != iced_x86::Register::None;
+    // Canonicalised for the same reason a branch target is: 32-bit decoding computes a 32-bit
+    // value, and an absolute `[0x80002000]` under an instruction living at `ffffffff`80001000` is
+    // an address in a different space from the instruction that reads it. Absolute globals and
+    // import slots are ordinary in x86 kernel code, so this is the field a consumer would follow.
     let address = if overridden {
         None
     } else if rip_relative {
-        Some(decoded.ip_rel_memory_address())
+        Some(canonical_address(decoded, decoded.ip_rel_memory_address()))
     } else if base == iced_x86::Register::None && index == iced_x86::Register::None {
-        Some(decoded.memory_displacement64())
+        Some(canonical_address(decoded, decoded.memory_displacement64()))
     } else {
         None
     };
@@ -2638,21 +2642,26 @@ fn read_decoded_memory(decoded: &iced_x86::Instruction) -> MemoryOperand {
     // expression should be. Derived back against the instruction's own end, which is what the
     // displacement is relative to.
     // And a narrow effective address keeps its own width in the decoder, so `[ebp-8]` comes back
-    // as `0xfffffff8` and a straight widening cast reports it as 4,294,967,288. The width to
-    // sign-extend from is the *address registers'*, that being what the addressing form is
-    // computed in; an absolute reference with no register is left unsigned, because a 32-bit
-    // `[0xfffff000]` is a high address rather than a negative offset.
-    let address_bits = if base != iced_x86::Register::None {
-        base.size() * 8
-    } else if index != iced_x86::Register::None {
-        index.size() * 8
-    } else {
-        64
-    };
+    // as `0xfffffff8` and a straight widening cast reports it as 4,294,967,288.
+    //
+    // The width to sign-extend from is the **displacement field's own**, not the address
+    // registers'. Those were the first answer and are wrong for a VSIB gather, whose index is an
+    // `xmm`/`ymm`/`zmm`: `index.size() * 8` is then 128 or more, the extension becomes a no-op,
+    // and a negative displacement comes back positive. The encoded field is the right width by
+    // construction — a `disp8` of `0xf8` is `-8` whatever computes the address — and it sidesteps
+    // the address-size override too.
+    //
+    // An absolute reference with no register stays unsigned, because a 32-bit `[0xfffff000]` is a
+    // high address rather than a negative offset.
     let displacement = if rip_relative {
         (decoded.ip_rel_memory_address() as i64).wrapping_sub(decoded.next_ip() as i64)
+    } else if base == iced_x86::Register::None && index == iced_x86::Register::None {
+        decoded.memory_displacement64() as i64
     } else {
-        sign_extend(decoded.memory_displacement64(), address_bits)
+        sign_extend(
+            decoded.memory_displacement64(),
+            decoded.memory_displ_size() as usize * 8,
+        )
     };
     MemoryOperand {
         size: (size != 0).then_some(size as u32),
@@ -2751,11 +2760,17 @@ fn near_target(decoded: &iced_x86::Instruction) -> Option<u64> {
 /// is the mirror of that — a 32-bit branch wrapping across its own sign boundary keeps the high
 /// half it started in.
 fn canonical_target(decoded: &iced_x86::Instruction) -> u64 {
-    let target = decoded.near_branch_target();
+    canonical_address(decoded, decoded.near_branch_target())
+}
+
+/// A decoded address, put back into the address space its instruction came from.
+///
+/// See [`canonical_target`] for why, and for why 64-bit is left alone.
+fn canonical_address(decoded: &iced_x86::Instruction, value: u64) -> u64 {
     if decoded.code_size() == iced_x86::CodeSize::Code64 {
-        return target;
+        return value;
     }
-    (decoded.ip() & 0xffff_ffff_0000_0000) | (target & 0xffff_ffff)
+    (decoded.ip() & 0xffff_ffff_0000_0000) | (value & 0xffff_ffff)
 }
 
 /// Runs of whitespace as one space. The engine pads its columns to align them in a listing, and
@@ -8681,6 +8696,24 @@ mod tests {
         assert_eq!(absolute.address, Some(0x2000));
         assert_eq!(absolute.displacement, 0x2000);
         assert_eq!(absolute.segment, None);
+
+        // And an absolute address is canonicalised into its instruction's space exactly as a
+        // branch target is. Absolute globals and import slots are ordinary in x86 kernel code,
+        // so this is the field a consumer follows.
+        // `a1 00 20 00 80` — mov eax,dword ptr [80002000h], in 32-bit code at a high address.
+        let high = split_instruction(
+            0xffffffff_80001000,
+            "ffffffff`80001000 a100200080 x",
+            InstructionSet::X86,
+        );
+        let Some(Operand::Memory(global)) = high.operands.get(1) else {
+            panic!("no absolute operand in {high:?}");
+        };
+        assert_eq!(
+            global.address,
+            Some(0xffffffff_80002000),
+            "the high half was dropped: {global:?}"
+        );
     }
 
     /// A negative displacement is negative, whatever the address width.
@@ -8716,6 +8749,29 @@ mod tests {
         // And a positive one is unchanged in both.
         assert_eq!(memory("8b4508", InstructionSet::X86).displacement, 8);
         assert_eq!(memory("488b4508", InstructionSet::Amd64).displacement, 8);
+
+        // A scaled index does not change the reading either.
+        // `8b 44 88 f8` — mov eax,dword ptr [eax+ecx*4-8].
+        let scaled = memory("8b4488f8", InstructionSet::X86);
+        assert_eq!(scaled.index.as_deref(), Some("ecx"));
+        assert_eq!(scaled.scale, 4);
+        assert_eq!(scaled.displacement, -8, "{scaled:?}");
+
+        // The width comes from the **displacement field**, not from the address registers, and a
+        // VSIB gather is where that matters: its index is a vector register, so a width taken
+        // from the index would be 128 bits or more, the sign extension would be a no-op, and a
+        // negative displacement would come back as four billion.
+        // `c4 e2 79 92 0c 95 f8 ff ff ff` — vgatherdps xmm1,dword ptr [xmm2*4-8],xmm0.
+        let gather = memory("c4e279920c95f8ffffff", InstructionSet::X86);
+        assert!(
+            gather
+                .index
+                .as_deref()
+                .is_some_and(|r| r.starts_with("xmm")),
+            "not the VSIB form this is about: {gather:?}"
+        );
+        assert_eq!(gather.base, None);
+        assert_eq!(gather.displacement, -8, "{gather:?}");
     }
 
     /// A 32-bit branch target lands in the address space its instruction was given.

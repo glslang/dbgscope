@@ -48,7 +48,14 @@ All notable changes to this project are documented here. The format follows
   reader follows to the wrong place. The high half is inherited from the instruction rather than
   sign-extended, taking the address form from the caller's own value instead of assuming the
   engine's. 64-bit decoding is left alone deliberately: a `rel32` reaches ±2 GB and so may cross a
-  4 GB boundary, where inheriting would drag a correct target back four gigabytes.
+  4 GB boundary, where inheriting would drag a correct target back four gigabytes. An **absolute**
+  memory address is canonicalised the same way and for the same reason, absolute globals and
+  import slots being ordinary in x86 kernel code.
+  A displacement's signed width comes from the **displacement field itself**, not from the address
+  registers. Those were the first answer and are wrong for a VSIB gather, whose index is an
+  `xmm`/`ymm`/`zmm`: a width taken from the index is 128 bits or more, the sign extension becomes
+  a no-op, and a negative displacement comes back as four billion. The encoded field is the right
+  width by construction, and it sidesteps the address-size override as well.
   Reading is gated on `InstructionSet`: x86 and x64 are decoded, and anything else — ARM64 today —
   reports its mnemonic, no operands and `Flow::Unknown`.
   Measured against a whole real dispatch routine rather than composed lines
