@@ -32,6 +32,14 @@ All notable changes to this project are documented here. The format follows
   An operand's width is the one its name means, and `mmword` is the trap: it is an MMX operand at
   eight bytes, beside the `xmmword` that is sixteen, so folding the two doubles the width reported
   for every MMX access while the rendering looks perfectly ordinary.
+  A control transfer's operand text is **not** split on commas, because it takes exactly one
+  operand and a demangled C++ name carries commas of its own: split,
+  `call module!std::map<int,int>::insert (…)` loses its parenthesised address and reports
+  `Call(None)`, which a walk reads as an indirect call and drops. Angle-bracket depth is
+  deliberately not tracked instead — `operator<<` and `operator<` leave it unbalanced, and an
+  unbalanced opener swallows a following operand, which on a `cmp` would take the control code
+  with it. `xbegin` is a conditional branch: it falls through into the transaction and takes its
+  operand on an abort, where the lock-based fallback usually lives.
 - `DebugEngine::effective_processor_type` reports the processor the engine is **rendering** in, as
   against the physical one `processor_type` already answered. The two diverge wherever one machine
   runs another's code — a WOW64 process, x64 emulated on ARM64, any target after `.effmach` — and

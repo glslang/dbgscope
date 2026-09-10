@@ -2524,12 +2524,37 @@ fn read_operation(text: &str, set: InstructionSet) -> (String, Vec<Operand>, Flo
     if mnemonic.starts_with('?') {
         return (mnemonic, Vec::new(), Flow::Unknown);
     }
-    let operands: Vec<Operand> = split_operands(&rest)
-        .into_iter()
-        .map(|operand| read_operand(operand.trim()))
-        .collect();
+    // A control transfer takes exactly one operand, so its text is not split at all. That is what
+    // keeps a comma *inside* a decorated symbol from severing a destination:
+    // `call module!std::map<int,int>::insert (00007ff6`12345678)` has a top-level comma, and split
+    // on it the first fragment carries no parenthesised address — so the direct edge disappears
+    // and `classify_flow` reports `Call(None)`, which a reachability walk reads as indirect.
+    //
+    // Angle-bracket depth is deliberately **not** tracked instead. `operator<<` and `operator<`
+    // leave it unbalanced, and an unbalanced opener swallows every later operand into one — which
+    // on a `cmp` would take the immediate with it, losing exactly the control codes this reading
+    // exists to recover. Not splitting where there is nothing to split needs no such judgement.
+    let operands: Vec<Operand> = if rest.is_empty() {
+        Vec::new()
+    } else if takes_one_destination(&mnemonic) {
+        vec![read_operand(rest.trim())]
+    } else {
+        split_operands(&rest)
+            .into_iter()
+            .map(|operand| read_operand(operand.trim()))
+            .collect()
+    };
     let flow = classify_flow(&mnemonic, &operands);
     (mnemonic, operands, flow)
+}
+
+/// Whether this mnemonic's whole operand text is one destination.
+///
+/// Every x86 control transfer takes a single operand — a far jump renders its segment with a
+/// colon rather than a comma — so there is never a comma here that separates two operands.
+fn takes_one_destination(mnemonic: &str) -> bool {
+    matches!(mnemonic, "call" | "callf" | "jmp" | "jmpf" | "xbegin")
+        || is_conditional_branch(mnemonic)
 }
 
 /// Splits an operand list on the commas that separate operands — the ones outside brackets and
@@ -2783,6 +2808,17 @@ fn is_register(token: &str) -> bool {
 
 /// The control flow an x86 mnemonic implies, with its destination taken from the operand that
 /// was already read rather than from the line.
+///
+/// # What a missing entry costs, which is why the table need not be complete
+///
+/// This is a hand-maintained list, so an exotic transfer will be missing from it, and the default
+/// arm calls anything unlisted [`Flow::Fallthrough`]. That error has a **direction**: a transfer
+/// read as a fall-through costs a walk one edge, so a reachable block can be missed, while nothing
+/// unlisted ever invents an edge that does not exist. Which is exactly the boundary a reachability
+/// walk over this already documents — "reachable" is sound and "not reachable" is best-effort
+/// within bounds — so a gap here degrades along the axis callers are already told about rather
+/// than opening a new one. Add to the table when a real target turns up an instruction it misses;
+/// do not treat its incompleteness as a soundness hole.
 fn classify_flow(mnemonic: &str, operands: &[Operand]) -> Flow {
     let destination = || match operands.first() {
         Some(Operand::Target { address, .. }) => *address,
@@ -2805,6 +2841,10 @@ fn classify_flow(mnemonic: &str, operands: &[Operand]) -> Flow {
             Some(Operand::Immediate(0x29 | 0x3)) => Flow::Trap,
             _ => Flow::Fallthrough,
         },
+        // TSX. `xbegin` takes the transaction on its fall-through and its own operand on an abort
+        // or a failure to start, and the abort path is commonly where the lock-based fallback
+        // lives — so a walk that only falls through misses that whole implementation.
+        "xbegin" => Flow::Branch(destination()),
         _ if is_conditional_branch(mnemonic) => Flow::Branch(destination()),
         _ => Flow::Fallthrough,
     }
@@ -5986,7 +6026,11 @@ impl DebugEngine {
     ///
     /// Falls back to [`InstructionSet::Other`] when the engine will not say, which reads operands
     /// out of nothing rather than reading them wrongly — a target that cannot name its processor
-    /// is not one to guess x86 for.
+    /// is not one to guess x86 for. That fold is deliberate **here** and not everywhere: a
+    /// disassembly whose processor query failed still has a rendering to hand back, with its
+    /// operands unread and its flow [`Flow::Unknown`], so there is a partial answer to give.
+    /// [`Self::function_extent`] has none, so it asks the processor directly and returns a failed
+    /// query as an error rather than as an unsupported architecture.
     pub fn instruction_set(&self) -> InstructionSet {
         match self.effective_processor_type() {
             Ok(machine) => InstructionSet::from_processor_type(machine),
@@ -6029,7 +6073,9 @@ impl DebugEngine {
     /// `[0x0025df60, 0x0005f218]`. Read as an end that is a bogus extent, and for any function
     /// whose `BeginAddress` is below the `.xdata` RVA it is a bogus extent that **contains the
     /// address asked about** and so passes every sanity check below. A wrong region that looks
-    /// right is worse than no region.
+    /// right is worse than no region. Decoding that record's packed function length is
+    /// [#146](https://github.com/glslang/dbgscope/issues/146); it waits on something consuming a
+    /// bound on ARM64, since operand reading refuses that set as well.
     ///
     /// # The shape, which is not the one the name suggests
     ///
@@ -6043,7 +6089,11 @@ impl DebugEngine {
     /// against that shape rather than assumed, since it is the field that says ARM64's is
     /// different.
     pub fn function_extent(&self, address: u64) -> Result<FunctionExtent, DbgEngError> {
-        let set = self.instruction_set();
+        // Asked directly rather than through `instruction_set`, which folds a failed query into
+        // `Other(0)`. That fold is right where a rendering still exists to hand back with its
+        // operands unread; here there is no partial answer, so a processor query that fails is an
+        // error and `Unsupported` is left meaning "a real architecture this does not decode".
+        let set = InstructionSet::from_processor_type(self.effective_processor_type()?);
         if set != InstructionSet::Amd64 {
             return Ok(FunctionExtent::Unsupported(set));
         }
@@ -8532,6 +8582,65 @@ mod tests {
         // Sound in the one direction that matters: an unresolved destination is `None`, never a
         // borrowed address from somewhere else on the line.
         assert_eq!(one("jmp     qword ptr [rax*8+1234h]").target(), None);
+    }
+
+    /// A comma inside a decorated symbol must not sever the destination it belongs to.
+    ///
+    /// A demangled C++ name carries commas between template arguments, and they sit outside the
+    /// brackets and parentheses the operand split steps over. Split there, the first fragment has
+    /// no parenthesised address, so the call reports `Call(None)` and a reachability walk reads a
+    /// direct edge as an indirect one and drops it. A control transfer takes one operand, so its
+    /// text is not split at all.
+    #[test]
+    fn test_a_comma_inside_a_decorated_symbol_does_not_sever_the_destination() {
+        let one = |text: &str| {
+            split_instruction(
+                0x1000,
+                &format!("00001000 90 {text}"),
+                InstructionSet::Amd64,
+            )
+        };
+
+        let call = one("call    module!std::map<int,int>::insert (00007ff6`12345678)");
+        assert_eq!(
+            call.flow,
+            Flow::Call(Some(0x00007ff6_12345678)),
+            "the direct edge was lost: {call:?}"
+        );
+        assert_eq!(
+            call.operands,
+            vec![Operand::Target {
+                symbol: Some("module!std::map<int,int>::insert".into()),
+                address: Some(0x00007ff6_12345678),
+            }]
+        );
+
+        let branch = one("je      module!foo<a,b> (00007ff6`1234abcd)");
+        assert_eq!(branch.flow, Flow::Branch(Some(0x00007ff6_1234abcd)));
+
+        // And an ordinary two-operand instruction is still split, so the immediate a control-code
+        // compare carries is still its own operand.
+        let cmp = one("cmp     r13d,6D0030h");
+        assert_eq!(cmp.operands.len(), 2, "{cmp:?}");
+        assert_eq!(cmp.operands[1], Operand::Immediate(0x6d_0030));
+    }
+
+    /// `xbegin` starts a transaction and takes its operand on an abort, so it has both edges.
+    ///
+    /// The abort path is commonly where the lock-based fallback lives, so a walk that only falls
+    /// through misses a whole implementation of the routine rather than a branch of it.
+    #[test]
+    fn test_xbegin_is_a_conditional_branch() {
+        let one = split_instruction(
+            0x1000,
+            "00001000 c7f8 xbegin  module!Lock+0x40 (00007ff6`12345678)",
+            InstructionSet::Amd64,
+        );
+        assert_eq!(one.flow, Flow::Branch(Some(0x00007ff6_12345678)));
+        assert!(
+            one.flow.falls_through(),
+            "a transaction that starts goes on"
+        );
     }
 
     /// The `ptr` widths, each asserted against the width its name means rather than against the
