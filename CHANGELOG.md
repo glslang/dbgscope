@@ -8,6 +8,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Disassembly carries its operands as values.** `Instruction` gains `mnemonic`, `operands` and
+  `flow` beside the `text` it already had, so a caller asking what an instruction *compares
+  against* or *branches to* reads a field instead of re-parsing a rendering downstream. `Operand`
+  is `Register`, `Immediate`, `Memory`, `Target` or `Other`, and `Other` is the whole safety
+  story — an operand this does not recognise keeps its text rather than being forced into a shape.
+  `Flow` carries every destination as an `Option`, because a resolvable target and an indirect one
+  are different facts, and a caller treating `None` as "no edge" stays sound.
+  Reading is gated on `InstructionSet`: x86 and x64 are read, and anything else — ARM64 today —
+  reports its mnemonic, no operands and `Flow::Unknown`. That is a refusal rather than a guess,
+  and the flow is `Unknown` rather than the `Fallthrough` most instructions happen to be, because
+  an unread `b.eq` reported as falling through hands a walk one edge of two.
+  Measured against a whole real dispatch routine rather than composed lines
+  (`examples/typed_disassembly.rs`): 376 instructions of `mountmgr!MountMgrDeviceControl` on a
+  26100 image read with **zero** unrecognised operands and zero unknown flows, and its eleven
+  control-code compares came back as values. Two defects that measurement found, both now pinned:
+  literals are `u64` rather than `i64`, since the routine renders `8000000000000000h` and
+  `0FFFFFFFFFFFFFFFFh`; and registers are matched before literals, since `ah`, `bh`, `ch` and `dh`
+  are both.
+- `DebugEngine::function_extent` returns the unwind **region** containing an address, from the
+  image's `.pdata`, rebased. A region is **not** a function, and using it as one loses code: MSVC
+  splits a function across several entries, and this answers `0x14750..0x147a3` for
+  `mountmgr!MountMgrDeviceControl` — 83 bytes, which `.fnent` confirms — while that routine's
+  compare chain lives past `0x147dd`. Bounding a walk with it recovered zero control codes where
+  following the flow recovered twelve. The x64 entry is three `u32` RVAs and not the 64-bit
+  addresses the API's name suggests; reading them as `u64` reports "no entry" for a function that
+  plainly has one.
+- `DebugEngine::symbol_for` is the public half of the existing symbol lookup: the `module!Symbol`
+  an address resolves to and how far past it, or `None` for a driver with no PDB.
 - **Exception events are readable as values.** `DebugEngine::last_event` returns a `DebugEvent` —
   kind, engine process and thread, and, when the event carried one, an `ExceptionRecord` with the
   code, flags, faulting address and parameters. That is `.exr -1` typed, and it is the user-mode
