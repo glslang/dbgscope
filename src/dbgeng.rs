@@ -1888,10 +1888,13 @@ pub enum FunctionExtent {
     /// The region containing the address, rebased into the target's address space.
     Region { begin: u64, end: u64 },
     /// The image has no unwind entry covering the address — a leaf function, or an address that
-    /// is not code. Every x86 address answers this, 32-bit Windows having no unwind table.
+    /// is not code. Reported only for x64, that being the one entry layout this decodes.
     NoEntry,
     /// This instruction set's entry layout is not decoded here, so nothing is claimed about the
-    /// address at all.
+    /// address at all. **x86 answers this**, not [`Self::NoEntry`]: 32-bit Windows has no unwind
+    /// table, so implementing it would buy nothing, but that is a fact about a platform and
+    /// `NoEntry` would assert it about an address that was never queried.
+    /// [`DebugEngine::function_extent`] has the reasoning.
     Unsupported(InstructionSet),
 }
 
@@ -2634,10 +2637,22 @@ fn read_decoded_memory(decoded: &iced_x86::Instruction) -> MemoryOperand {
     // `0x1000` as a displacement of `0x2000` — a duplicate of `address` where the addressing
     // expression should be. Derived back against the instruction's own end, which is what the
     // displacement is relative to.
+    // And a narrow effective address keeps its own width in the decoder, so `[ebp-8]` comes back
+    // as `0xfffffff8` and a straight widening cast reports it as 4,294,967,288. The width to
+    // sign-extend from is the *address registers'*, that being what the addressing form is
+    // computed in; an absolute reference with no register is left unsigned, because a 32-bit
+    // `[0xfffff000]` is a high address rather than a negative offset.
+    let address_bits = if base != iced_x86::Register::None {
+        base.size() * 8
+    } else if index != iced_x86::Register::None {
+        index.size() * 8
+    } else {
+        64
+    };
     let displacement = if rip_relative {
         (decoded.ip_rel_memory_address() as i64).wrapping_sub(decoded.next_ip() as i64)
     } else {
-        decoded.memory_displacement64() as i64
+        sign_extend(decoded.memory_displacement64(), address_bits)
     };
     MemoryOperand {
         size: (size != 0).then_some(size as u32),
@@ -2650,6 +2665,15 @@ fn read_decoded_memory(decoded: &iced_x86::Instruction) -> MemoryOperand {
         displacement,
         address,
     }
+}
+
+/// A value carried in `bits` of a wider word, read as the signed number it is.
+fn sign_extend(value: u64, bits: usize) -> i64 {
+    if bits == 0 || bits >= 64 {
+        return value as i64;
+    }
+    let shift = 64 - bits;
+    ((value << shift) as i64) >> shift
 }
 
 /// A register by the lowercase name the engine also prints.
@@ -8635,6 +8659,41 @@ mod tests {
         assert_eq!(absolute.address, Some(0x2000));
         assert_eq!(absolute.displacement, 0x2000);
         assert_eq!(absolute.segment, None);
+    }
+
+    /// A negative displacement is negative, whatever the address width.
+    ///
+    /// The decoder keeps a 32-bit effective address in its 32-bit representation, so `[ebp-8]`
+    /// comes back as `0xfffffff8` and a straight widening cast reports it as four billion. The
+    /// field promises a *signed* displacement, and `[ebp-8]` is the commonest local-variable
+    /// reference there is.
+    #[test]
+    fn test_a_negative_displacement_survives_a_narrow_address_width() {
+        let memory = |encoding: &str, set: InstructionSet| {
+            let decoded = split_instruction(0x1000, &format!("00001000 {encoding} x"), set);
+            decoded
+                .operands
+                .iter()
+                .find_map(|operand| match operand {
+                    Operand::Memory(memory) => Some(memory.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no memory operand in {decoded:?}"))
+        };
+
+        // `8b 45 f8` — mov eax,dword ptr [ebp-8], in 32-bit code.
+        let local32 = memory("8b45f8", InstructionSet::X86);
+        assert_eq!(local32.base.as_deref(), Some("ebp"));
+        assert_eq!(local32.displacement, -8, "{local32:?}");
+
+        // `48 8b 45 f8` — mov rax,qword ptr [rbp-8], the 64-bit form, which was already right.
+        let local64 = memory("488b45f8", InstructionSet::Amd64);
+        assert_eq!(local64.base.as_deref(), Some("rbp"));
+        assert_eq!(local64.displacement, -8, "{local64:?}");
+
+        // And a positive one is unchanged in both.
+        assert_eq!(memory("8b4508", InstructionSet::X86).displacement, 8);
+        assert_eq!(memory("488b4508", InstructionSet::Amd64).displacement, 8);
     }
 
     /// `hlt` is not an ending, though it is grouped with one in every mnemonic list.

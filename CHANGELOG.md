@@ -36,7 +36,11 @@ All notable changes to this project are documented here. The format follows
   the displacement, and that base is a runtime fact. A RIP-relative operand keeps the displacement
   it **encodes** rather than the decoder's normalised target, which would otherwise report
   `[rip+0xffa]` at `0x1000` as a displacement of `0x2000` — a second copy of `address` where the
-  addressing expression should be.
+  addressing expression should be. A displacement is signed at the width its *address registers*
+  are: the decoder keeps a 32-bit effective address in 32 bits, so `[ebp-8]` arrives as
+  `0xfffffff8` and a straight widening cast reported the commonest local-variable reference there
+  is as 4,294,967,288. An absolute reference with no register stays unsigned, a 32-bit
+  `[0xfffff000]` being a high address rather than a negative offset.
   Reading is gated on `InstructionSet`: x86 and x64 are decoded, and anything else — ARM64 today —
   reports its mnemonic, no operands and `Flow::Unknown`.
   Measured against a whole real dispatch routine rather than composed lines
