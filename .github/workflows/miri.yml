@@ -4,9 +4,17 @@
 #
 # **Not on pull requests**, since 2026-08-22. It is the longest job in this repo by a wide margin —
 # a median of 9 minutes against `ci.yml`'s 1 and `coverage.yml`'s 4 — and running it on the PR *and*
-# on the merge meant paying that twice for every change. It has never failed: 92 successes and 6
-# runs cancelled by the rule below, across the last hundred. So it moves to where one run per change
-# is enough, and stops being the thing a PR waits on.
+# on the merge meant paying that twice for every change. At the time it had never failed: 92
+# successes and 6 runs cancelled by the rule below, across the last hundred. So it moves to where
+# one run per change is enough, and stops being the thing a PR waits on.
+#
+# **It has since failed exactly once**, on the merge that added the `iced-x86` decoder: a Stacked
+# Borrows retag refusal inside that crate's own handler tables, on a code path no test here had
+# ever reached. That is the cost this comment predicted, arriving in the shape it predicted — a red
+# `main` rather than a red branch. It does not change the trade, one PR run per change still not
+# being worth nine minutes on every change, and `workflow_dispatch` below is what a change like
+# that should have used. The tests reaching the decoder are now excluded from this job; the
+# measurement behind that is in `src/dbgeng.rs` under "MIRI AND THE DECODER".
 #
 # A **path filter** was the first proposal and was measured rather than adopted. Skipping Miri for
 # changes that cannot affect it does not work in this crate: filtering to the obviously-unsafe
