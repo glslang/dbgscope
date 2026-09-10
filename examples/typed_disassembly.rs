@@ -71,18 +71,33 @@ fn main() {
 
     // Follow the flow rather than reading forward. A linear read runs into whatever follows the
     // function and fills the candidate list with other routines' constants; the unwind region is
-    // no substitute, because MSVC splits one function across several of them. The module bounds
-    // the walk so a tail jump out of the driver does not take it with them.
+    // no substitute, because MSVC splits one function across several of them.
+    //
+    // A module bound alone is not enough either. A tail `jmp` to a neighbour is *inside* the
+    // module, so the walk would follow it into that function and its own tail calls, and every
+    // number below would describe more than the routine that was asked about. So a non-call edge
+    // is taken only while it stays inside the entry's own symbol. Where the entry has no symbol —
+    // a stripped driver — there is no ownership to test and the module bound is all there is,
+    // which the run says out loud rather than reporting a narrower walk as the same thing.
     let module = e
         .module_at(entry)
         .ok()
         .flatten()
         .expect("the entry is in no module");
     let (low, high) = (module.base, module.base + module.size as u64);
+    let owner = e.symbol_for(entry).map(|(name, _)| name);
+    println!(
+        "ownership: {}",
+        match &owner {
+            Some(name) => format!("edges kept inside {name}"),
+            None => "no symbol for the entry — module bounds only".to_string(),
+        }
+    );
 
     let mut seen = std::collections::HashSet::new();
     let mut queue = vec![entry];
     let mut instructions = Vec::new();
+    let mut left_the_function = Vec::new();
     while let Some(at) = queue.pop() {
         if at < low || at >= high || !seen.insert(at) || seen.len() > 20_000 {
             continue;
@@ -96,10 +111,17 @@ fn main() {
         let Some(instruction) = pair.into_iter().next() else {
             continue;
         };
-        if let Some(target) = instruction.flow.target() {
-            // A call leaves this function; every other edge stays in it.
-            if !matches!(instruction.flow, Flow::Call(_)) {
+        if let Some(target) = instruction.flow.target()
+            && !matches!(instruction.flow, Flow::Call(_))
+        {
+            let stays = match &owner {
+                Some(owner) => e.symbol_for(target).is_some_and(|(name, _)| &name == owner),
+                None => true,
+            };
+            if stays {
                 queue.push(target);
+            } else {
+                left_the_function.push((instruction.address, target));
             }
         }
         if instruction.flow.falls_through() {
@@ -108,7 +130,11 @@ fn main() {
         instructions.push(instruction);
     }
     instructions.sort_by_key(|instruction| instruction.address);
-    println!("walked {} instructions\n", instructions.len());
+    println!("walked {} instructions", instructions.len());
+    println!(
+        "cross-function jumps declined: {}\n",
+        left_the_function.len()
+    );
 
     let (mut unreadable, mut other_operands, mut unknown_flow) = (0usize, 0usize, 0usize);
     let mut candidates: Vec<(u64, u64)> = Vec::new();
