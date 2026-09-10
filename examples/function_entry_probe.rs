@@ -24,11 +24,14 @@ fn main() {
     };
     let mut wanted = Vec::new();
     let mut image_path = None;
+    let mut effmach = None;
     while let Some(arg) = args.next() {
-        if arg == "--exepath" {
-            image_path = args.next();
-        } else {
-            wanted.push(arg);
+        match arg.as_str() {
+            "--exepath" => image_path = args.next(),
+            // `.effmach` is the one way to make the physical and effective processor types
+            // disagree on a fixture that is not a WOW64 or emulated target.
+            "--effmach" => effmach = args.next(),
+            _ => wanted.push(arg),
         }
     }
 
@@ -41,7 +44,19 @@ fn main() {
         e.reload_symbols("/f").expect("reloading failed");
     }
 
-    println!("instruction set: {:?}\n", e.instruction_set());
+    if let Some(machine) = &effmach {
+        e.execute_command(&format!(".effmach {machine}"))
+            .expect("setting the effective machine failed");
+    }
+
+    // Physical against effective: `Disassemble` renders with the second, so the second is what
+    // discriminates the reading. They diverge wherever one machine runs another's code.
+    println!(
+        "processor: physical {:?} effective {:?} -> {:?}\n",
+        e.processor_type().map(|m| format!("{m:#x}")),
+        e.effective_processor_type().map(|m| format!("{m:#x}")),
+        e.instruction_set()
+    );
     for name in &wanted {
         let address = match name.strip_prefix("0x") {
             Some(hex) => u64::from_str_radix(hex, 16).expect("a hexadecimal address"),
