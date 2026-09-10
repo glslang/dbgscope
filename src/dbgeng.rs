@@ -2595,7 +2595,7 @@ fn read_decoded_operand(decoded: &iced_x86::Instruction, index: u32) -> Operand 
     match decoded.op_kind(index) {
         OpKind::Register => Operand::Register(register_name(decoded.op_register(index))),
         OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
-            Operand::Target(decoded.near_branch_target())
+            Operand::Target(canonical_target(decoded))
         }
         OpKind::Immediate8
         | OpKind::Immediate8_2nd
@@ -2733,7 +2733,29 @@ fn near_target(decoded: &iced_x86::Instruction) -> Option<u64> {
                 OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
             )
         })
-        .then(|| decoded.near_branch_target())
+        .then(|| canonical_target(decoded))
+}
+
+/// A near branch's destination, in the address space its instruction came from.
+///
+/// Decoding 16- or 32-bit code computes a target of that width, so an instruction whose own
+/// address carries a high half — a narrow effective machine over a wide address, which is exactly
+/// what `.effmach x86` produces, and any target whose addresses arrive sign-extended — would get a
+/// destination in a different address space from the instruction naming it. The high half is
+/// inherited from the instruction rather than sign-extended, because that takes the address form
+/// from the caller's own value instead of assuming which one the engine uses.
+///
+/// **64-bit decoding is left alone**, and not merely because it needs no help: a `rel32` branch
+/// reaches ±2 GB, so it can legitimately cross a 4 GB boundary, and inheriting a high half there
+/// would drag a correct target backwards by four gigabytes. The one case this does not get right
+/// is the mirror of that — a 32-bit branch wrapping across its own sign boundary keeps the high
+/// half it started in.
+fn canonical_target(decoded: &iced_x86::Instruction) -> u64 {
+    let target = decoded.near_branch_target();
+    if decoded.code_size() == iced_x86::CodeSize::Code64 {
+        return target;
+    }
+    (decoded.ip() & 0xffff_ffff_0000_0000) | (target & 0xffff_ffff)
 }
 
 /// Runs of whitespace as one space. The engine pads its columns to align them in a listing, and
@@ -8694,6 +8716,56 @@ mod tests {
         // And a positive one is unchanged in both.
         assert_eq!(memory("8b4508", InstructionSet::X86).displacement, 8);
         assert_eq!(memory("488b4508", InstructionSet::Amd64).displacement, 8);
+    }
+
+    /// A 32-bit branch target lands in the address space its instruction was given.
+    ///
+    /// Decoding 32-bit code computes a 32-bit target, so an instruction whose own address carries
+    /// high bits — a 32-bit effective machine over a 64-bit address, which is what `.effmach x86`
+    /// produces, and any target whose addresses the engine hands out sign-extended — gets a
+    /// destination in a different address space from the instruction that names it. A module-bounds
+    /// check then rejects the edge, and anything reading or symbolising it reads the wrong place.
+    #[test]
+    fn test_a_32_bit_target_stays_in_its_instructions_address_space() {
+        // `e8 fb 0f 00 00` — call +0xffb. Five bytes, so from `…1000` the next IP is `…1005` and
+        // the destination is `…2000`, whatever the high half is.
+        let high = split_instruction(
+            0xffffffff_80001000,
+            "ffffffff`80001000 e8fb0f0000 x",
+            InstructionSet::X86,
+        );
+        assert_eq!(
+            high.flow,
+            Flow::Call(Some(0xffffffff_80002000)),
+            "the high half of the address was dropped: {high:?}"
+        );
+        assert_eq!(high.operands, vec![Operand::Target(0xffffffff_80002000)]);
+
+        // And an ordinary low 32-bit address is untouched.
+        let low = split_instruction(0x00401000, "00401000 e8fb0f0000 x", InstructionSet::X86);
+        assert_eq!(low.flow, Flow::Call(Some(0x00402000)), "{low:?}");
+
+        // 64-bit decoding was never affected: its own arithmetic is already 64-bit.
+        let wide = split_instruction(
+            0xfffff805_5ec04750,
+            "fffff805`5ec04750 e8fb0f0000 x",
+            InstructionSet::Amd64,
+        );
+        assert_eq!(wide.flow, Flow::Call(Some(0xfffff805_5ec05750)), "{wide:?}");
+
+        // And 64-bit must **not** inherit a high half, because a `rel32` reaches ±2 GB and so can
+        // legitimately cross a 4 GB boundary. From `…f805`fffffff0` the destination is in
+        // `…f806`, and masking it back into `…f805` would move it four gigabytes.
+        let crossing = split_instruction(
+            0xfffff805_fffffff0,
+            "fffff805`fffffff0 e8fb0f0000 x",
+            InstructionSet::Amd64,
+        );
+        assert_eq!(
+            crossing.flow,
+            Flow::Call(Some(0xfffff806_00000ff0)),
+            "a 64-bit branch across a 4 GB boundary was dragged back: {crossing:?}"
+        );
     }
 
     /// `hlt` is not an ending, though it is grouped with one in every mnemonic list.
