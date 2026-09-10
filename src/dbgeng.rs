@@ -2644,24 +2644,49 @@ fn read_decoded_memory(decoded: &iced_x86::Instruction) -> MemoryOperand {
     // And a narrow effective address keeps its own width in the decoder, so `[ebp-8]` comes back
     // as `0xfffffff8` and a straight widening cast reports it as 4,294,967,288.
     //
-    // The width to sign-extend from is the **displacement field's own**, not the address
-    // registers'. Those were the first answer and are wrong for a VSIB gather, whose index is an
-    // `xmm`/`ymm`/`zmm`: `index.size() * 8` is then 128 or more, the extension becomes a no-op,
-    // and a negative displacement comes back positive. The encoded field is the right width by
-    // construction — a `disp8` of `0xf8` is `-8` whatever computes the address — and it sidesteps
-    // the address-size override too.
+    // # The width to sign-extend from, which is neither of the two obvious answers
+    //
+    // It is the **effective address width**, and both simpler readings of that are wrong in one
+    // addressing form each:
+    //
+    // * The *index register's* width breaks a VSIB gather, whose index is an `xmm`/`ymm`/`zmm`:
+    //   128 bits or more makes the extension a no-op and a negative displacement comes back as
+    //   four billion.
+    // * The *encoded field's* width breaks EVEX, whose `disp8` is **compressed** — the decoder
+    //   returns it already multiplied by the tuple's scale while the field is still one byte, so
+    //   extending the expanded value from eight bits turns a real `+128` into `-128`.
+    //
+    // The address registers give the width where there are any, an address-size override being
+    // exactly what makes them narrow. Where there is no general-purpose register — a pure VSIB
+    // form — the encoding makes the displacement field the address width, and EVEX compression
+    // cannot arise there, since a compressed `disp8` needs a base.
     //
     // An absolute reference with no register stays unsigned, because a 32-bit `[0xfffff000]` is a
     // high address rather than a negative offset.
+    let address_bits = if base != iced_x86::Register::None {
+        base.size() * 8
+    } else if index != iced_x86::Register::None && index.size() <= 8 {
+        index.size() * 8
+    } else {
+        decoded.memory_displ_size() as usize * 8
+    };
     let displacement = if rip_relative {
-        (decoded.ip_rel_memory_address() as i64).wrapping_sub(decoded.next_ip() as i64)
+        // An address-size override leaves this `EIP`-relative, and then the decoder's target is
+        // wrapped to 32 bits while the instruction's own next address is still 64 — so the
+        // subtraction has to happen at the narrower width or it reports the delta four gigabytes
+        // out.
+        let delta = decoded
+            .ip_rel_memory_address()
+            .wrapping_sub(decoded.next_ip());
+        if base == iced_x86::Register::EIP {
+            sign_extend(delta & 0xffff_ffff, 32)
+        } else {
+            delta as i64
+        }
     } else if base == iced_x86::Register::None && index == iced_x86::Register::None {
         decoded.memory_displacement64() as i64
     } else {
-        sign_extend(
-            decoded.memory_displacement64(),
-            decoded.memory_displ_size() as usize * 8,
-        )
+        sign_extend(decoded.memory_displacement64(), address_bits)
     };
     MemoryOperand {
         size: (size != 0).then_some(size as u32),
@@ -8772,6 +8797,48 @@ mod tests {
         );
         assert_eq!(gather.base, None);
         assert_eq!(gather.displacement, -8, "{gather:?}");
+
+        // And the mirror of that: an EVEX operand's `disp8` is **compressed**, so the decoder
+        // hands back the displacement already multiplied by the tuple's scale while the encoded
+        // field is still one byte. Sign-extending the expanded value from eight bits turns a
+        // legitimate `+128` into `-128`, which is why the width cannot come from the field either.
+        // `62 f1 7c 48 28 41 02` — vmovaps zmm0,zmmword ptr [rcx+80h]: an encoded `disp8` of 2,
+        // scaled by the 64-byte tuple.
+        let evex = memory("62f17c48284102", InstructionSet::Amd64);
+        assert_eq!(evex.base.as_deref(), Some("rcx"), "{evex:?}");
+        assert_eq!(evex.displacement, 128, "{evex:?}");
+    }
+
+    /// An address-size override makes a 64-bit instruction's relative operand `EIP`-relative, and
+    /// the two halves of the subtraction stop being the same width.
+    ///
+    /// The decoder wraps the target to 32 bits while the instruction's own next address stays 64,
+    /// so subtracting them directly reports an enormous negative displacement rather than the
+    /// small number the instruction encodes.
+    #[test]
+    fn test_an_eip_relative_displacement_is_computed_at_its_own_width() {
+        let operand = |at: u64, encoding: &str| {
+            let decoded =
+                split_instruction(at, &format!("00001000 {encoding} x"), InstructionSet::Amd64);
+            decoded
+                .operands
+                .iter()
+                .find_map(|operand| match operand {
+                    Operand::Memory(memory) => Some(memory.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no memory operand in {decoded:?}"))
+        };
+
+        // `67 48 8b 05 fa 0f 00 00` — mov rax,qword ptr [eip+0xffa], eight bytes.
+        let overridden = operand(0xffffffff_80001000, "67488b05fa0f0000");
+        assert_eq!(overridden.base.as_deref(), Some("eip"), "{overridden:?}");
+        assert_eq!(overridden.displacement, 0xffa, "{overridden:?}");
+
+        // The ordinary 64-bit form is unchanged: `48 8b 05 fa 0f 00 00`, seven bytes.
+        let plain = operand(0xfffff805_5ec04750, "488b05fa0f0000");
+        assert_eq!(plain.base.as_deref(), Some("rip"));
+        assert_eq!(plain.displacement, 0xffa, "{plain:?}");
     }
 
     /// A 32-bit branch target lands in the address space its instruction was given.
