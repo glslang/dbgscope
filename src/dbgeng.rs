@@ -7602,6 +7602,34 @@ impl Drop for ScopedBreakpoint<'_> {
     }
 }
 
+// ---- MIRI AND THE DECODER ------------------------------------------------
+//
+// The eighteen tests below that decode an encoding are `#[cfg_attr(miri, ignore)]`, and this is
+// the reason. `iced-x86`'s byte reader casts an integer to a pointer (`mk_read_xx`, an
+// `unsafe { ptr::read_unaligned(data_ptr as *const _) }`), so the pointer it produces carries no
+// provenance and Stacked Borrows refuses to retag it — inside the crate's own handler tables, on
+// every decode. Measured three ways on nightly, one test each:
+//
+// | `MIRIFLAGS`                                             | result |
+// |---------------------------------------------------------|--------|
+// | the workflow's (Stacked Borrows)                         | fail   |
+// | ... plus `-Zmiri-permissive-provenance`                  | fail   |
+// | ... plus `-Zmiri-tree-borrows` instead                   | **pass** |
+//
+// So it is an aliasing-model disagreement about a dependency's internals rather than a defect in
+// this crate: nothing on that path is `unsafe` code of ours — `decode_operation` is safe Rust
+// calling a safe API — and there is nothing here to fix.
+//
+// Excluding these tests rather than moving the whole job to Tree Borrows is deliberate. This job
+// exists for *this* crate's unsafe code, which `miri.yml` names as `dbgeng.rs` and `pool/**`
+// decoding raw kernel structures out of byte slices, and switching the model would relax the
+// check for all of that in order to cover a dependency's tables that we cannot change either way.
+// Excluding costs no coverage of any `unsafe` block in this crate.
+//
+// If iced-x86 ever needs Miri coverage here, the answer is a second job with `-Zmiri-tree-borrows`
+// rather than weakening this one. And a new decoding test that forgets the attribute turns `main`
+// red, which is how this one was found — a self-correcting omission, not a silent one.
+
 #[cfg(test)]
 mod tests {
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
@@ -8425,6 +8453,10 @@ mod tests {
     /// architectures' padding, and it must take the address from the walk rather than from the
     /// line — the point of the record is that it is not a re-parse of a rendering.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_an_instruction_splits_into_its_encoding_and_its_mnemonic() {
         let x64 = split_instruction(
             0xfffff803_89201234,
@@ -8447,6 +8479,10 @@ mod tests {
     /// The address is the walk's, not the line's. Asserted against a line that disagrees, because
     /// agreeing lines cannot tell the two sources apart.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_an_instructions_address_comes_from_the_walk_not_the_rendering() {
         let one = split_instruction(0x1000, "deadbeef`deadbeef 90    nop", InstructionSet::Amd64);
         assert_eq!(one.address, 0x1000);
@@ -8457,6 +8493,10 @@ mod tests {
     /// An engine that renders a shape this does not know loses a column, never an instruction:
     /// the remainder is kept as text and nothing is presented as an encoding that is not one.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_an_unrecognised_line_keeps_its_text_rather_than_inventing_an_encoding() {
         let two_columns =
             split_instruction(0x1000, "fffff803`89201234 ????", InstructionSet::Amd64);
@@ -8477,6 +8517,10 @@ mod tests {
     /// are not decoded, where there is a real instruction and continuing is the right best-effort,
     /// and the two are separate variants for exactly that reason.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_an_unreadable_rendering_is_not_walked_through() {
         for set in [
             InstructionSet::Amd64,
@@ -8501,6 +8545,10 @@ mod tests {
     /// would hand a caller one edge of two and call the walk complete. Unlike an unreadable
     /// rendering, this one still falls through, because there **is** an instruction there.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_an_unread_instruction_set_reports_no_operands_and_no_flow() {
         let arm64 = split_instruction(
             0xfffff803_89201234,
@@ -8526,6 +8574,10 @@ mod tests {
     /// review, three characters, one defect. Here the rendering is **deliberately a lie** and the
     /// fields are still right.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_the_operands_come_from_the_encoding_and_not_from_the_rendering() {
         let lied_to = split_instruction(
             0x1000,
@@ -8544,6 +8596,10 @@ mod tests {
     /// direct call, the import thunk, the scaled index of a jump table, and the KPCR read through
     /// a segment override.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_x64_operands_are_read_as_values() {
         let one = |encoding: &str, at: u64| {
             split_instruction(at, &format!("00001000 {encoding} x"), InstructionSet::Amd64)
@@ -8632,6 +8688,10 @@ mod tests {
     /// The flow classification, including the endings a walk must not fall through and the ones
     /// that only look like endings.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_flow_separates_the_edges_a_walk_may_take() {
         let one = |encoding: &str| {
             split_instruction(
@@ -8669,6 +8729,10 @@ mod tests {
     /// `06` is the case with no version skew needed: `push es`, a perfectly good 32-bit
     /// instruction and not an encoding at all in 64-bit mode.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_bytes_that_do_not_decode_are_unknown_rather_than_unreadable() {
         let in_64 = split_instruction(0x1000, "00001000 06 x", InstructionSet::Amd64);
         assert_eq!(in_64.flow, Flow::Unknown, "{in_64:?}");
@@ -8694,6 +8758,10 @@ mod tests {
     /// target, so taking it verbatim reports `[rip+0xffa]` at `0x1000` as `0x2000` — a duplicate
     /// of `address`, where the addressing expression should be.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_a_static_address_is_only_claimed_where_one_exists() {
         let one = |encoding: &str| {
             let decoded = split_instruction(
@@ -8763,6 +8831,10 @@ mod tests {
     /// field promises a *signed* displacement, and `[ebp-8]` is the commonest local-variable
     /// reference there is.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_a_negative_displacement_survives_a_narrow_address_width() {
         let memory = |encoding: &str, set: InstructionSet| {
             let decoded = split_instruction(0x1000, &format!("00001000 {encoding} x"), set);
@@ -8831,6 +8903,10 @@ mod tests {
     /// so subtracting them directly reports an enormous negative displacement rather than the
     /// small number the instruction encodes.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_an_eip_relative_displacement_is_computed_at_its_own_width() {
         let operand = |at: u64, encoding: &str| {
             let decoded =
@@ -8864,6 +8940,10 @@ mod tests {
     /// destination in a different address space from the instruction that names it. A module-bounds
     /// check then rejects the edge, and anything reading or symbolising it reads the wrong place.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_a_32_bit_target_stays_in_its_instructions_address_space() {
         // `e8 fb 0f 00 00` — call +0xffb. Five bytes, so from `…1000` the next IP is `…1005` and
         // the destination is `…2000`, whatever the high half is.
@@ -8920,6 +9000,10 @@ mod tests {
     /// the low half. That is the narrower exposure of the two, and the doc on `canonical_target`
     /// says what would reopen it.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_a_32_bit_address_is_not_sign_extended() {
         // `a1 00 20 00 80` — mov eax,dword ptr [80002000h], from a *low* instruction address.
         let straddling =
@@ -8945,6 +9029,10 @@ mod tests {
     /// kernel idle loops are built on exactly that. Classifying it with the undefined-instruction
     /// traps truncates every one of them at the halt.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_hlt_keeps_its_wake_up_edge() {
         let halt = split_instruction(0x1000, "00001000 f4 hlt", InstructionSet::Amd64);
         assert_eq!(halt.mnemonic, "hlt");
@@ -8963,6 +9051,10 @@ mod tests {
     /// padding behind unreachable code, which encodes as the one-byte `0xcc` as well as the
     /// two-byte `cd 03`, so both have to be caught.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_a_software_interrupt_is_classified_by_its_vector() {
         let one = |encoding: &str| {
             split_instruction(
@@ -8994,6 +9086,10 @@ mod tests {
     /// is the opposite call and is deliberate: the SDM makes it a NOP outside a transaction, so
     /// treating it as a transfer would drop everything after it wherever RTM is inactive.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_the_transactional_instructions_keep_the_edges_they_have() {
         // `c7 f8 0a 00 00 00` — xbegin +0xa, which from 0x1000 lands at 0x1010.
         let begin = split_instruction(0x1000, "00001000 c7f80a000000 x", InstructionSet::Amd64);
@@ -9014,6 +9110,10 @@ mod tests {
     /// pinning: an MMX operand is 64 bits and the `xmm` beside it is 128, so a reading that folds
     /// them doubles every MMX access while nothing about it looks wrong.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_an_operand_width_comes_from_the_encoding() {
         let width = |encoding: &str, index: u32| {
             let one = split_instruction(
