@@ -51,11 +51,18 @@ All notable changes to this project are documented here. The format follows
   4 GB boundary, where inheriting would drag a correct target back four gigabytes. An **absolute**
   memory address is canonicalised the same way and for the same reason, absolute globals and
   import slots being ordinary in x86 kernel code.
-  A displacement's signed width comes from the **displacement field itself**, not from the address
-  registers. Those were the first answer and are wrong for a VSIB gather, whose index is an
-  `xmm`/`ymm`/`zmm`: a width taken from the index is 128 bits or more, the sign extension becomes
-  a no-op, and a negative displacement comes back as four billion. The encoded field is the right
-  width by construction, and it sidesteps the address-size override as well.
+  A displacement's signed width is the **effective address width**, and neither of the two simpler
+  readings of that survives: the *index register's* width breaks a VSIB gather, whose index is an
+  `xmm`/`ymm`/`zmm`, so the extension becomes a no-op and a negative displacement comes back as
+  four billion; the *encoded field's* width breaks EVEX, whose `disp8` is compressed, so the
+  decoder returns it already scaled by the tuple while the field is still one byte and extending
+  from eight bits turns a real `+128` into `-128`. The address registers give the width where
+  there are any, an address-size override being exactly what makes them narrow, and the encoded
+  field gives it for a pure VSIB form, where compression cannot arise because it needs a base. All
+  three readings are pinned, so the two wrong ones fail a test rather than being re-proposed.
+  An `EIP`-relative operand — a 64-bit instruction under an address-size override — has its
+  displacement computed at 32 bits, the decoder wrapping the target to that width while the
+  instruction's own next address stays 64, which otherwise puts the delta four gigabytes out.
   Reading is gated on `InstructionSet`: x86 and x64 are decoded, and anything else — ARM64 today —
   reports its mnemonic, no operands and `Flow::Unknown`.
   Measured against a whole real dispatch routine rather than composed lines
