@@ -1959,6 +1959,15 @@ pub struct RegisterOperand {
     pub name: String,
     /// The full-width register it belongs to at this target's bitness — `r13`, `rax`, `rip`.
     pub full: String,
+    /// How many bytes this spelling reads or writes — 4 for `eax`, 1 for `ah`.
+    ///
+    /// **What a caller tracking a value needs in order to know it still has all of it.** A `ULONG`
+    /// field read with `mov eax,[rdx+18h]` is the whole of it; `movzx ecx,ax` two instructions
+    /// later carries two bytes of the same value, and a caller that treated the copy as the value
+    /// would report a comparison against part of a field as a comparison against the field. The
+    /// decoder knows the width because it decoded the register; a consumer deriving it from the
+    /// spelling is writing the table this type exists to delete.
+    pub width: u32,
 }
 
 impl std::fmt::Display for RegisterOperand {
@@ -2966,6 +2975,7 @@ fn register_operand(register: iced_x86::Register, bitness: u32) -> RegisterOpera
     RegisterOperand {
         name: register_name(register),
         full: register_name(full),
+        width: register.size() as u32,
     }
 }
 
@@ -8744,10 +8754,11 @@ mod tests {
 
     /// A register operand as a fixture writes one: the printed name, and the full-width register
     /// it belongs to.
-    fn register(name: &str, full: &str) -> RegisterOperand {
+    fn register(name: &str, full: &str, width: u32) -> RegisterOperand {
         RegisterOperand {
             name: name.to_string(),
             full: full.to_string(),
+            width,
         }
     }
 
@@ -8767,7 +8778,9 @@ mod tests {
             split_instruction(0x1000, &format!("00001000`00000000 {bytes}    {text}"), set)
         };
         let register = |one: &Instruction, index: usize| match &one.operands[index] {
-            Operand::Register(register) => (register.name.clone(), register.full.clone()),
+            Operand::Register(register) => {
+                (register.name.clone(), register.full.clone(), register.width)
+            }
             other => panic!("expected a register operand: {other:?}"),
         };
 
@@ -8775,19 +8788,32 @@ mod tests {
         let wide = decode("4189c5", "mov r13d,eax", InstructionSet::Amd64);
         assert_eq!(
             register(&wide, 0),
-            ("r13d".to_string(), "r13".to_string()),
+            ("r13d".to_string(), "r13".to_string(), 4),
             "{wide:?}"
         );
-        assert_eq!(register(&wide, 1), ("eax".to_string(), "rax".to_string()));
+        assert_eq!(
+            register(&wide, 1),
+            ("eax".to_string(), "rax".to_string(), 4)
+        );
 
         // `mov ah,al`: the legacy high byte belongs to the same register as the low one.
         let bytes = decode("88c4", "mov ah,al", InstructionSet::Amd64);
-        assert_eq!(register(&bytes, 0), ("ah".to_string(), "rax".to_string()));
+        assert_eq!(
+            register(&bytes, 0),
+            ("ah".to_string(), "rax".to_string(), 1),
+            "and the width is what says a copy of it is not the whole value"
+        );
 
         // And the same instruction decoded as 32-bit code: there is no `rax` on that target.
         let narrow = decode("8bc1", "mov eax,ecx", InstructionSet::X86);
-        assert_eq!(register(&narrow, 0), ("eax".to_string(), "eax".to_string()));
-        assert_eq!(register(&narrow, 1), ("ecx".to_string(), "ecx".to_string()));
+        assert_eq!(
+            register(&narrow, 0),
+            ("eax".to_string(), "eax".to_string(), 4)
+        );
+        assert_eq!(
+            register(&narrow, 1),
+            ("ecx".to_string(), "ecx".to_string(), 4)
+        );
     }
 
     /// A branch's condition carries its **signedness**, which its mnemonic reads like but does not
@@ -9090,7 +9116,7 @@ mod tests {
         assert_eq!(
             cmp.operands,
             vec![
-                Operand::Register(register("r13d", "r13")),
+                Operand::Register(register("r13d", "r13", 4)),
                 Operand::Immediate(0x6d_0030)
             ]
         );
@@ -9153,7 +9179,7 @@ mod tests {
         assert_eq!(
             byte_register.operands,
             vec![
-                Operand::Register(register("ah", "rax")),
+                Operand::Register(register("ah", "rax", 1)),
                 Operand::Immediate(5)
             ]
         );
