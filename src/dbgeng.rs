@@ -1924,9 +1924,9 @@ pub struct MemoryOperand {
     /// A segment override — `gs` in `gs:[188h]`, which is how kernel code reaches the KPCR.
     pub segment: Option<String>,
     /// The base register, when one was printed.
-    pub base: Option<String>,
+    pub base: Option<RegisterOperand>,
     /// The index register of a `base+index*scale` form.
-    pub index: Option<String>,
+    pub index: Option<RegisterOperand>,
     /// The index's scale; 1 when none was printed.
     pub scale: u8,
     /// The signed displacement, zero when none was printed.
@@ -1941,6 +1941,120 @@ pub struct MemoryOperand {
     pub address: Option<u64>,
 }
 
+/// A register operand: the name as printed, and the full-width register it is part of.
+///
+/// **Two spellings of one register are one value here**, which is what lets a caller follow a
+/// value across widths: a dispatch routine reads a control code into `r13d` and compares `r13d`
+/// against an immediate two instructions later, while the `pop r13` in its epilogue writes the
+/// same register. A caller keying on the printed name sees three registers and loses the value at
+/// the first width change; keying on [`Self::full`] it sees one.
+///
+/// Both come from the **decoder**, not from a table of names. The mapping is per architecture and
+/// per bitness — `eax` is part of `rax` on x64 and is itself the full register on x86 — and a
+/// hand-written list is wrong in the way every hand-written list here has been: `r8d` and `sil`
+/// and `ah` are each a case somebody forgets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegisterOperand {
+    /// As the engine prints it — `r13d`, `al`, `rip`.
+    pub name: String,
+    /// The full-width register it belongs to at this target's bitness — `r13`, `rax`, `rip`.
+    pub full: String,
+}
+
+impl std::fmt::Display for RegisterOperand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+/// A register **is** its printed name, so `memory.base.as_deref() == Some("rdx")` reads as it did
+/// before this type existed, and the full-width register is the field a caller asks for on purpose.
+///
+/// The direction matters: dereferencing to [`Self::name`] cannot be mistaken for the canonical one,
+/// where the reverse would silently answer `rax` to a caller printing an operand.
+impl std::ops::Deref for RegisterOperand {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.name
+    }
+}
+
+/// What a conditional branch requires of the flags the compare before it set.
+///
+/// **Signedness is part of the answer, and that is why this is not a mnemonic.** `ja` and `jg`
+/// read the same rendering-shaped "greater", and only one of them says anything about an unsigned
+/// index: a jump table bounded by `jg` is not bounded at all. A caller matching mnemonics gets
+/// that wrong once per family and finds out when a table is read one entry past its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Condition {
+    /// `je`/`jz`.
+    Equal,
+    /// `jne`/`jnz`.
+    NotEqual,
+    /// `ja`/`jnbe` — unsigned, strict.
+    UnsignedAbove,
+    /// `jae`/`jnb`/`jnc` — unsigned, inclusive.
+    UnsignedAboveOrEqual,
+    /// `jb`/`jnae`/`jc` — unsigned, strict.
+    UnsignedBelow,
+    /// `jbe`/`jna` — unsigned, inclusive.
+    UnsignedBelowOrEqual,
+    /// `jg`/`jnle` — signed, strict.
+    SignedGreater,
+    /// `jge`/`jnl` — signed, inclusive.
+    SignedGreaterOrEqual,
+    /// `jl`/`jnge` — signed, strict.
+    SignedLess,
+    /// `jle`/`jng` — signed, inclusive.
+    SignedLessOrEqual,
+    /// `js` / `jns` — the sign flag alone.
+    Negative,
+    NotNegative,
+    /// `jo` / `jno`.
+    Overflow,
+    NotOverflow,
+    /// `jp`/`jpe` / `jnp`/`jpo`.
+    Parity,
+    NotParity,
+}
+
+/// What an instruction **does**, in the few classes an analysis branches on.
+///
+/// [`Flow`] answers where control goes; this answers what the instruction did to its operands, and
+/// the two together are what a caller reading a mnemonic string was reaching for. It is
+/// deliberately coarse: a caller that needs the exact instruction has [`Instruction::mnemonic`],
+/// and a class list that grew a variant per encoding would be the table this exists to delete.
+///
+/// The classes are the ones a dataflow over a dispatch routine actually branches on — is this a
+/// copy, an address computation, a compare, an arithmetic adjustment of a value it is tracking —
+/// and they carry across architectures: an ARM64 `mov`/`add`/`sub`/`cmp`/`lsr` answers the same
+/// set, which is the point of putting them here rather than in each consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// A copy, of any width, zero- or sign-extending included.
+    Move,
+    /// An address computation that reads no memory — `lea`.
+    LoadAddress,
+    /// A comparison that writes only flags — `cmp`.
+    Compare,
+    /// A bitwise test that writes only flags — `test`.
+    Test,
+    Add,
+    Subtract,
+    /// `shl`/`sal`.
+    ShiftLeft,
+    /// `shr`/`sar`. The signedness is in the mnemonic, and a caller that cares reads it.
+    ShiftRight,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Push,
+    Pop,
+    /// Anything else, including every transfer of control — those are [`Flow`]'s answer.
+    Other,
+}
+
 /// One operand of an instruction, as its **encoding** says rather than as the engine printed it.
 ///
 /// There is no symbol anywhere in here, and that is the point. A destination is an address;
@@ -1950,8 +2064,8 @@ pub struct MemoryOperand {
 /// direct call edge that a reachability walk then dropped as indirect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
-    /// A register, lowercased — the name the engine also prints.
-    Register(String),
+    /// A register: the name the engine prints, and the full-width register it is part of.
+    Register(RegisterOperand),
     /// A literal, as the bit pattern encoded. Unsigned, because what a caller matches against a
     /// control code or a mask is the pattern rather than an arithmetic sign.
     Immediate(u64),
@@ -2018,6 +2132,21 @@ pub struct Instruction {
     /// One deliberate gap, iced's rather than this crate's: `vmcall` is excluded, being the one
     /// CPL=0-encoded instruction a guest executes at any privilege level.
     pub privileged: bool,
+    /// What the instruction does to its operands, in the classes an analysis branches on.
+    ///
+    /// [`Effect::Other`] for an instruction set this build does not decode, which [`Self::flow`]
+    /// tells apart by being [`Flow::Unknown`] there.
+    pub effect: Effect,
+    /// What a conditional branch requires of the flags, when the instruction is one.
+    ///
+    /// `None` for everything else, and for a conditional whose condition is not one of these --
+    /// `jrcxz` and the `loop` family test a register rather than the flags.
+    pub condition: Option<Condition>,
+    /// Whether the instruction writes any flag a conditional branch reads.
+    ///
+    /// The decoder's own answer, so "which instruction set the flags this branch is reading" needs
+    /// no list of arithmetic mnemonics -- the list that forgets `bt`, `cmpxchg` and `neg`.
+    pub writes_flags: bool,
 }
 
 /// The engine's current **scope**: which instruction, which frame, and the register context
@@ -2524,7 +2653,8 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
     // trip. A column that is not hexadecimal is not one — a `???` line has none — and decodes to
     // nothing.
     let raw = hex::decode(&bytes).unwrap_or_default();
-    let (mut mnemonic, operands, flow, privileged) = decode_operation(&raw, address, set);
+    let decoded = decode_operation(&raw, address, set);
+    let mut mnemonic = decoded.mnemonic;
     if mnemonic.is_empty() {
         // Nothing decoded: an instruction set this does not decode, or bytes that are not an
         // instruction. The rendering's first token is the mnemonic in every syntax the engine
@@ -2540,9 +2670,12 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
         bytes,
         text,
         mnemonic,
-        operands,
-        flow,
-        privileged,
+        operands: decoded.operands,
+        flow: decoded.flow,
+        privileged: decoded.privileged,
+        effect: decoded.effect,
+        condition: decoded.condition,
+        writes_flags: decoded.writes_flags,
     }
 }
 
@@ -2570,23 +2703,44 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
 /// listing prints and this crate has always promised `u`'s own output. In principle the two could
 /// disagree on an encoding one decoder knows and the other does not; they are the same bytes, and
 /// the fields say which reading they came from.
-fn decode_operation(
-    bytes: &[u8],
-    address: u64,
-    set: InstructionSet,
-) -> (String, Vec<Operand>, Flow, bool) {
+struct Decoded {
+    mnemonic: String,
+    operands: Vec<Operand>,
+    flow: Flow,
+    privileged: bool,
+    effect: Effect,
+    condition: Option<Condition>,
+    writes_flags: bool,
+}
+
+impl Decoded {
+    /// What is claimed about bytes nothing decoded: nothing.
+    fn nothing(flow: Flow) -> Self {
+        Self {
+            mnemonic: String::new(),
+            operands: Vec::new(),
+            flow,
+            privileged: false,
+            effect: Effect::Other,
+            condition: None,
+            writes_flags: false,
+        }
+    }
+}
+
+fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded {
     // Asked before the instruction set: bytes that are not there are not there on any
     // architecture, and answering `Unknown` for them on ARM64 would let a walk step through the
     // same unreadable page the x64 path is kept out of.
     if bytes.is_empty() {
-        return (String::new(), Vec::new(), Flow::Unreadable, false);
+        return Decoded::nothing(Flow::Unreadable);
     }
     let bitness = match set {
         InstructionSet::X86 => 32,
         InstructionSet::Amd64 => 64,
         // Not decoded: ARM64 today. The mnemonic is still the rendering's first token, which every
         // syntax puts first, and the caller reads `Flow::Unknown` as "nothing was claimed".
-        InstructionSet::Other(_) => return (String::new(), Vec::new(), Flow::Unknown, false),
+        InstructionSet::Other(_) => return Decoded::nothing(Flow::Unknown),
     };
     let mut decoder =
         iced_x86::Decoder::with_ip(bitness, bytes, address, iced_x86::DecoderOptions::NONE);
@@ -2597,26 +2751,87 @@ fn decode_operation(
         // decoder simply does not know it — an extension newer than the version pinned, or a
         // span entered mid-instruction. `Unknown` says exactly that, and falls through, where
         // `Unreadable` would stop a walk and discard the rest of a routine over a version skew.
-        return (String::new(), Vec::new(), Flow::Unknown, false);
+        return Decoded::nothing(Flow::Unknown);
     }
 
     let mnemonic = format!("{:?}", decoded.mnemonic()).to_lowercase();
     let operands = (0..decoded.op_count())
-        .map(|index| read_decoded_operand(&decoded, index))
+        .map(|index| read_decoded_operand(&decoded, index, bitness))
         .collect();
-    (
+    Decoded {
         mnemonic,
         operands,
-        decoded_flow(&decoded),
-        decoded.is_privileged(),
-    )
+        flow: decoded_flow(&decoded),
+        privileged: decoded.is_privileged(),
+        effect: decoded_effect(&decoded),
+        condition: decoded_condition(&decoded),
+        // Any flag at all: what a caller is asking is "did this set the flags the branch after it
+        // reads", and the decoder knows which bits each instruction writes.
+        writes_flags: decoded.rflags_written() != 0,
+    }
+}
+
+/// What the instruction does to its operands, from the decoder's own mnemonic rather than from the
+/// rendering of one.
+///
+/// A `match` over a typed enum rather than over strings, which is the difference that matters: the
+/// compiler sees every arm, the spellings the engine happens to print cannot change it, and a
+/// second architecture answers the same classes from its own decoder rather than from a second
+/// copy of somebody's list.
+fn decoded_effect(decoded: &iced_x86::Instruction) -> Effect {
+    use iced_x86::Mnemonic;
+    match decoded.mnemonic() {
+        Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd => Effect::Move,
+        Mnemonic::Lea => Effect::LoadAddress,
+        Mnemonic::Cmp => Effect::Compare,
+        Mnemonic::Test => Effect::Test,
+        Mnemonic::Add | Mnemonic::Adc | Mnemonic::Inc => Effect::Add,
+        Mnemonic::Sub | Mnemonic::Sbb | Mnemonic::Dec => Effect::Subtract,
+        Mnemonic::Shl | Mnemonic::Sal => Effect::ShiftLeft,
+        Mnemonic::Shr | Mnemonic::Sar => Effect::ShiftRight,
+        Mnemonic::And => Effect::BitAnd,
+        Mnemonic::Or => Effect::BitOr,
+        Mnemonic::Xor => Effect::BitXor,
+        Mnemonic::Push => Effect::Push,
+        Mnemonic::Pop => Effect::Pop,
+        _ => Effect::Other,
+    }
+}
+
+/// The condition a conditional branch reads, from the decoder's `ConditionCode`.
+///
+/// **Signedness comes with it**, which is the whole reason this is not a mnemonic: `ja` and `jg`
+/// are the same word in English and different questions about a value.
+fn decoded_condition(decoded: &iced_x86::Instruction) -> Option<Condition> {
+    use iced_x86::ConditionCode;
+    Some(match decoded.condition_code() {
+        ConditionCode::None => return None,
+        ConditionCode::e => Condition::Equal,
+        ConditionCode::ne => Condition::NotEqual,
+        ConditionCode::a => Condition::UnsignedAbove,
+        ConditionCode::ae => Condition::UnsignedAboveOrEqual,
+        ConditionCode::b => Condition::UnsignedBelow,
+        ConditionCode::be => Condition::UnsignedBelowOrEqual,
+        ConditionCode::g => Condition::SignedGreater,
+        ConditionCode::ge => Condition::SignedGreaterOrEqual,
+        ConditionCode::l => Condition::SignedLess,
+        ConditionCode::le => Condition::SignedLessOrEqual,
+        ConditionCode::s => Condition::Negative,
+        ConditionCode::ns => Condition::NotNegative,
+        ConditionCode::o => Condition::Overflow,
+        ConditionCode::no => Condition::NotOverflow,
+        ConditionCode::p => Condition::Parity,
+        ConditionCode::np => Condition::NotParity,
+    })
 }
 
 /// One decoded operand.
-fn read_decoded_operand(decoded: &iced_x86::Instruction, index: u32) -> Operand {
+fn read_decoded_operand(decoded: &iced_x86::Instruction, index: u32, bitness: u32) -> Operand {
     use iced_x86::OpKind;
     match decoded.op_kind(index) {
-        OpKind::Register => Operand::Register(register_name(decoded.op_register(index))),
+        OpKind::Register => {
+            Operand::Register(register_operand(decoded.op_register(index), bitness))
+        }
         OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => {
             Operand::Target(canonical_target(decoded))
         }
@@ -2629,14 +2844,14 @@ fn read_decoded_operand(decoded: &iced_x86::Instruction, index: u32) -> Operand 
         | OpKind::Immediate8to32
         | OpKind::Immediate8to64
         | OpKind::Immediate32to64 => Operand::Immediate(decoded.immediate(index)),
-        OpKind::Memory => Operand::Memory(read_decoded_memory(decoded)),
+        OpKind::Memory => Operand::Memory(read_decoded_memory(decoded, bitness)),
         // Far branches, and the implicit string-operation operands. Kept rather than shaped.
         other => Operand::Other(format!("{other:?}").to_lowercase()),
     }
 }
 
 /// The memory operand of a decoded instruction.
-fn read_decoded_memory(decoded: &iced_x86::Instruction) -> MemoryOperand {
+fn read_decoded_memory(decoded: &iced_x86::Instruction, bitness: u32) -> MemoryOperand {
     let size = decoded.memory_size().size();
     let base = decoded.memory_base();
     let index = decoded.memory_index();
@@ -2716,8 +2931,8 @@ fn read_decoded_memory(decoded: &iced_x86::Instruction) -> MemoryOperand {
         // The *prefix*, not the segment the encoding implies: `[rsp+8]` is `ss` by rule and prints
         // no override, and reporting one would say the instruction carried something it did not.
         segment: overridden.then(|| register_name(decoded.segment_prefix())),
-        base: (base != iced_x86::Register::None).then(|| register_name(base)),
-        index: (index != iced_x86::Register::None).then(|| register_name(index)),
+        base: (base != iced_x86::Register::None).then(|| register_operand(base, bitness)),
+        index: (index != iced_x86::Register::None).then(|| register_operand(index, bitness)),
         scale: decoded.memory_index_scale() as u8,
         displacement,
         address,
@@ -2736,6 +2951,22 @@ fn sign_extend(value: u64, bits: usize) -> i64 {
 /// A register by the lowercase name the engine also prints.
 fn register_name(register: iced_x86::Register) -> String {
     format!("{register:?}").to_lowercase()
+}
+
+/// A register operand, with the full-width register **the decoder** says it is part of.
+///
+/// The width depends on the target: `eax` is part of `rax` on x64 and is the whole register on
+/// x86, so the bitness picks which question to ask. Neither answer is a list of names — iced knows
+/// what `r8d` and `sil` and `ah` belong to because it decoded them.
+fn register_operand(register: iced_x86::Register, bitness: u32) -> RegisterOperand {
+    let full = match bitness {
+        64 => register.full_register(),
+        _ => register.full_register32(),
+    };
+    RegisterOperand {
+        name: register_name(register),
+        full: register_name(full),
+    }
 }
 
 /// What a decoded instruction does to control flow.
@@ -6040,7 +6271,7 @@ impl DebugEngine {
                     Vec::new()
                 } else {
                     (0..decoded.op_count())
-                        .map(|index| read_decoded_operand(&decoded, index))
+                        .map(|index| read_decoded_operand(&decoded, index, bitness))
                         .collect()
                 },
                 // Bytes that were read and did not decode: `Unknown`, not `Unreadable`. A linear
@@ -6054,6 +6285,15 @@ impl DebugEngine {
                 // `false` for bytes that did not decode, for the same reason the flow is
                 // `Unknown` there: nothing was read, so nothing is claimed.
                 privileged: !decoded.is_invalid() && decoded.is_privileged(),
+                effect: if decoded.is_invalid() {
+                    Effect::Other
+                } else {
+                    decoded_effect(&decoded)
+                },
+                condition: (!decoded.is_invalid())
+                    .then(|| decoded_condition(&decoded))
+                    .flatten(),
+                writes_flags: !decoded.is_invalid() && decoded.rflags_written() != 0,
             });
         }
         Ok(out)
@@ -8502,6 +8742,146 @@ mod tests {
         assert_eq!(arm64.text, "stp fp,lr,[sp,#-0x10]!");
     }
 
+    /// A register operand as a fixture writes one: the printed name, and the full-width register
+    /// it belongs to.
+    fn register(name: &str, full: &str) -> RegisterOperand {
+        RegisterOperand {
+            name: name.to_string(),
+            full: full.to_string(),
+        }
+    }
+
+    /// A register is one value across its widths, and the **decoder** says which.
+    ///
+    /// The mapping is per bitness, not per name: `eax` is part of `rax` on x64 and is itself the
+    /// full register on x86, so a table of names is wrong on one of the two whatever it says. The
+    /// cases here are the ones such a table forgets — a numbered register's `d` suffix, a legacy
+    /// high byte, and the same name read under both bitnesses.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn test_a_register_operand_carries_the_full_width_register_the_decoder_names() {
+        let decode = |bytes: &str, text: &str, set| {
+            split_instruction(0x1000, &format!("00001000`00000000 {bytes}    {text}"), set)
+        };
+        let register = |one: &Instruction, index: usize| match &one.operands[index] {
+            Operand::Register(register) => (register.name.clone(), register.full.clone()),
+            other => panic!("expected a register operand: {other:?}"),
+        };
+
+        // `mov r13d,eax` on x64: two spellings, two different full registers.
+        let wide = decode("4189c5", "mov r13d,eax", InstructionSet::Amd64);
+        assert_eq!(
+            register(&wide, 0),
+            ("r13d".to_string(), "r13".to_string()),
+            "{wide:?}"
+        );
+        assert_eq!(register(&wide, 1), ("eax".to_string(), "rax".to_string()));
+
+        // `mov ah,al`: the legacy high byte belongs to the same register as the low one.
+        let bytes = decode("88c4", "mov ah,al", InstructionSet::Amd64);
+        assert_eq!(register(&bytes, 0), ("ah".to_string(), "rax".to_string()));
+
+        // And the same instruction decoded as 32-bit code: there is no `rax` on that target.
+        let narrow = decode("8bc1", "mov eax,ecx", InstructionSet::X86);
+        assert_eq!(register(&narrow, 0), ("eax".to_string(), "eax".to_string()));
+        assert_eq!(register(&narrow, 1), ("ecx".to_string(), "ecx".to_string()));
+    }
+
+    /// A branch's condition carries its **signedness**, which its mnemonic reads like but does not
+    /// say.
+    ///
+    /// `ja` and `jg` are the same word in English. Only the first bounds an unsigned index, so a
+    /// consumer sizing a jump table from a signed comparison sizes it from nothing — and a
+    /// consumer matching mnemonics has no way to see the difference without knowing this table by
+    /// heart, which is the knowledge this field exists to stop being everybody's.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn test_a_conditional_branch_carries_its_condition_and_its_signedness() {
+        let decode = |bytes: &str, text: &str| {
+            split_instruction(
+                0x1000,
+                &format!("00001000`00000000 {bytes}    {text}"),
+                InstructionSet::Amd64,
+            )
+        };
+        for (bytes, text, expected) in [
+            ("7402", "je 1004", Condition::Equal),
+            ("7502", "jne 1004", Condition::NotEqual),
+            ("7702", "ja 1004", Condition::UnsignedAbove),
+            ("7302", "jae 1004", Condition::UnsignedAboveOrEqual),
+            ("7202", "jb 1004", Condition::UnsignedBelow),
+            ("7602", "jbe 1004", Condition::UnsignedBelowOrEqual),
+            ("7f02", "jg 1004", Condition::SignedGreater),
+            ("7d02", "jge 1004", Condition::SignedGreaterOrEqual),
+            ("7c02", "jl 1004", Condition::SignedLess),
+            ("7e02", "jle 1004", Condition::SignedLessOrEqual),
+        ] {
+            let one = decode(bytes, text);
+            assert_ne!(
+                one.flow,
+                Flow::Unknown,
+                "`{text}` must decode, or the condition is about nothing: {one:?}"
+            );
+            assert_eq!(one.condition, Some(expected), "`{text}`: {one:?}");
+        }
+
+        // Everything that is not a conditional branch claims nothing.
+        let unconditional = decode("eb02", "jmp 1004");
+        assert_eq!(unconditional.condition, None, "{unconditional:?}");
+        let arithmetic = decode("83e804", "sub eax,4");
+        assert_eq!(arithmetic.condition, None, "{arithmetic:?}");
+    }
+
+    /// What an instruction does to its operands is a class the decoder answers, and whether it set
+    /// the flags is the decoder's too.
+    ///
+    /// Both replace a list of mnemonics in a consumer. The flags case is the one such a list keeps
+    /// getting wrong: `cmp` and `test` are obvious, and `bt`, `neg` and `cmpxchg` are the ones
+    /// nobody writes down — while `lea`, which looks like arithmetic, sets none.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn test_an_instruction_carries_what_it_does_and_whether_it_set_the_flags() {
+        let decode = |bytes: &str, text: &str| {
+            split_instruction(
+                0x1000,
+                &format!("00001000`00000000 {bytes}    {text}"),
+                InstructionSet::Amd64,
+            )
+        };
+        for (bytes, text, effect, flags) in [
+            ("8bc1", "mov eax,ecx", Effect::Move, false),
+            ("0fb6c1", "movzx eax,cl", Effect::Move, false),
+            ("488d0c10", "lea rcx,[rax+rdx]", Effect::LoadAddress, false),
+            ("83f804", "cmp eax,4", Effect::Compare, true),
+            ("85c0", "test eax,eax", Effect::Test, true),
+            ("83c004", "add eax,4", Effect::Add, true),
+            ("83e804", "sub eax,4", Effect::Subtract, true),
+            ("c1e802", "shr eax,2", Effect::ShiftRight, true),
+            ("c1e002", "shl eax,2", Effect::ShiftLeft, true),
+            ("83e00f", "and eax,0Fh", Effect::BitAnd, true),
+            ("50", "push rax", Effect::Push, false),
+            ("58", "pop rax", Effect::Pop, false),
+            ("c3", "ret", Effect::Other, false),
+            // The flag-setters a hand-written list forgets.
+            ("0fa3c1", "bt ecx,eax", Effect::Other, true),
+            ("f7d8", "neg eax", Effect::Other, true),
+        ] {
+            let one = decode(bytes, text);
+            assert_ne!(one.flow, Flow::Unknown, "`{text}` must decode: {one:?}");
+            assert_eq!(one.effect, effect, "`{text}`: {one:?}");
+            assert_eq!(one.writes_flags, flags, "`{text}` flags: {one:?}");
+        }
+    }
+
     /// Privilege is the **decoder's** answer, which is the whole point of carrying it.
     ///
     /// A caller asking "does this driver touch the machine" wants the entire set, and the obvious
@@ -8710,7 +9090,7 @@ mod tests {
         assert_eq!(
             cmp.operands,
             vec![
-                Operand::Register("r13d".into()),
+                Operand::Register(register("r13d", "r13")),
                 Operand::Immediate(0x6d_0030)
             ]
         );
@@ -8772,7 +9152,10 @@ mod tests {
         let byte_register = one("b405", 0x1000);
         assert_eq!(
             byte_register.operands,
-            vec![Operand::Register("ah".into()), Operand::Immediate(5)]
+            vec![
+                Operand::Register(register("ah", "rax")),
+                Operand::Immediate(5)
+            ]
         );
 
         // `48 b8 00 00 00 00 00 00 00 80` — mov rax,8000000000000000h. A literal that does not fit
