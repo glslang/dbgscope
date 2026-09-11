@@ -2001,6 +2001,23 @@ pub struct Instruction {
     pub operands: Vec<Operand>,
     /// What the instruction does to control flow.
     pub flow: Flow,
+    /// Whether executing it requires privilege: every CPL=0 instruction, plus the IOPL-sensitive
+    /// ones (`in`, `ins`, `out`, `outs`, `cli`, `sti`).
+    ///
+    /// **The decoder's own answer, not a list of mnemonics.** A caller asking "does this driver
+    /// touch the machine" wants the whole set -- `rdmsr` and `mov cr3` and `lgdt`, but also `cli`,
+    /// `clts`, `lmsw`, `invpcid`, and every VMX and SVM operation -- and a hand-kept table of
+    /// those answers "none" for a driver containing exactly the ones nobody remembered. iced's
+    /// table is generated from the instruction set itself, so the question is asked once and
+    /// stays right as the set grows.
+    ///
+    /// `false` on an instruction set this build does not decode, for the same reason
+    /// [`Flow::Unknown`] is the flow there: nothing was read, so nothing is claimed. A caller that
+    /// needs to tell "no privileged instructions" from "not asked" reads the flow.
+    ///
+    /// One deliberate gap, iced's rather than this crate's: `vmcall` is excluded, being the one
+    /// CPL=0-encoded instruction a guest executes at any privilege level.
+    pub privileged: bool,
 }
 
 /// The engine's current **scope**: which instruction, which frame, and the register context
@@ -2507,7 +2524,7 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
     // trip. A column that is not hexadecimal is not one — a `???` line has none — and decodes to
     // nothing.
     let raw = hex::decode(&bytes).unwrap_or_default();
-    let (mut mnemonic, operands, flow) = decode_operation(&raw, address, set);
+    let (mut mnemonic, operands, flow, privileged) = decode_operation(&raw, address, set);
     if mnemonic.is_empty() {
         // Nothing decoded: an instruction set this does not decode, or bytes that are not an
         // instruction. The rendering's first token is the mnemonic in every syntax the engine
@@ -2525,6 +2542,7 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
         mnemonic,
         operands,
         flow,
+        privileged,
     }
 }
 
@@ -2556,19 +2574,19 @@ fn decode_operation(
     bytes: &[u8],
     address: u64,
     set: InstructionSet,
-) -> (String, Vec<Operand>, Flow) {
+) -> (String, Vec<Operand>, Flow, bool) {
     // Asked before the instruction set: bytes that are not there are not there on any
     // architecture, and answering `Unknown` for them on ARM64 would let a walk step through the
     // same unreadable page the x64 path is kept out of.
     if bytes.is_empty() {
-        return (String::new(), Vec::new(), Flow::Unreadable);
+        return (String::new(), Vec::new(), Flow::Unreadable, false);
     }
     let bitness = match set {
         InstructionSet::X86 => 32,
         InstructionSet::Amd64 => 64,
         // Not decoded: ARM64 today. The mnemonic is still the rendering's first token, which every
         // syntax puts first, and the caller reads `Flow::Unknown` as "nothing was claimed".
-        InstructionSet::Other(_) => return (String::new(), Vec::new(), Flow::Unknown),
+        InstructionSet::Other(_) => return (String::new(), Vec::new(), Flow::Unknown, false),
     };
     let mut decoder =
         iced_x86::Decoder::with_ip(bitness, bytes, address, iced_x86::DecoderOptions::NONE);
@@ -2579,14 +2597,19 @@ fn decode_operation(
         // decoder simply does not know it — an extension newer than the version pinned, or a
         // span entered mid-instruction. `Unknown` says exactly that, and falls through, where
         // `Unreadable` would stop a walk and discard the rest of a routine over a version skew.
-        return (String::new(), Vec::new(), Flow::Unknown);
+        return (String::new(), Vec::new(), Flow::Unknown, false);
     }
 
     let mnemonic = format!("{:?}", decoded.mnemonic()).to_lowercase();
     let operands = (0..decoded.op_count())
         .map(|index| read_decoded_operand(&decoded, index))
         .collect();
-    (mnemonic, operands, decoded_flow(&decoded))
+    (
+        mnemonic,
+        operands,
+        decoded_flow(&decoded),
+        decoded.is_privileged(),
+    )
 }
 
 /// One decoded operand.
@@ -6028,6 +6051,9 @@ impl DebugEngine {
                 } else {
                     decoded_flow(&decoded)
                 },
+                // `false` for bytes that did not decode, for the same reason the flow is
+                // `Unknown` there: nothing was read, so nothing is claimed.
+                privileged: !decoded.is_invalid() && decoded.is_privileged(),
             });
         }
         Ok(out)
@@ -8474,6 +8500,79 @@ mod tests {
         );
         assert_eq!(arm64.bytes, "a9bf7bfd");
         assert_eq!(arm64.text, "stp fp,lr,[sp,#-0x10]!");
+    }
+
+    /// Privilege is the **decoder's** answer, which is the whole point of carrying it.
+    ///
+    /// A caller asking "does this driver touch the machine" wants the entire set, and the obvious
+    /// implementation — a list of mnemonics — answers "none" for a driver containing exactly the
+    /// ones nobody remembered. The cases below are chosen to be the ones such a list misses:
+    /// `cli` and `sti` are IOPL-sensitive rather than CPL=0 and read like ordinary flag
+    /// instructions; `clts` and `lmsw` are rare enough to be forgotten; `vmlaunch` is a family of
+    /// its own. iced's table is generated from the instruction set, so all of them answer without
+    /// anyone maintaining a list.
+    ///
+    /// Every encoding here is asserted to have **decoded**, which is not pedantry: the first draft
+    /// used a `vmxon` encoding that was not one, and it failed as `privileged: false` — the same
+    /// answer a genuinely unprivileged instruction gives, and the same one this whole field exists
+    /// to stop being silent.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn test_privilege_is_the_decoders_answer_rather_than_a_list_of_mnemonics() {
+        let decode = |bytes: &str, text: &str| {
+            split_instruction(
+                0x1000,
+                &format!("00001000`00000000 {bytes}    {text}"),
+                InstructionSet::Amd64,
+            )
+        };
+
+        for (bytes, text) in [
+            ("fa", "cli"),
+            ("fb", "sti"),
+            ("0f06", "clts"),
+            ("0f01f0", "lmsw ax"),
+            ("0f01c2", "vmlaunch"),
+            ("0f32", "rdmsr"),
+            ("0f20d8", "mov rax,cr3"),
+        ] {
+            let one = decode(bytes, text);
+            assert_ne!(
+                one.flow,
+                Flow::Unknown,
+                "`{text}` must actually decode, or `privileged` is answering about nothing: {one:?}"
+            );
+            assert!(
+                one.privileged,
+                "`{text}` requires privilege and the decoder knows it: {one:?}"
+            );
+        }
+
+        for (bytes, text) in [
+            ("90", "nop"),
+            ("4889d8", "mov rax,rbx"),
+            ("c3", "ret"),
+            // Reads a counter, needs no privilege, and sits next to `rdmsr` in every list a person
+            // writes from memory.
+            ("0f31", "rdtsc"),
+        ] {
+            let one = decode(bytes, text);
+            assert_ne!(one.flow, Flow::Unknown, "`{text}` must decode: {one:?}");
+            assert!(!one.privileged, "`{text}` needs no privilege: {one:?}");
+        }
+
+        // An instruction set this build does not decode claims nothing, exactly as its flow does:
+        // `false` here means "not asked", which a caller tells apart by reading the flow.
+        let arm64 = split_instruction(
+            0x1000,
+            "00001000`00000000 d4000002     hvc #0",
+            InstructionSet::Other(0xaa64),
+        );
+        assert!(!arm64.privileged);
+        assert_eq!(arm64.flow, Flow::Unknown);
     }
 
     /// The address is the walk's, not the line's. Asserted against a line that disagrees, because
