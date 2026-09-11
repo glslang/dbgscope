@@ -1959,7 +1959,7 @@ pub struct RegisterOperand {
     pub name: String,
     /// The full-width register it belongs to at this target's bitness — `r13`, `rax`, `rip`.
     pub full: String,
-    /// How many bytes this spelling reads or writes — 4 for `eax`, 1 for `ah`.
+    /// How many bytes **this register** holds — 4 for `eax`, 1 for `ah`, 8 for `rax`.
     ///
     /// **What a caller tracking a value needs in order to know it still has all of it.** A `ULONG`
     /// field read with `mov eax,[rdx+18h]` is the whole of it; `movzx ecx,ax` two instructions
@@ -1967,6 +1967,12 @@ pub struct RegisterOperand {
     /// would report a comparison against part of a field as a comparison against the field. The
     /// decoder knows the width because it decoded the register; a consumer deriving it from the
     /// spelling is writing the table this type exists to delete.
+    ///
+    /// **It is the register's width and not the instruction's access.** They differ on the vector
+    /// registers, where an instruction may touch part of one: the `xmm1` in `movss xmm0,xmm1` is
+    /// 16 bytes here while the copy moves four. A general-purpose spelling has no such gap — `ax`
+    /// *is* two bytes — which is the case this field exists for, and a caller reasoning about
+    /// vector lanes needs the mnemonic rather than this.
     pub width: u32,
 }
 
@@ -2041,8 +2047,15 @@ pub enum Condition {
 /// set, which is the point of putting them here rather than in each consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
-    /// A copy, of any width, zero- or sign-extending included.
+    /// A copy, of any width, zero-extending included.
     Move,
+    /// A copy that **sign-extends** what it read.
+    ///
+    /// Apart from [`Self::Move`] because the difference is what the value means afterwards: a
+    /// dword loaded with `movsxd` and added to a base is a *signed* displacement from it, and
+    /// reading it as unsigned puts the result four gigabytes away. A caller that does not care
+    /// matches both.
+    MoveSigned,
     /// An address computation that reads no memory — `lea`.
     LoadAddress,
     /// A comparison that writes only flags — `cmp`.
@@ -2790,7 +2803,8 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
 fn decoded_effect(decoded: &iced_x86::Instruction) -> Effect {
     use iced_x86::Mnemonic;
     match decoded.mnemonic() {
-        Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd => Effect::Move,
+        Mnemonic::Mov | Mnemonic::Movzx => Effect::Move,
+        Mnemonic::Movsx | Mnemonic::Movsxd => Effect::MoveSigned,
         Mnemonic::Lea => Effect::LoadAddress,
         Mnemonic::Cmp => Effect::Compare,
         Mnemonic::Test => Effect::Test,
@@ -8804,6 +8818,17 @@ mod tests {
             "and the width is what says a copy of it is not the whole value"
         );
 
+        // **The width is the register's, not the instruction's access**, and the two differ on a
+        // vector register: `movss` copies four bytes of an `xmm`, which is sixteen. Asserted
+        // because a caller reading this field for "did I keep the whole value" has to know where
+        // that question stops being answerable from it.
+        let scalar = decode("f30f10c1", "movss xmm0,xmm1", InstructionSet::Amd64);
+        assert_eq!(
+            register(&scalar, 1),
+            ("xmm1".to_string(), "zmm1".to_string(), 16),
+            "the register is sixteen bytes however many the copy moves, and it is part of a              `zmm` for the same reason `eax` is part of `rax`: {scalar:?}"
+        );
+
         // And the same instruction decoded as 32-bit code: there is no `rax` on that target.
         let narrow = decode("8bc1", "mov eax,ecx", InstructionSet::X86);
         assert_eq!(
@@ -8886,6 +8911,10 @@ mod tests {
         for (bytes, text, effect, flags) in [
             ("8bc1", "mov eax,ecx", Effect::Move, false),
             ("0fb6c1", "movzx eax,cl", Effect::Move, false),
+            // Apart from the zero-extending copy above, because what the value means afterwards
+            // differs: `movsxd` makes a dword a signed displacement, and a caller adding it to a
+            // base lands four gigabytes away if it reads the two the same.
+            ("4863c1", "movsxd rax,ecx", Effect::MoveSigned, false),
             ("488d0c10", "lea rcx,[rax+rdx]", Effect::LoadAddress, false),
             ("83f804", "cmp eax,4", Effect::Compare, true),
             ("85c0", "test eax,eax", Effect::Test, true),
