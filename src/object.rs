@@ -68,6 +68,12 @@ const MAX_NAME_BYTES: usize = 1024;
 /// in a `USHORT`, and `MAX_PATH` twice over in UTF-16 is well inside it.
 const MAX_TARGET_BYTES: usize = 32_768;
 
+/// The most hash buckets a directory may claim.
+///
+/// Windows uses 37 and has for a long time. This is far above that and far below a count that
+/// would have the walk read for minutes off a [`Layout`] nobody checked.
+const MAX_BUCKETS: usize = 1024;
+
 /// What the object manager calls a directory's type, and the one type name this walk acts on.
 const DIRECTORY: &str = "Directory";
 
@@ -187,6 +193,36 @@ pub struct Layout {
     pub type_name: u32,
 }
 
+impl Layout {
+    /// Whether this describes a target's structures, or merely has the right field names.
+    ///
+    /// Two kinds of check, and the second is the one worth naming. A **width** and a **count** are
+    /// what the walk sizes reads and loops from, so a wrong one panics or runs away. An **offset**
+    /// into a structure the walk reads whole has to be inside what it reads, or the read succeeds
+    /// and the field is taken from past its end. Offsets that are only added to an address are not
+    /// checked: a wrong one reads somewhere else, which comes back as [`ObjectError::Unreadable`]
+    /// naming the address, and there is nothing this could compare it against anyway.
+    fn check(&self) -> Result<(), ObjectError> {
+        let bad = |reason| Err(ObjectError::Malformed { reason });
+        if !matches!(self.pointer, 4 | 8) {
+            return bad("a pointer on this target is neither four bytes nor eight");
+        }
+        if self.buckets == 0 || self.buckets > MAX_BUCKETS {
+            return bad("a directory's bucket count is not one a directory has");
+        }
+        // A `UNICODE_STRING` is read whole: its two lengths, then its buffer.
+        let unicode = (self.unicode_buffer as usize) + self.pointer;
+        if (self.unicode_length as usize) + 4 > unicode {
+            return bad("a UNICODE_STRING's lengths sit outside the structure");
+        }
+        // And the name header is read as far as the string inside it.
+        if (self.name_info_name as usize) + unicode > self.name_info_size as usize {
+            return bad("a name header's string sits outside the name header");
+        }
+        Ok(())
+    }
+}
+
 /// The globals the walk starts from, resolved by symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Globals {
@@ -229,12 +265,27 @@ pub struct Namespace<'a> {
 }
 
 impl<'a> Namespace<'a> {
-    pub fn new(memory: &'a dyn Memory, layout: Layout, globals: Globals) -> Self {
-        Self {
+    /// A walk over some memory, once the layout has been checked.
+    ///
+    /// **The check is here and not in each read**, which is the third answer this seam has had and
+    /// the one that ends it. [`Layout`] is public, so its fields are a caller's to fill in, and
+    /// every one of them is either an index into bytes this walk read or a count it loops on -- a
+    /// width of two had two bytes read and eight taken, a field past the end of its structure was
+    /// the same fault by another route, a bucket count of zero made an empty directory out of a
+    /// full one, and `usize::MAX` overflowed the size arithmetic before any of the guards those
+    /// produced could run. Defending each read found one more of these every round. Checking the
+    /// layout once means the walk below can rely on it, and there is no next one.
+    pub fn new(
+        memory: &'a dyn Memory,
+        layout: Layout,
+        globals: Globals,
+    ) -> Result<Self, ObjectError> {
+        layout.check()?;
+        Ok(Self {
             memory,
             layout,
             globals,
-        }
+        })
     }
 
     /// One global this operation cannot do without.
@@ -751,7 +802,7 @@ impl DebugEngine {
             reason: "this target does not resolve the object manager's globals",
         })?;
         let read = |at: u64, len: usize| self.read_memory(at, len).ok();
-        answer(&Namespace::new(&read, layout, globals))
+        answer(&Namespace::new(&read, layout, globals)?)
     }
 }
 
@@ -943,7 +994,8 @@ mod tests {
     #[test]
     fn a_path_resolves_to_the_object_filed_under_it() {
         let fake = namespace();
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
 
         let found = namespace
             .object_at("\\Device\\MountPointManager")
@@ -969,7 +1021,8 @@ mod tests {
     #[test]
     fn a_name_is_matched_without_regard_to_case() {
         let fake = namespace();
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace
                 .object_at("\\device\\MOUNTPOINTMANAGER")
@@ -983,7 +1036,8 @@ mod tests {
     #[test]
     fn a_missing_component_names_the_directory_it_was_not_in() {
         let fake = namespace();
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.object_at("\\Device\\Nothing"),
             Err(ObjectError::NotFound {
@@ -1000,7 +1054,8 @@ mod tests {
     #[test]
     fn a_leaf_is_not_walked_through() {
         let fake = namespace();
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.object_at("\\Device\\MountPointManager\\Deeper"),
             Err(ObjectError::NotADirectory {
@@ -1014,7 +1069,8 @@ mod tests {
     #[test]
     fn a_directory_lists_what_it_holds() {
         let fake = namespace();
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace
                 .objects_in("\\Device")
@@ -1031,7 +1087,8 @@ mod tests {
     #[test]
     fn a_target_with_no_namespace_says_so_rather_than_answering_empty() {
         let fake = Fake::default();
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.object_at("\\Device"),
             Err(ObjectError::Unreadable {
@@ -1055,7 +1112,8 @@ mod tests {
         fake.pointer(DEVICE_DIR, EMPTY);
         fake.pointer(EMPTY, EMPTY);
         fake.pointer(EMPTY + 0x08, 0);
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.objects_in("\\Device"),
             Err(ObjectError::TooMany {
@@ -1073,7 +1131,8 @@ mod tests {
     #[test]
     fn a_leaf_is_not_listed_as_a_directory() {
         let fake = namespace();
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.objects_in("\\Device\\MountPointManager"),
             Err(ObjectError::NotADirectory {
@@ -1095,7 +1154,8 @@ mod tests {
         fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\X");
         // Everything the link check looks at still holds; only the buffer is gone.
         fake.pointer(LINK + 0x10, 0);
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.link_target(LINK),
             Err(ObjectError::Malformed {
@@ -1112,7 +1172,8 @@ mod tests {
         let entry = DEVICE_DIR + 0x2000;
         fake.pointer(DEVICE_DIR, entry);
         fake.pointer(entry, entry);
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.objects_in("\\Device"),
             Err(ObjectError::TooMany {
@@ -1132,7 +1193,8 @@ mod tests {
         const LINK: u64 = 0xffff_a000_0040_0000;
         fake.flags(LINK, 0);
         fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\MountPointManager");
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.link_target(LINK).as_deref(),
             Ok("\\Device\\MountPointManager")
@@ -1145,7 +1207,8 @@ mod tests {
         fake.flags(CALLBACK, 0);
         fake.pointer(CALLBACK + 0x08, 0xffff_f805_cb41_2341);
         fake.pointer(CALLBACK + 0x10, 0xffff_a000_0050_0000);
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.link_target(CALLBACK),
             Err(ObjectError::Malformed {
@@ -1161,7 +1224,8 @@ mod tests {
         const DOS: u64 = 0xffff_a000_0043_0000;
         fake.flags(DOS, 0);
         fake.string(DOS + 0x08, DOS + 0x1000, "C:\\Windows\\System32");
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.link_target(DOS).as_deref(),
             Ok("C:\\Windows\\System32"),
@@ -1181,7 +1245,8 @@ mod tests {
         // A target that would decode perfectly well, and a flag saying it is not the live arm.
         fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\X");
         fake.flags(LINK, 0);
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.link_target(LINK).as_deref(),
             Ok("\\Device\\X"),
@@ -1189,7 +1254,8 @@ mod tests {
         );
 
         fake.flags(LINK, SYMBOLIC_LINK_CALLBACK);
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.link_target(LINK),
             Err(ObjectError::Malformed {
@@ -1209,7 +1275,8 @@ mod tests {
         let mut fake = namespace();
         // The slot the Device directory's own type index selects, emptied.
         fake.pointer(TYPE_TABLE + 3 * 8, 0);
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.object_at("\\Device\\MountPointManager"),
             Err(ObjectError::Untyped {
@@ -1236,7 +1303,8 @@ mod tests {
         let name_info = header - 0x20;
         // Length past MaximumLength, with the buffer left as it was.
         fake.put(name_info + 0x08, &200u16.to_le_bytes());
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.objects_in("\\Device"),
             Err(ObjectError::Malformed {
@@ -1261,7 +1329,8 @@ mod tests {
         fake.units_named(ODD, &[0x41, 0xd800, 0x42], obfuscated(4, ODD));
         fake.units_named(OTHER, &[0x41, 0xdbff, 0x42], obfuscated(4, OTHER));
         fake.directory(DEVICE_DIR, &[DEVICE, ODD, OTHER]);
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
 
         let listed = namespace
             .objects_in("\\Device")
@@ -1310,7 +1379,8 @@ mod tests {
             type_index_table: None,
             ..globals()
         };
-        let namespace = Namespace::new(&fake, layout(), untyped);
+        let namespace = Namespace::new(&fake, layout(), untyped)
+            .expect("the fixture layout is one this crate builds");
 
         assert_eq!(
             namespace.object_at("\\Device").map(|found| found.address),
@@ -1351,7 +1421,8 @@ mod tests {
             header_cookie: None,
             type_index_table: None,
         };
-        let namespace = Namespace::new(&fake, layout(), nothing);
+        let namespace = Namespace::new(&fake, layout(), nothing)
+            .expect("the fixture layout is one this crate builds");
 
         assert_eq!(
             namespace.link_target(LINK).as_deref(),
@@ -1379,7 +1450,8 @@ mod tests {
         let long = format!("\\Device\\{}", "D".repeat(MAX_NAME_BYTES));
         fake.flags(LINK, 0);
         fake.string(LINK + 0x08, LINK + 0x1000, &long);
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert_eq!(
             namespace.link_target(LINK).as_deref(),
             Ok(long.as_str()),
@@ -1397,41 +1469,69 @@ mod tests {
     #[test]
     fn a_layout_this_crate_did_not_build_is_refused_rather_than_panicked_on() {
         let fake = namespace();
-
-        let narrow = Layout {
-            pointer: 2,
-            ..layout()
+        let refused = |layout: Layout| match Namespace::new(&fake, layout, globals()) {
+            Err(ObjectError::Malformed { reason }) => reason,
+            other => panic!("a layout that is not one was accepted: {:?}", other.is_ok()),
         };
+
+        // Every one of these was a separate defect before the layout was checked in one place: a
+        // width of two had two bytes read and eight taken, `usize::MAX` overflowed the size
+        // arithmetic before any read happened, no buckets made a full directory look empty, too
+        // many kept it reading, and a field past the end of its structure was taken from whatever
+        // followed.
         assert_eq!(
-            Namespace::new(&fake, narrow, globals()).object_at("\\Device"),
-            Err(ObjectError::Malformed {
-                reason: "a pointer on this target is neither four bytes nor eight"
-            })
+            refused(Layout {
+                pointer: 2,
+                ..layout()
+            }),
+            "a pointer on this target is neither four bytes nor eight"
+        );
+        assert_eq!(
+            refused(Layout {
+                pointer: usize::MAX,
+                ..layout()
+            }),
+            "a pointer on this target is neither four bytes nor eight"
+        );
+        assert_eq!(
+            refused(Layout {
+                buckets: 0,
+                ..layout()
+            }),
+            "a directory's bucket count is not one a directory has"
+        );
+        assert_eq!(
+            refused(Layout {
+                buckets: MAX_BUCKETS + 1,
+                ..layout()
+            }),
+            "a directory's bucket count is not one a directory has"
+        );
+        assert_eq!(
+            refused(Layout {
+                unicode_length: 0x40,
+                ..layout()
+            }),
+            "a UNICODE_STRING's lengths sit outside the structure"
+        );
+        assert_eq!(
+            refused(Layout {
+                name_info_name: 0x40,
+                ..layout()
+            }),
+            "a name header's string sits outside the name header"
         );
 
-        // A string field placed past the end of the structure the walk reads for it. The link
-        // itself is whole, so what refuses this is the offset rather than a read that failed.
-        let mut fake = fake;
-        const LINK: u64 = 0xffff_a000_0047_0000;
-        fake.flags(LINK, 0);
-        fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\X");
-        let adrift = Layout {
-            unicode_length: 0x40,
-            ..layout()
-        };
-        assert_eq!(
-            Namespace::new(&fake, adrift, globals()).link_target(LINK),
-            Err(ObjectError::Malformed {
-                reason: "a field sits outside the structure this layout describes"
-            })
-        );
+        // And the one this crate builds is accepted, so the check is not refusing everything.
+        assert!(Namespace::new(&fake, layout(), globals()).is_ok());
     }
 
     /// A path that is not a path is refused before anything is read.
     #[test]
     fn a_path_that_is_not_one_is_refused() {
         let fake = namespace();
-        let namespace = Namespace::new(&fake, layout(), globals());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
         assert!(matches!(
             namespace.object_at("Device"),
             Err(ObjectError::BadPath { .. })
