@@ -53,11 +53,20 @@ const MAX_ENTRIES: usize = 65_536;
 /// The most path components a name may have. `\Device\HarddiskVolume1` is two.
 const MAX_COMPONENTS: usize = 32;
 
-/// The longest object name this reads, in bytes of UTF-16.
+/// The longest object **name** this reads, in bytes of UTF-16.
 ///
 /// `_UNICODE_STRING::Length` is a `USHORT`, so the structure's own limit is 64 KiB; a name that
-/// long is not one the object manager made.
+/// long is not one the object manager made. A name is one component and not a path -- the longest
+/// in `\\Device` on an ordinary machine is a few dozen bytes.
 const MAX_NAME_BYTES: usize = 1024;
+
+/// The longest **link target**, which is a different quantity and needs a bound of its own.
+///
+/// A target is a whole path where a name is one component of one, so holding it to the name bound
+/// refuses a link that is perfectly ordinary, with a message about object names. This is the
+/// structure's own limit rounded down to something a path can reach: `UNICODE_STRING` counts bytes
+/// in a `USHORT`, and `MAX_PATH` twice over in UTF-16 is well inside it.
+const MAX_TARGET_BYTES: usize = 32_768;
 
 /// What the object manager calls a directory's type, and the one type name this walk acts on.
 const DIRECTORY: &str = "Directory";
@@ -71,6 +80,10 @@ const DIRECTORY: &str = "Directory";
 /// token is sandboxed, `8h` masks an access mask, `1h` is a silo check -- which is why this was
 /// measured rather than guessed: the first bit anyone would have tried is the sandbox one.
 const SYMBOLIC_LINK_CALLBACK: u32 = 0x10;
+
+/// The globals a walk names when it has to say which one is missing.
+const ROOT_SYMBOL: &str = "nt!ObpRootDirectoryObject";
+const OFFSETS_SYMBOL: &str = "nt!ObpInfoMaskToOffset";
 
 /// Why a namespace walk could not answer.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -103,6 +116,13 @@ pub enum ObjectError {
     /// exactly the case it is for -- but it refuses saying it could not tell.
     #[error("{component:?} could not be typed, so this walk will not descend through it")]
     Untyped { component: String },
+    /// A global this operation needs is not one the target resolves.
+    ///
+    /// Per operation rather than per walk: reading a symbolic link needs none of the namespace's
+    /// globals, and taking it away because the root pointer was renamed would refuse something this
+    /// target can perfectly well answer.
+    #[error("this target does not resolve {what}, which this operation reads")]
+    Unavailable { what: &'static str },
     /// A cap was reached, so what this could answer with is a **short** list.
     #[error("{what} exceeded its bound of {bound}, so this list would be shorter than the truth")]
     TooMany { what: &'static str, bound: usize },
@@ -171,10 +191,10 @@ pub struct Layout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Globals {
     /// `nt!ObpRootDirectoryObject` — a pointer to the root directory, not the directory.
-    pub root: u64,
+    pub root: Option<u64>,
     /// `nt!ObpInfoMaskToOffset` — a byte per `InfoMask` combination, saying how far before the
     /// header the optional headers sit.
-    pub info_mask_to_offset: u64,
+    pub info_mask_to_offset: Option<u64>,
     /// `nt!ObHeaderCookie` and `nt!ObTypeIndexTable`, which together turn a header's obfuscated
     /// `TypeIndex` into a type object. Optional: a build without them still resolves names, and a
     /// `type_name` of `None` is the honest answer there.
@@ -215,6 +235,17 @@ impl<'a> Namespace<'a> {
             layout,
             globals,
         }
+    }
+
+    /// One global this operation cannot do without.
+    ///
+    /// **Asked for where it is used rather than where the set is built**, because the operations
+    /// here need different subsets and a walk that resolved the union of them would take reading a
+    /// symbolic link away from a target that merely renamed the root pointer. The layout is not
+    /// treated this way and deliberately: every type in it comes out of one PDB, so a partial
+    /// answer there is not a thing a real target produces.
+    fn needs(&self, global: Option<u64>, what: &'static str) -> Result<u64, ObjectError> {
+        global.ok_or(ObjectError::Unavailable { what })
     }
 
     fn read(&self, at: u64, len: usize) -> Result<Vec<u8>, ObjectError> {
@@ -275,7 +306,12 @@ impl<'a> Namespace<'a> {
     }
 
     /// One `_UNICODE_STRING`, read from wherever it sits.
-    fn unicode_at(&self, at: u64) -> Result<(String, bool), ObjectError> {
+    fn unicode_at(
+        &self,
+        at: u64,
+        bound: usize,
+        what: &'static str,
+    ) -> Result<(String, bool), ObjectError> {
         let size = (self.layout.unicode_buffer as usize) + self.layout.pointer;
         let bytes = self.read(at, size)?;
         let field = |offset: u32| {
@@ -307,11 +343,8 @@ impl<'a> Namespace<'a> {
                 reason: "a UNICODE_STRING's length is not a whole number of UTF-16 units",
             });
         }
-        if length > MAX_NAME_BYTES {
-            return Err(ObjectError::TooMany {
-                what: "an object name",
-                bound: MAX_NAME_BYTES,
-            });
+        if length > bound {
+            return Err(ObjectError::TooMany { what, bound });
         }
         let raw = self.read(buffer, length)?;
         Ok(utf16(&raw[..length]))
@@ -334,8 +367,7 @@ impl<'a> Namespace<'a> {
         // including* the one wanted, which is what the bit and every bit below it select.
         let index = mask & (INFO_MASK_NAME | (INFO_MASK_NAME - 1));
         let distance = self.read(
-            self.globals
-                .info_mask_to_offset
+            self.needs(self.globals.info_mask_to_offset, OFFSETS_SYMBOL)?
                 .wrapping_add(u64::from(index)),
             1,
         )?[0];
@@ -347,6 +379,8 @@ impl<'a> Namespace<'a> {
         let name_info = header.wrapping_sub(u64::from(distance));
         Ok(Some(self.unicode_at(
             name_info.wrapping_add(u64::from(self.layout.name_info_name)),
+            MAX_NAME_BYTES,
+            "an object name",
         )?))
     }
 
@@ -394,7 +428,11 @@ impl<'a> Namespace<'a> {
             return None;
         }
         let (name, _) = self
-            .unicode_at(entry.wrapping_add(u64::from(self.layout.type_name)))
+            .unicode_at(
+                entry.wrapping_add(u64::from(self.layout.type_name)),
+                MAX_NAME_BYTES,
+                "a type name",
+            )
             .ok()?;
         (!name.is_empty()).then_some(name)
     }
@@ -420,7 +458,7 @@ impl<'a> Namespace<'a> {
     /// Resolves a path to the object filed under it.
     pub fn object_at(&self, path: &str) -> Result<KernelObject, ObjectError> {
         let components = components_of(path)?;
-        let mut directory = self.pointer_at(self.globals.root)?;
+        let mut directory = self.pointer_at(self.needs(self.globals.root, ROOT_SYMBOL)?)?;
         if directory == 0 {
             return Err(ObjectError::Malformed {
                 reason: "the root directory pointer is null",
@@ -475,7 +513,7 @@ impl<'a> Namespace<'a> {
     /// thirty-seven bucket pointers and whatever they hold followed as chains.
     pub fn objects_in(&self, path: &str) -> Result<Vec<KernelObject>, ObjectError> {
         let directory = match path.trim_end_matches('\\') {
-            "" => self.pointer_at(self.globals.root)?,
+            "" => self.pointer_at(self.needs(self.globals.root, ROOT_SYMBOL)?)?,
             path => {
                 let found = self.object_at(path)?;
                 match found.type_name.as_deref() {
@@ -540,7 +578,7 @@ impl<'a> Namespace<'a> {
                 reason: "the link target is not a string this can vouch for",
             });
         }
-        let (target, exact) = self.unicode_at(at)?;
+        let (target, exact) = self.unicode_at(at, MAX_TARGET_BYTES, "a link target")?;
         if !exact {
             return Err(ObjectError::Malformed {
                 reason: "the link target is not text, so it is not a path to follow",
@@ -660,8 +698,8 @@ impl DebugEngine {
     /// because a build that renamed or inlined them still resolves paths.
     pub fn object_globals(&self) -> Result<Globals, DbgEngError> {
         Ok(Globals {
-            root: self.symbol_offset("nt!ObpRootDirectoryObject")?,
-            info_mask_to_offset: self.symbol_offset("nt!ObpInfoMaskToOffset")?,
+            root: self.symbol_offset("nt!ObpRootDirectoryObject").ok(),
+            info_mask_to_offset: self.symbol_offset("nt!ObpInfoMaskToOffset").ok(),
             header_cookie: self.symbol_offset("nt!ObHeaderCookie").ok(),
             type_index_table: self.symbol_offset("nt!ObTypeIndexTable").ok(),
         })
@@ -741,8 +779,8 @@ mod tests {
 
     fn globals() -> Globals {
         Globals {
-            root: ROOT_POINTER,
-            info_mask_to_offset: INFO_OFFSETS,
+            root: Some(ROOT_POINTER),
+            info_mask_to_offset: Some(INFO_OFFSETS),
             header_cookie: Some(COOKIE),
             type_index_table: Some(TYPE_TABLE),
         }
@@ -1287,6 +1325,60 @@ mod tests {
                 component: "Device".to_string()
             }),
             "and descending is refused, saying which of the two it is"
+        );
+    }
+
+    /// A link is read on a target that resolves **none** of the namespace's globals.
+    ///
+    /// Reading one needs the symbolic link's own layout and nothing else: not the root pointer, not
+    /// the optional-header offsets, not the type table. Requiring the set would take an answer this
+    /// target can give away because of a symbol it never reads -- which is the third round of
+    /// findings this seam produced, and why the globals are now asked for one at a time.
+    #[test]
+    fn a_link_is_read_with_none_of_the_namespaces_globals() {
+        let mut fake = namespace();
+        const LINK: u64 = 0xffff_a000_0045_0000;
+        fake.flags(LINK, 0);
+        fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\MountPointManager");
+        let nothing = Globals {
+            root: None,
+            info_mask_to_offset: None,
+            header_cookie: None,
+            type_index_table: None,
+        };
+        let namespace = Namespace::new(&fake, layout(), nothing);
+
+        assert_eq!(
+            namespace.link_target(LINK).as_deref(),
+            Ok("\\Device\\MountPointManager"),
+            "the link reads, because it needs none of them"
+        );
+        assert_eq!(
+            namespace.object_at("\\Device"),
+            Err(ObjectError::Unavailable {
+                what: "nt!ObpRootDirectoryObject"
+            }),
+            "and a walk says which one it wanted"
+        );
+    }
+
+    /// A link target is bounded as a **path**, not as a name.
+    ///
+    /// A name is one component and a target is a whole path, so holding the second to the first's
+    /// bound refuses an ordinary link -- with a message about object names, which is the tell.
+    #[test]
+    fn a_link_target_is_bounded_as_a_path_rather_than_as_a_name() {
+        let mut fake = namespace();
+        const LINK: u64 = 0xffff_a000_0046_0000;
+        // Longer than a name may be, and far inside what a path may be.
+        let long = format!("\\Device\\{}", "D".repeat(MAX_NAME_BYTES));
+        fake.flags(LINK, 0);
+        fake.string(LINK + 0x08, LINK + 0x1000, &long);
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.link_target(LINK).as_deref(),
+            Ok(long.as_str()),
+            "a target this long is a path, not a name that got out of hand"
         );
     }
 
