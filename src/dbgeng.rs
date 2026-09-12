@@ -2169,6 +2169,41 @@ pub struct Instruction {
     /// The decoder's own answer, so "which instruction set the flags this branch is reading" needs
     /// no list of arithmetic mnemonics -- the list that forgets `bt`, `cmpxchg` and `neg`.
     pub writes_flags: bool,
+    /// Every register the instruction **writes**, explicit and implicit.
+    ///
+    /// [`Self::operands`] says what an instruction was written with; this says what it leaves
+    /// changed, and the two differ in the places that cost a consumer most. A pass tracking a value
+    /// through a routine has to know when to stop believing in it, and inferring that from the
+    /// first operand is right for the shapes a compiler emits and wrong for two it also emits:
+    ///
+    /// * **A second explicit destination.** `xchg eax,r13d` writes both. A consumer that clears the
+    ///   first goes on believing whatever it knew about `r13`, which now holds the old `eax`.
+    /// * **An implicit destination.** `mul ecx` writes `eax` and `edx` and names neither, as do
+    ///   `div`, `cpuid`, `rdmsr`, `cmpxchg`'s `rax` and the string instructions' `rsi`/`rdi`/`rcx`.
+    ///
+    /// Both were live defects in `windbg-mcp`'s IOCTL recovery, where a control code surviving in a
+    /// register an unmodelled instruction had overwritten is published as a code the driver
+    /// accepts. The alternative to this field is the mnemonic table this type exists to delete.
+    ///
+    /// **A conditional write is in the list**, because a consumer that must not believe a stale
+    /// value wants the conservative answer: `cmovne eax,ecx` may or may not have changed `eax`, and
+    /// neither answer about its contents is safe afterwards. A **read-write** operand is here *and*
+    /// in `operands`, those being different questions.
+    ///
+    /// The flags are not registers here: [`Self::writes_flags`] is that question, and this list
+    /// holds only what a register name refers to.
+    ///
+    /// **A register is named as the *write* reaches it, which is not always how the operand was
+    /// spelled.** On x64 a 32-bit write zeroes the upper half, so `mov eax,1` appears here as
+    /// `rax` — eight bytes — while [`Self::operands`] has the `eax` the instruction was written
+    /// with. That is the useful answer for the question this field is for (which register no
+    /// longer holds what it did), and it is the reason to match these against
+    /// [`RegisterOperand::full`] rather than against a spelling.
+    ///
+    /// Empty for an instruction set this build does not decode, for the same reason
+    /// [`Flow::Unknown`] is the flow there -- nothing was read, so nothing is claimed, and a
+    /// consumer that needs the difference reads the flow.
+    pub writes: Vec<RegisterOperand>,
 }
 
 /// The engine's current **scope**: which instruction, which frame, and the register context
@@ -2698,6 +2733,7 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
         effect: decoded.effect,
         condition: decoded.condition,
         writes_flags: decoded.writes_flags,
+        writes: decoded.writes,
     }
 }
 
@@ -2725,6 +2761,7 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
 /// listing prints and this crate has always promised `u`'s own output. In principle the two could
 /// disagree on an encoding one decoder knows and the other does not; they are the same bytes, and
 /// the fields say which reading they came from.
+#[derive(Debug)]
 struct Decoded {
     mnemonic: String,
     operands: Vec<Operand>,
@@ -2733,6 +2770,7 @@ struct Decoded {
     effect: Effect,
     condition: Option<Condition>,
     writes_flags: bool,
+    writes: Vec<RegisterOperand>,
 }
 
 impl Decoded {
@@ -2746,6 +2784,7 @@ impl Decoded {
             effect: Effect::Other,
             condition: None,
             writes_flags: false,
+            writes: Vec::new(),
         }
     }
 }
@@ -2790,7 +2829,44 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
         // Any flag at all: what a caller is asking is "did this set the flags the branch after it
         // reads", and the decoder knows which bits each instruction writes.
         writes_flags: decoded.rflags_written() != 0,
+        writes: written_registers(&decoded, bitness),
     }
+}
+
+/// Every register an instruction writes, explicit and implicit.
+///
+/// iced's instruction *info* rather than its operands, which is the whole point: the operand list
+/// is what the instruction was written with, and the info is what it touches. `mul ecx` names one
+/// register and writes three.
+///
+/// A **conditional** write counts, because the question a consumer asks is "may this register have
+/// changed" and the conservative answer is the only safe one. `OpAccess::NoMemAccess` is about
+/// memory rather than about a register and cannot appear here; it is matched with the reads so the
+/// arms stay exhaustive over the enum rather than over a wildcard, which is what keeps this honest
+/// when iced adds one.
+fn written_registers(decoded: &iced_x86::Instruction, bitness: u32) -> Vec<RegisterOperand> {
+    use iced_x86::{OpAccess, Register};
+    let mut info = iced_x86::InstructionInfoFactory::new();
+    let mut written: Vec<RegisterOperand> = Vec::new();
+    for used in info.info(decoded).used_registers() {
+        let writes = match used.access() {
+            OpAccess::Write
+            | OpAccess::CondWrite
+            | OpAccess::ReadWrite
+            | OpAccess::ReadCondWrite => true,
+            OpAccess::None | OpAccess::Read | OpAccess::CondRead | OpAccess::NoMemAccess => false,
+        };
+        if !writes || used.register() == Register::None {
+            continue;
+        }
+        let operand = register_operand(used.register(), bitness);
+        // iced reports a register once per access kind, and an instruction can name one twice;
+        // what a consumer wants is the set.
+        if !written.iter().any(|seen| seen.name == operand.name) {
+            written.push(operand);
+        }
+    }
+    written
 }
 
 /// What the instruction does to its operands, from the decoder's own mnemonic rather than from the
@@ -6318,6 +6394,10 @@ impl DebugEngine {
                     .then(|| decoded_condition(&decoded))
                     .flatten(),
                 writes_flags: !decoded.is_invalid() && decoded.rflags_written() != 0,
+                writes: match decoded.is_invalid() {
+                    true => Vec::new(),
+                    false => written_registers(&decoded, bitness),
+                },
             });
         }
         Ok(out)
@@ -8935,6 +9015,108 @@ mod tests {
             assert_eq!(one.effect, effect, "`{text}`: {one:?}");
             assert_eq!(one.writes_flags, flags, "`{text}` flags: {one:?}");
         }
+    }
+
+    /// An instruction says which registers it **writes**, which its operands do not.
+    ///
+    /// A consumer tracking a value has to know when to stop believing in it, and the obvious
+    /// implementation -- the first operand -- is right for the shapes a compiler emits and wrong
+    /// for two it also emits. Both are here: `xchg` writes its *second* operand as well, and `mul`,
+    /// `cpuid` and the string instructions write registers they do not name at all. A consumer
+    /// that clears the first operand goes on believing whatever it knew about the rest, which is
+    /// how a stale control code becomes a code a driver is reported to accept.
+    ///
+    /// `cmovne` is in the list because its write is **conditional**: what a consumer asks is
+    /// whether a register may have changed, and the only safe answer to that is yes.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn test_an_instruction_says_which_registers_it_writes() {
+        let writes = |bytes: &str| {
+            let raw = hex::decode(bytes).expect("the fixture is hex");
+            let decoded = decode_operation(&raw, 0x1000, InstructionSet::Amd64);
+            assert_ne!(
+                decoded.flow,
+                Flow::Unknown,
+                "`{bytes}` must decode: {decoded:?}"
+            );
+            let mut full: Vec<String> = decoded.writes.iter().map(|w| w.full.clone()).collect();
+            full.sort();
+            (decoded.mnemonic.clone(), full)
+        };
+
+        // A plain move, and the asymmetry worth knowing: the operand is `eax` and the write
+        // reaches the whole of `rax`, because a 32-bit write zeroes the upper half.
+        assert_eq!(
+            writes("b801000000"),
+            ("mov".to_string(), vec!["rax".to_string()])
+        );
+
+        // Both operands, which is what an instruction's *first* one cannot say.
+        assert_eq!(
+            writes("91"),
+            (
+                "xchg".to_string(),
+                vec!["rax".to_string(), "rcx".to_string()]
+            )
+        );
+        assert_eq!(
+            writes("4195"),
+            (
+                "xchg".to_string(),
+                vec!["r13".to_string(), "rax".to_string()]
+            )
+        );
+
+        // And the ones that name none of what they write.
+        assert_eq!(
+            writes("f7e1"),
+            (
+                "mul".to_string(),
+                vec!["rax".to_string(), "rdx".to_string()]
+            ),
+            "`mul ecx` names `ecx` and writes neither of these"
+        );
+        assert_eq!(
+            writes("0fa2"),
+            (
+                "cpuid".to_string(),
+                vec![
+                    "rax".to_string(),
+                    "rbx".to_string(),
+                    "rcx".to_string(),
+                    "rdx".to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            writes("f3a5"),
+            (
+                "movsd".to_string(),
+                vec!["rcx".to_string(), "rdi".to_string(), "rsi".to_string()]
+            ),
+            "a repeated string move walks both pointers and the count"
+        );
+
+        // A conditional write counts, because "may this have changed" is the question.
+        assert_eq!(
+            writes("0f45c1"),
+            ("cmovne".to_string(), vec!["rax".to_string()])
+        );
+
+        // And an instruction that writes only the flags writes no register.
+        assert_eq!(writes("3bc1"), ("cmp".to_string(), Vec::new()));
+
+        // An instruction set this build does not decode claims nothing, as its flow says.
+        let undecoded = decode_operation(
+            &[0x00, 0x01, 0x02, 0x03],
+            0x1000,
+            InstructionSet::Other(0xaa64),
+        );
+        assert_eq!(undecoded.flow, Flow::Unknown);
+        assert!(undecoded.writes.is_empty(), "{undecoded:?}");
     }
 
     /// Privilege is the **decoder's** answer, which is the whole point of carrying it.
