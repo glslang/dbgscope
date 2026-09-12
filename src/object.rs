@@ -68,6 +68,15 @@ const MAX_NAME_BYTES: usize = 1024;
 /// in a `USHORT`, and `MAX_PATH` twice over in UTF-16 is well inside it.
 const MAX_TARGET_BYTES: usize = 32_768;
 
+/// The most any structure this walk reads may be, in bytes.
+///
+/// Every one of them is tens of bytes: `_OBJECT_HEADER` is 0x30, a name header 0x20, a
+/// `UNICODE_STRING` 0x10. A bound on the *relation* between offsets is not a bound on their size --
+/// a buffer offset of nearly four gigabytes satisfies every ordering this checks and then asks the
+/// target for a read that large, which is an allocation failure rather than a refusal. So the
+/// magnitudes are bounded too, and every sum that reaches this is checked.
+const MAX_STRUCTURE: usize = 4096;
+
 /// The most hash buckets a directory may claim.
 ///
 /// Windows uses 37 and has for a long time. This is far above that and far below a count that
@@ -209,6 +218,29 @@ impl Layout {
         }
         if self.buckets == 0 || self.buckets > MAX_BUCKETS {
             return bad("a directory's bucket count is not one a directory has");
+        }
+        // **Every offset is small before any of them is added to another.** These describe
+        // structures of tens of bytes, so anything near a `u32`'s range is not one of them -- and
+        // checking that first is what stops a sum overflowing on a 32-bit host and what stops a
+        // read being asked for in gigabytes.
+        let fields = [
+            self.hash_buckets,
+            self.entry_chain,
+            self.entry_object,
+            self.header_body,
+            self.header_type_index,
+            self.header_info_mask,
+            self.header_security,
+            self.name_info_name,
+            self.name_info_size,
+            self.unicode_length,
+            self.unicode_buffer,
+            self.link_target,
+            self.link_flags,
+            self.type_name,
+        ];
+        if fields.iter().any(|offset| *offset as usize > MAX_STRUCTURE) {
+            return bad("a field sits further into its structure than any of these reach");
         }
         // A `UNICODE_STRING` is read whole: its two lengths, then its buffer.
         let unicode = (self.unicode_buffer as usize) + self.pointer;
@@ -585,6 +617,16 @@ impl<'a> Namespace<'a> {
     /// of the path, and without it `\Device\MountPointManager` has a driver's own fields read as
     /// thirty-seven bucket pointers and whatever they hold followed as chains.
     pub fn objects_in(&self, path: &str) -> Result<Vec<KernelObject>, ObjectError> {
+        // **The root is `\\`, and nothing else is.** Trimming first made the empty string the
+        // same value, so a caller whose argument was missing listed the root and got a successful
+        // answer about a directory it never asked for. `object_at` has always refused that; this
+        // refuses it the same way rather than having two answers to one question.
+        if !path.starts_with('\\') {
+            return Err(ObjectError::BadPath {
+                path: path.to_string(),
+                reason: "an object path begins at the root, with a backslash",
+            });
+        }
         let directory = match path.trim_end_matches('\\') {
             "" => self.pointer_at(self.needs(self.globals.root, ROOT_SYMBOL)?)?,
             path => {
@@ -1521,9 +1563,54 @@ mod tests {
             }),
             "a name header's string sits outside the name header"
         );
+        // **A relation is not a magnitude**, which is the gap the checks above left: these offsets
+        // are ordered exactly as a real layout's are, and describe a structure of nearly four
+        // gigabytes. What that reaches is a read asked for in gigabytes, which is an allocation
+        // failure rather than a refusal.
+        assert_eq!(
+            refused(Layout {
+                pointer: 4,
+                unicode_buffer: u32::MAX - 4,
+                name_info_name: 0,
+                name_info_size: u32::MAX,
+                ..layout()
+            }),
+            "a field sits further into its structure than any of these reach"
+        );
 
         // And the one this crate builds is accepted, so the check is not refusing everything.
         assert!(Namespace::new(&fake, layout(), globals()).is_ok());
+    }
+
+    /// Listing with **no path at all** is refused, not answered about the root.
+    ///
+    /// `\\` is the root and nothing else is. Trimming first made the empty string the same
+    /// value, so an argument that went missing came back as a successful listing of a directory
+    /// nobody asked about -- and `object_at` had always refused it, so one question had two
+    /// answers.
+    #[test]
+    fn listing_with_no_path_is_refused_rather_than_answered_about_the_root() {
+        let fake = namespace();
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
+        assert!(
+            matches!(namespace.objects_in(""), Err(ObjectError::BadPath { .. })),
+            "an empty path is not the root"
+        );
+        assert!(
+            matches!(
+                namespace.objects_in("Device"),
+                Err(ObjectError::BadPath { .. })
+            ),
+            "and neither is one that does not begin at it"
+        );
+        assert_eq!(
+            namespace
+                .objects_in("\\")
+                .map(|found| found.into_iter().map(|one| one.name).collect::<Vec<_>>()),
+            Ok(vec!["Device".to_string()]),
+            "while the root itself still lists"
+        );
     }
 
     /// A path that is not a path is refused before anything is read.
