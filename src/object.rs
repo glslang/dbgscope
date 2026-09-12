@@ -563,6 +563,14 @@ impl<'a> Namespace<'a> {
     /// Resolves a path to the object filed under it.
     pub fn object_at(&self, path: &str) -> Result<KernelObject, ObjectError> {
         let components = components_of(path)?;
+        // The root is a directory rather than an object in one, so there is nothing here to
+        // resolve. `objects_in` is the call that answers about it.
+        if components.is_empty() {
+            return Err(ObjectError::BadPath {
+                path: path.to_string(),
+                reason: "it names the root directory rather than an object in it",
+            });
+        }
         let mut directory = self.pointer_at(self.needs(self.globals.root, ROOT_SYMBOL)?)?;
         if directory == 0 {
             return Err(ObjectError::Malformed {
@@ -617,19 +625,13 @@ impl<'a> Namespace<'a> {
     /// of the path, and without it `\Device\MountPointManager` has a driver's own fields read as
     /// thirty-seven bucket pointers and whatever they hold followed as chains.
     pub fn objects_in(&self, path: &str) -> Result<Vec<KernelObject>, ObjectError> {
-        // **The root is `\\`, and nothing else is.** Trimming first made the empty string the
-        // same value, so a caller whose argument was missing listed the root and got a successful
-        // answer about a directory it never asked for. `object_at` has always refused that; this
-        // refuses it the same way rather than having two answers to one question.
-        if !path.starts_with('\\') {
-            return Err(ObjectError::BadPath {
-                path: path.to_string(),
-                reason: "an object path begins at the root, with a backslash",
-            });
-        }
-        let directory = match path.trim_end_matches('\\') {
-            "" => self.pointer_at(self.needs(self.globals.root, ROOT_SYMBOL)?)?,
-            path => {
+        // **The same parser `object_at` uses**, which is the point rather than a tidy-up: this
+        // had its own, and the two disagreed twice -- an empty argument listed the root, and so
+        // did a path of nothing but separators, both of which `object_at` refused. One question
+        // with two answers depending on which door it came through.
+        let directory = match components_of(path)?.is_empty() {
+            true => self.pointer_at(self.needs(self.globals.root, ROOT_SYMBOL)?)?,
+            false => {
                 let found = self.object_at(path)?;
                 match found.type_name.as_deref() {
                     Some(DIRECTORY) => {}
@@ -712,15 +714,19 @@ fn components_of(path: &str) -> Result<Vec<String>, ObjectError> {
     if !path.starts_with('\\') {
         return Err(bad("an object path begins at the root, with a backslash"));
     }
-    let parts: Vec<String> = path
-        .split('\\')
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect();
-    if parts.is_empty() {
-        return Err(bad(
-            "it names the root directory rather than an object in it",
-        ));
+    // The root, which is the one path with no components in it.
+    if path == "\\" {
+        return Ok(Vec::new());
+    }
+    // One trailing separator is a caller's convenience and is dropped. **An empty component
+    // anywhere else is refused rather than dropped**, which is where the leniency here used to
+    // be: filtering them turned `\\Device\\\\X` into `\\Device\\X` and `\\\\` into the root, so a path
+    // that is not one quietly became a path that is -- and a listing answered about a directory
+    // nobody named.
+    let body = path.strip_suffix('\\').unwrap_or(path);
+    let parts: Vec<String> = body[1..].split('\\').map(str::to_string).collect();
+    if parts.iter().any(String::is_empty) {
+        return Err(bad("it has a component with no name in it"));
     }
     if parts.len() > MAX_COMPONENTS {
         return Err(bad("it has more components than the namespace is deep"));
@@ -1593,23 +1599,44 @@ mod tests {
         let fake = namespace();
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
-        assert!(
-            matches!(namespace.objects_in(""), Err(ObjectError::BadPath { .. })),
-            "an empty path is not the root"
-        );
+
+        // **Every one of these used to list the root**, each through a different hole in a parser
+        // `objects_in` kept for itself: nothing at all, a path that never begins at the root, and
+        // a path of separators with no name between them. `object_at` refused all three.
+        for path in ["", "Device", "\\\\", "\\\\\\"] {
+            assert!(
+                matches!(namespace.objects_in(path), Err(ObjectError::BadPath { .. })),
+                "{path:?} is not the root"
+            );
+            assert!(
+                matches!(namespace.object_at(path), Err(ObjectError::BadPath { .. })),
+                "{path:?} is not an object either, and the two agree now"
+            );
+        }
+
+        // Nor is a path whose components are not all named.
         assert!(
             matches!(
-                namespace.objects_in("Device"),
+                namespace.object_at("\\Device\\\\MountPointManager"),
                 Err(ObjectError::BadPath { .. })
             ),
-            "and neither is one that does not begin at it"
+            "an empty component is refused rather than dropped"
+        );
+
+        let root = |path: &str| {
+            namespace
+                .objects_in(path)
+                .map(|found| found.into_iter().map(|one| one.name).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            root("\\"),
+            Ok(vec!["Device".to_string()]),
+            "while the root itself lists"
         );
         assert_eq!(
-            namespace
-                .objects_in("\\")
-                .map(|found| found.into_iter().map(|one| one.name).collect::<Vec<_>>()),
-            Ok(vec!["Device".to_string()]),
-            "while the root itself still lists"
+            namespace.objects_in("\\Device\\").map(|found| found.len()),
+            Ok(1),
+            "and one trailing separator is still a caller's convenience"
         );
     }
 
