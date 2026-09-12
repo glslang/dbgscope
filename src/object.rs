@@ -1,0 +1,896 @@
+//! The kernel **object namespace**, walked by name.
+//!
+//! `\Device\MountPointManager` is not an address, and nothing in [`crate::dbgeng`] could turn it
+//! into one: a symbol names code and data the linker placed, while an object is created at run
+//! time and filed under a name in a tree the object manager keeps. The debugger's own answer to
+//! this is `!object`, which is an extension command printing text; this is the same walk answering
+//! in values.
+//!
+//! # What the walk is
+//!
+//! `nt!ObpRootDirectoryObject` points at the root [`_OBJECT_DIRECTORY`]. A directory is an array
+//! of hash buckets, each a chain of `_OBJECT_DIRECTORY_ENTRY`, each pointing at an object **body**.
+//! The name of a body is not in the body: it is in an `_OBJECT_HEADER_NAME_INFO` that sits *before*
+//! the `_OBJECT_HEADER`, present only when the header's `InfoMask` says so, at a distance the
+//! kernel looks up in `nt!ObpInfoMaskToOffset`. So resolving one path component means enumerating
+//! a directory and reading a name out from under every object in it.
+//!
+//! **Every bucket is walked rather than the one the name hashes to.** The hash is the object
+//! manager's own, over a case-folded name using the kernel's upcase table, and a wrong reimplementation
+//! of it does not fail — it looks in the wrong bucket and reports that the object does not exist,
+//! which is the answer a caller would act on. A directory holds tens of entries, so walking all of
+//! them costs nothing worth having that risk for.
+//!
+//! # What it refuses
+//!
+//! Every list is capped, and a cap is an **error rather than a short list**. A namespace is data
+//! this crate did not write: a corrupt chain is a cycle, and a directory reported shorter than it
+//! is answers "which symbolic links point here" wrongly, which is the one thing a security question
+//! must not do.
+//!
+//! Names are compared with an **ASCII** case fold, which is what device and directory names are in
+//! practice and is stated rather than hidden: the kernel folds with its own upcase table, so a name
+//! differing only outside ASCII compares unequal here where the object manager would match it.
+//!
+//! # Where it works
+//!
+//! A live kernel, and a kernel dump complete enough to carry `nt`'s data pages. It does **not**
+//! work on a kernel minidump: measured against `docs/samples/081226-2187-01.dmp` in the consumer,
+//! `nt!ObpRootDirectoryObject` itself reads `????????`, so the walk stops at its first read and
+//! says so rather than reporting an empty namespace.
+
+use thiserror::Error;
+
+use crate::dbgeng::{DbgEngError, DebugEngine};
+
+/// The most entries one directory may hold before the walk refuses it.
+///
+/// `\GLOBAL??` on a busy machine holds a few thousand; this is well above that and far below a
+/// chain that has looped. It bounds the whole directory rather than one bucket, because a cycle
+/// can be spread across buckets as easily as kept inside one.
+const MAX_ENTRIES: usize = 65_536;
+
+/// The most path components a name may have. `\Device\HarddiskVolume1` is two.
+const MAX_COMPONENTS: usize = 32;
+
+/// The longest object name this reads, in bytes of UTF-16.
+///
+/// `_UNICODE_STRING::Length` is a `USHORT`, so the structure's own limit is 64 KiB; a name that
+/// long is not one the object manager made.
+const MAX_NAME_BYTES: usize = 1024;
+
+/// Why a namespace walk could not answer.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ObjectError {
+    /// Target memory that would not read. On a kernel minidump this is the first thing that
+    /// happens, and it names the address so that the answer is "this target has no namespace"
+    /// rather than "this namespace is empty".
+    #[error("could not read {len} bytes of the object namespace at {at:#x}")]
+    Unreadable { at: u64, len: usize },
+    /// A structure whose fields contradict themselves.
+    #[error("the object namespace is malformed: {reason}")]
+    Malformed { reason: &'static str },
+    /// A path that is not one the object manager could have filed anything under.
+    #[error("{path:?} is not an object path: {reason}")]
+    BadPath { path: String, reason: &'static str },
+    /// Every component before this one resolved, and this one is not in its directory.
+    #[error("{component:?} is not in {directory:?}")]
+    NotFound {
+        directory: String,
+        component: String,
+    },
+    /// A component resolved to something that is not a directory, with path left to walk.
+    #[error("{component:?} is not a directory, so {rest:?} cannot be under it")]
+    NotADirectory { component: String, rest: String },
+    /// A cap was reached, so what this could answer with is a **short** list.
+    #[error("{what} exceeded its bound of {bound}, so this list would be shorter than the truth")]
+    TooMany { what: &'static str, bound: usize },
+}
+
+/// One object, as much of it as the namespace says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelObject {
+    /// The object **body** — what a handle resolves to, and what `!devobj` and friends take.
+    pub address: u64,
+    /// Its name in the directory that holds it, not a path.
+    pub name: String,
+    /// The object type's name (`Device`, `SymbolicLink`, `Directory`), when the type table could
+    /// be read. `None` is "this walk could not say", never "untyped".
+    pub type_name: Option<String>,
+    /// `_OBJECT_HEADER::SecurityDescriptor`, with the three low bits the object manager keeps its
+    /// own flags in masked off. `None` where the object carries none.
+    pub security_descriptor: Option<u64>,
+}
+
+/// Where the fields this walk reads live, taken from the **target's own type information**.
+///
+/// Not one literal offset, and that is the point: `_OBJECT_HEADER` has moved between Windows
+/// versions and `_OBJECT_DIRECTORY`'s bucket count is a build's choice. A table of constants here
+/// would decode a different build confidently and wrongly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// A pointer's width on this target, **derived** from the distance between the two pointer
+    /// fields of a directory entry rather than assumed from the host.
+    pub pointer: usize,
+    /// How many hash buckets a directory has, derived the same way: the span from the array to the
+    /// field after it, over a pointer.
+    pub buckets: usize,
+    /// `_OBJECT_DIRECTORY::HashBuckets`.
+    pub hash_buckets: u32,
+    /// `_OBJECT_DIRECTORY_ENTRY::ChainLink` and `::Object`.
+    pub entry_chain: u32,
+    pub entry_object: u32,
+    /// `_OBJECT_HEADER::Body`, which is how far *back* a body's header is.
+    pub header_body: u32,
+    pub header_type_index: u32,
+    pub header_info_mask: u32,
+    pub header_security: u32,
+    /// `_OBJECT_HEADER_NAME_INFO::Name`, and the structure's size.
+    pub name_info_name: u32,
+    pub name_info_size: u32,
+    /// `_UNICODE_STRING::Length` and `::Buffer`.
+    pub unicode_length: u32,
+    pub unicode_buffer: u32,
+    /// `_OBJECT_SYMBOLIC_LINK::LinkTarget`.
+    pub link_target: u32,
+    /// `_OBJECT_TYPE::Name`.
+    pub type_name: u32,
+}
+
+/// The globals the walk starts from, resolved by symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Globals {
+    /// `nt!ObpRootDirectoryObject` — a pointer to the root directory, not the directory.
+    pub root: u64,
+    /// `nt!ObpInfoMaskToOffset` — a byte per `InfoMask` combination, saying how far before the
+    /// header the optional headers sit.
+    pub info_mask_to_offset: u64,
+    /// `nt!ObHeaderCookie` and `nt!ObTypeIndexTable`, which together turn a header's obfuscated
+    /// `TypeIndex` into a type object. Optional: a build without them still resolves names, and a
+    /// `type_name` of `None` is the honest answer there.
+    pub header_cookie: Option<u64>,
+    pub type_index_table: Option<u64>,
+}
+
+/// Which optional header is wanted, as the bit the kernel's own lookup is keyed on.
+const INFO_MASK_NAME: u8 = 0x02;
+
+/// Reads a walk's worth of target memory. A trait so the walk is testable against bytes, which is
+/// the only way to test it at all: the namespace it walks lives in a running kernel.
+pub trait Memory {
+    /// Answers `None` for anything that would not read, at any length.
+    fn read(&self, address: u64, len: usize) -> Option<Vec<u8>>;
+}
+
+impl<F> Memory for F
+where
+    F: Fn(u64, usize) -> Option<Vec<u8>>,
+{
+    fn read(&self, address: u64, len: usize) -> Option<Vec<u8>> {
+        self(address, len)
+    }
+}
+
+/// The namespace, over some memory and a layout.
+pub struct Namespace<'a> {
+    memory: &'a dyn Memory,
+    layout: Layout,
+    globals: Globals,
+}
+
+impl<'a> Namespace<'a> {
+    pub fn new(memory: &'a dyn Memory, layout: Layout, globals: Globals) -> Self {
+        Self {
+            memory,
+            layout,
+            globals,
+        }
+    }
+
+    fn read(&self, at: u64, len: usize) -> Result<Vec<u8>, ObjectError> {
+        match self.memory.read(at, len) {
+            Some(bytes) if bytes.len() >= len => Ok(bytes),
+            _ => Err(ObjectError::Unreadable { at, len }),
+        }
+    }
+
+    fn pointer_at(&self, at: u64) -> Result<u64, ObjectError> {
+        let bytes = self.read(at, self.layout.pointer)?;
+        Ok(match self.layout.pointer {
+            4 => u64::from(u32::from_le_bytes(
+                bytes[..4].try_into().unwrap_or_default(),
+            )),
+            _ => u64::from_le_bytes(bytes[..8].try_into().unwrap_or_default()),
+        })
+    }
+
+    /// The object body every entry of a directory points at.
+    fn entries_of(&self, directory: u64) -> Result<Vec<u64>, ObjectError> {
+        let mut out = Vec::new();
+        for bucket in 0..self.layout.buckets {
+            let at = directory
+                .wrapping_add(u64::from(self.layout.hash_buckets))
+                .wrapping_add((bucket * self.layout.pointer) as u64);
+            let mut entry = self.pointer_at(at)?;
+            // A chain is bounded by the whole directory's bound rather than one of its own: a
+            // cycle inside a bucket and a cycle across buckets are the same corruption.
+            while entry != 0 {
+                if out.len() >= MAX_ENTRIES {
+                    return Err(ObjectError::TooMany {
+                        what: "a directory's entries",
+                        bound: MAX_ENTRIES,
+                    });
+                }
+                let object =
+                    self.pointer_at(entry.wrapping_add(u64::from(self.layout.entry_object)))?;
+                if object != 0 {
+                    out.push(object);
+                }
+                entry = self.pointer_at(entry.wrapping_add(u64::from(self.layout.entry_chain)))?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The header that belongs to an object body.
+    fn header_of(&self, body: u64) -> u64 {
+        body.wrapping_sub(u64::from(self.layout.header_body))
+    }
+
+    /// One `_UNICODE_STRING`, read from wherever it sits.
+    fn unicode_at(&self, at: u64) -> Result<String, ObjectError> {
+        let size = (self.layout.unicode_buffer as usize) + self.layout.pointer;
+        let bytes = self.read(at, size)?;
+        let length = u16::from_le_bytes(
+            bytes[self.layout.unicode_length as usize..][..2]
+                .try_into()
+                .unwrap_or_default(),
+        ) as usize;
+        let buffer = self.pointer_at(at.wrapping_add(u64::from(self.layout.unicode_buffer)))?;
+        if length == 0 || buffer == 0 {
+            return Ok(String::new());
+        }
+        if !length.is_multiple_of(2) {
+            return Err(ObjectError::Malformed {
+                reason: "a UNICODE_STRING's length is not a whole number of UTF-16 units",
+            });
+        }
+        if length > MAX_NAME_BYTES {
+            return Err(ObjectError::TooMany {
+                what: "an object name",
+                bound: MAX_NAME_BYTES,
+            });
+        }
+        let raw = self.read(buffer, length)?;
+        Ok(utf16(&raw[..length]))
+    }
+
+    /// An object's own name, which lives in an optional header before its header.
+    ///
+    /// `Ok(None)` is an object filed under no name at all, which is ordinary — most objects are
+    /// reached by handle and never named.
+    fn name_of(&self, body: u64) -> Result<Option<String>, ObjectError> {
+        let header = self.header_of(body);
+        let mask = self.read(
+            header.wrapping_add(u64::from(self.layout.header_info_mask)),
+            1,
+        )?[0];
+        if mask & INFO_MASK_NAME == 0 {
+            return Ok(None);
+        }
+        // The kernel's own lookup: the offsets of every optional header present *up to and
+        // including* the one wanted, which is what the bit and every bit below it select.
+        let index = mask & (INFO_MASK_NAME | (INFO_MASK_NAME - 1));
+        let distance = self.read(
+            self.globals
+                .info_mask_to_offset
+                .wrapping_add(u64::from(index)),
+            1,
+        )?[0];
+        if u32::from(distance) < self.layout.name_info_size {
+            return Err(ObjectError::Malformed {
+                reason: "the name header's distance is shorter than the name header",
+            });
+        }
+        let name_info = header.wrapping_sub(u64::from(distance));
+        Ok(Some(self.unicode_at(
+            name_info.wrapping_add(u64::from(self.layout.name_info_name)),
+        )?))
+    }
+
+    /// The security descriptor an object carries, with the object manager's flag bits cleared.
+    fn security_of(&self, body: u64) -> Result<Option<u64>, ObjectError> {
+        let at = self
+            .header_of(body)
+            .wrapping_add(u64::from(self.layout.header_security));
+        // The low three bits are the object manager's own, never part of the address.
+        let descriptor = self.pointer_at(at)? & !0b111;
+        Ok((descriptor != 0).then_some(descriptor))
+    }
+
+    /// The name of an object's type, when the type table can be read.
+    ///
+    /// The index in the header is obfuscated — exclusive-ored with a per-boot cookie and with a
+    /// byte of the header's own address — so a build whose cookie this cannot find gets `None`
+    /// rather than a type read out of the wrong table slot.
+    fn type_of(&self, body: u64) -> Option<String> {
+        let (cookie, table) = (self.globals.header_cookie?, self.globals.type_index_table?);
+        let header = self.header_of(body);
+        let raw = self
+            .read(
+                header.wrapping_add(u64::from(self.layout.header_type_index)),
+                1,
+            )
+            .ok()?[0];
+        let cookie = self.read(cookie, 1).ok()?[0];
+        let index = raw ^ cookie ^ ((header >> 8) as u8);
+        let entry = self
+            .pointer_at(table.wrapping_add((usize::from(index) * self.layout.pointer) as u64))
+            .ok()?;
+        if entry == 0 {
+            return None;
+        }
+        let name = self
+            .unicode_at(entry.wrapping_add(u64::from(self.layout.type_name)))
+            .ok()?;
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Everything one directory holds, named.
+    fn named_in(&self, directory: u64) -> Result<Vec<KernelObject>, ObjectError> {
+        let mut out = Vec::new();
+        for body in self.entries_of(directory)? {
+            let Some(name) = self.name_of(body)? else {
+                continue;
+            };
+            out.push(KernelObject {
+                address: body,
+                name,
+                type_name: self.type_of(body),
+                security_descriptor: self.security_of(body)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Resolves a path to the object filed under it.
+    pub fn object_at(&self, path: &str) -> Result<KernelObject, ObjectError> {
+        let components = components_of(path)?;
+        let mut directory = self.pointer_at(self.globals.root)?;
+        if directory == 0 {
+            return Err(ObjectError::Malformed {
+                reason: "the root directory pointer is null",
+            });
+        }
+        let mut walked = String::from("\\");
+        let last = components.len() - 1;
+        for (at, component) in components.iter().enumerate() {
+            let found = self
+                .named_in(directory)?
+                .into_iter()
+                .find(|object| object.name.eq_ignore_ascii_case(component))
+                .ok_or_else(|| ObjectError::NotFound {
+                    directory: walked.clone(),
+                    component: component.clone(),
+                })?;
+            if at == last {
+                return Ok(found);
+            }
+            // Anything with a directory under it has to *be* one, and the type is how that is
+            // known. A build this cannot read the type table on gets the benefit of the doubt --
+            // the next read fails as an unreadable directory rather than as a wrong answer.
+            if found
+                .type_name
+                .as_deref()
+                .is_some_and(|kind| kind != "Directory")
+            {
+                return Err(ObjectError::NotADirectory {
+                    component: component.clone(),
+                    rest: components[at + 1..].join("\\"),
+                });
+            }
+            directory = found.address;
+            if walked.len() > 1 {
+                walked.push('\\');
+            }
+            walked.push_str(component);
+        }
+        unreachable!("a path with no components is refused above")
+    }
+
+    /// Everything a directory holds.
+    pub fn objects_in(&self, path: &str) -> Result<Vec<KernelObject>, ObjectError> {
+        let directory = match path.trim_end_matches('\\') {
+            "" => self.pointer_at(self.globals.root)?,
+            path => self.object_at(path)?.address,
+        };
+        self.named_in(directory)
+    }
+
+    /// What a symbolic link points at.
+    ///
+    /// **`LinkTarget` shares its storage with a callback pointer**, so what is there is checked
+    /// before it is followed rather than after: `Callback` lands exactly on `Length` and
+    /// `MaximumLength`, and `CallbackContext` lands on `Buffer`, so decoding without looking
+    /// reads a name out of whatever a context pointer happens to address. The checks are what a
+    /// string must satisfy and a function address need not -- a whole number of UTF-16 units,
+    /// within its own maximum -- and they are **not** a way to tell the two arms apart on their
+    /// own: filter by [`KernelObject::type_name`] first, and treat this as the second gate.
+    pub fn link_target(&self, link: u64) -> Result<String, ObjectError> {
+        let at = link.wrapping_add(u64::from(self.layout.link_target));
+        let size = (self.layout.unicode_buffer as usize) + self.layout.pointer;
+        let bytes = self.read(at, size)?;
+        let field = |offset: u32| {
+            u16::from_le_bytes(bytes[offset as usize..][..2].try_into().unwrap_or_default())
+        };
+        let length = field(self.layout.unicode_length);
+        let maximum = field(self.layout.unicode_length + 2);
+        if length == 0 || !length.is_multiple_of(2) || length > maximum {
+            return Err(ObjectError::Malformed {
+                reason: "the link target is not a string this can vouch for",
+            });
+        }
+        self.unicode_at(at)
+    }
+}
+
+/// Splits an object path into the components a walk descends through.
+fn components_of(path: &str) -> Result<Vec<String>, ObjectError> {
+    let bad = |reason| ObjectError::BadPath {
+        path: path.to_string(),
+        reason,
+    };
+    if !path.starts_with('\\') {
+        return Err(bad("an object path begins at the root, with a backslash"));
+    }
+    let parts: Vec<String> = path
+        .split('\\')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    if parts.is_empty() {
+        return Err(bad(
+            "it names the root directory rather than an object in it",
+        ));
+    }
+    if parts.len() > MAX_COMPONENTS {
+        return Err(bad("it has more components than the namespace is deep"));
+    }
+    Ok(parts)
+}
+
+/// UTF-16 little-endian, with anything unpaired replaced rather than refused: a name is being read
+/// to show someone, and a lone surrogate in it is not a reason to lose the object.
+fn utf16(bytes: &[u8]) -> String {
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
+    String::from_utf16_lossy(&units)
+}
+
+impl DebugEngine {
+    /// Where the object namespace's structures are on **this** target.
+    ///
+    /// Read once per call rather than cached: the walk that follows makes tens of memory reads, so
+    /// a dozen type lookups beside them are not what costs, and a cache keyed on the wrong thing
+    /// is how a second build gets decoded with the first one's offsets.
+    pub fn object_layout(&self) -> Result<Layout, DbgEngError> {
+        // Every type below is the kernel's, so the module is the kernel's base -- asked of the
+        // engine rather than inferred from a symbol's address, which is inside a section and not
+        // the base a type lookup is scoped by.
+        let module = self.kernel_base()?;
+        let of = |type_name: &str, field: &str| -> Result<u32, DbgEngError> {
+            let id = self.type_id(module, type_name)?;
+            self.field_offset(module, id, field)
+        };
+
+        let entry_chain = of("_OBJECT_DIRECTORY_ENTRY", "ChainLink")?;
+        let entry_object = of("_OBJECT_DIRECTORY_ENTRY", "Object")?;
+        // **A pointer's width is the target's, and it is derived rather than assumed.** These two
+        // fields are adjacent and the first is one pointer, so their distance is that width -- on
+        // a 32-bit kernel read from a 64-bit host, which is a supported target, the host's answer
+        // would be wrong by a factor of two and every read after it off the end of something.
+        let pointer = entry_object
+            .checked_sub(entry_chain)
+            .filter(|width| matches!(width, 4 | 8))
+            .ok_or(DbgEngError::InvalidCommand)? as usize;
+
+        let hash_buckets = of("_OBJECT_DIRECTORY", "HashBuckets")?;
+        // And the bucket count is the array's span over that width, for the same reason: 37 is
+        // this build's number rather than the structure's.
+        let buckets = (of("_OBJECT_DIRECTORY", "Lock")?.saturating_sub(hash_buckets) as usize)
+            .checked_div(pointer)
+            .filter(|count| *count > 0)
+            .ok_or(DbgEngError::InvalidCommand)?;
+
+        let name_info = self.type_id(module, "_OBJECT_HEADER_NAME_INFO")?;
+        Ok(Layout {
+            pointer,
+            buckets,
+            hash_buckets,
+            entry_chain,
+            entry_object,
+            header_body: of("_OBJECT_HEADER", "Body")?,
+            header_type_index: of("_OBJECT_HEADER", "TypeIndex")?,
+            header_info_mask: of("_OBJECT_HEADER", "InfoMask")?,
+            header_security: of("_OBJECT_HEADER", "SecurityDescriptor")?,
+            name_info_name: self.field_offset(module, name_info, "Name")?,
+            name_info_size: self.type_size(module, name_info)?,
+            unicode_length: of("_UNICODE_STRING", "Length")?,
+            unicode_buffer: of("_UNICODE_STRING", "Buffer")?,
+            link_target: of("_OBJECT_SYMBOLIC_LINK", "LinkTarget")?,
+            type_name: of("_OBJECT_TYPE", "Name")?,
+        })
+    }
+
+    /// The globals the walk starts from.
+    ///
+    /// The two the walk cannot do without are errors; the two that only name a *type* are options,
+    /// because a build that renamed or inlined them still resolves paths.
+    pub fn object_globals(&self) -> Result<Globals, DbgEngError> {
+        Ok(Globals {
+            root: self.symbol_offset("nt!ObpRootDirectoryObject")?,
+            info_mask_to_offset: self.symbol_offset("nt!ObpInfoMaskToOffset")?,
+            header_cookie: self.symbol_offset("nt!ObHeaderCookie").ok(),
+            type_index_table: self.symbol_offset("nt!ObTypeIndexTable").ok(),
+        })
+    }
+
+    /// The object filed under a path, as `!object` would find it.
+    pub fn object_at(&self, path: &str) -> Result<KernelObject, ObjectError> {
+        self.with_namespace(|namespace| namespace.object_at(path))
+    }
+
+    /// Everything a directory holds.
+    pub fn objects_in(&self, path: &str) -> Result<Vec<KernelObject>, ObjectError> {
+        self.with_namespace(|namespace| namespace.objects_in(path))
+    }
+
+    /// What a symbolic link object points at.
+    pub fn symbolic_link_target(&self, link: u64) -> Result<String, ObjectError> {
+        self.with_namespace(|namespace| namespace.link_target(link))
+    }
+
+    fn with_namespace<T>(
+        &self,
+        answer: impl FnOnce(&Namespace<'_>) -> Result<T, ObjectError>,
+    ) -> Result<T, ObjectError> {
+        // A layout or a global this cannot resolve is reported as the read it would have been:
+        // both mean the same thing to a caller — this target does not carry a namespace to walk —
+        // and the symbol that failed is in the engine's own error rather than lost here.
+        let layout = self.object_layout().map_err(|_| ObjectError::Malformed {
+            reason: "this target has no type information for the object manager's structures",
+        })?;
+        let globals = self.object_globals().map_err(|_| ObjectError::Malformed {
+            reason: "this target does not resolve the object manager's globals",
+        })?;
+        let read = |at: u64, len: usize| self.read_memory(at, len).ok();
+        answer(&Namespace::new(&read, layout, globals))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// The offsets measured on Windows 26100 x64, which is what the fixtures below are laid out to.
+    ///
+    /// Written out rather than derived from the builder that places the bytes: a fixture sharing
+    /// its arithmetic with the code under test agrees with it about a wrong offset, which is the
+    /// one thing a layout test cannot afford.
+    fn layout() -> Layout {
+        Layout {
+            pointer: 8,
+            buckets: 37,
+            hash_buckets: 0x00,
+            entry_chain: 0x00,
+            entry_object: 0x08,
+            header_body: 0x30,
+            header_type_index: 0x18,
+            header_info_mask: 0x1a,
+            header_security: 0x28,
+            name_info_name: 0x08,
+            name_info_size: 0x20,
+            unicode_length: 0x00,
+            unicode_buffer: 0x08,
+            link_target: 0x08,
+            type_name: 0x10,
+        }
+    }
+
+    const ROOT_POINTER: u64 = 0xffff_f800_0000_1000;
+    const INFO_OFFSETS: u64 = 0xffff_f800_0000_2000;
+    const COOKIE: u64 = 0xffff_f800_0000_3000;
+    const TYPE_TABLE: u64 = 0xffff_f800_0000_4000;
+    /// The cookie this fixture's kernel booted with.
+    const COOKIE_VALUE: u8 = 0x5a;
+
+    fn globals() -> Globals {
+        Globals {
+            root: ROOT_POINTER,
+            info_mask_to_offset: INFO_OFFSETS,
+            header_cookie: Some(COOKIE),
+            type_index_table: Some(TYPE_TABLE),
+        }
+    }
+
+    /// A byte-addressed target, which is all the walk needs to be a walk.
+    #[derive(Default)]
+    struct Fake {
+        bytes: BTreeMap<u64, u8>,
+    }
+
+    impl Memory for Fake {
+        fn read(&self, address: u64, len: usize) -> Option<Vec<u8>> {
+            (0..len)
+                .map(|step| self.bytes.get(&(address + step as u64)).copied())
+                .collect()
+        }
+    }
+
+    impl Fake {
+        fn put(&mut self, at: u64, bytes: &[u8]) {
+            for (step, byte) in bytes.iter().enumerate() {
+                self.bytes.insert(at + step as u64, *byte);
+            }
+        }
+
+        fn pointer(&mut self, at: u64, value: u64) {
+            self.put(at, &value.to_le_bytes());
+        }
+
+        /// A `_UNICODE_STRING` at `at`, with its characters at `buffer`.
+        fn string(&mut self, at: u64, buffer: u64, text: &str) {
+            let units: Vec<u8> = text
+                .encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect();
+            let length = units.len() as u16;
+            // The whole structure, padding included: the walk reads it in one go, and a fixture
+            // that writes only the fields it cares about leaves a hole that reads as unmapped.
+            self.put(at, &[0u8; 16]);
+            self.put(at, &length.to_le_bytes());
+            self.put(at + 2, &length.to_le_bytes());
+            self.pointer(at + 8, buffer);
+            self.put(buffer, &units);
+        }
+
+        /// An object body with a header, a name, a type and a descriptor.
+        #[allow(clippy::too_many_arguments)]
+        fn object(&mut self, body: u64, name: &str, type_index: u8, security: u64) {
+            let header = body - 0x30;
+            // Name info sits `distance` before the header, and the table says how far.
+            self.put(header + 0x18, &[type_index]);
+            self.put(header + 0x1a, &[0x02]);
+            self.pointer(header + 0x28, security);
+            self.put(INFO_OFFSETS + u64::from(0x02u8 & 0x03), &[0x20]);
+            let name_info = header - 0x20;
+            self.string(name_info + 0x08, name_info + 0x1000, name);
+        }
+
+        /// A directory holding these objects, one per bucket so the chains stay short.
+        fn directory(&mut self, at: u64, objects: &[u64]) {
+            for bucket in 0..37u64 {
+                self.pointer(at + bucket * 8, 0);
+            }
+            for (index, object) in objects.iter().enumerate() {
+                let entry = at + 0x2000 + (index as u64) * 0x20;
+                let bucket = (index as u64) % 37;
+                // Push onto the front of the bucket's chain.
+                let was =
+                    u64::from_le_bytes(self.read(at + bucket * 8, 8).unwrap().try_into().unwrap());
+                self.pointer(entry, was);
+                self.pointer(entry + 0x08, *object);
+                self.pointer(at + bucket * 8, entry);
+            }
+        }
+
+        /// A type object whose index the header will be obfuscated against.
+        fn kind(&mut self, index: u8, at: u64, name: &str) {
+            self.pointer(TYPE_TABLE + u64::from(index) * 8, at);
+            self.string(at + 0x10, at + 0x1000, name);
+        }
+    }
+
+    /// The index a header must carry for its object to read as `kind`.
+    fn obfuscated(kind: u8, body: u64) -> u8 {
+        let header = body - 0x30;
+        kind ^ COOKIE_VALUE ^ ((header >> 8) as u8)
+    }
+
+    const ROOT: u64 = 0xffff_a000_0000_0000;
+    const DEVICE_DIR: u64 = 0xffff_a000_0010_0000;
+    const DEVICE: u64 = 0xffff_a000_0020_0000;
+
+    fn namespace() -> Fake {
+        let mut fake = Fake::default();
+        fake.put(COOKIE, &[COOKIE_VALUE]);
+        fake.pointer(ROOT_POINTER, ROOT);
+        fake.kind(3, 0xffff_a000_0030_0000, "Directory");
+        fake.kind(4, 0xffff_a000_0031_0000, "Device");
+        fake.kind(5, 0xffff_a000_0032_0000, "SymbolicLink");
+
+        fake.object(DEVICE_DIR, "Device", obfuscated(3, DEVICE_DIR), 0);
+        fake.directory(ROOT, &[DEVICE_DIR]);
+
+        fake.object(
+            DEVICE,
+            "MountPointManager",
+            obfuscated(4, DEVICE),
+            0xffff_b000_0000_0007,
+        );
+        fake.directory(DEVICE_DIR, &[DEVICE]);
+        fake
+    }
+
+    /// A path resolves to the object filed under it, with its type and its descriptor.
+    ///
+    /// The descriptor is stored with the object manager's own flag bits set, which is how a real
+    /// one is stored: taking the field as an address reads a security descriptor three bytes into
+    /// its own header and reports a DACL that is not there.
+    #[test]
+    fn a_path_resolves_to_the_object_filed_under_it() {
+        let fake = namespace();
+        let namespace = Namespace::new(&fake, layout(), globals());
+
+        let found = namespace
+            .object_at("\\Device\\MountPointManager")
+            .expect("the device is in the namespace");
+        assert_eq!(
+            (
+                found.address,
+                found.name.as_str(),
+                found.type_name.as_deref(),
+                found.security_descriptor
+            ),
+            (
+                DEVICE,
+                "MountPointManager",
+                Some("Device"),
+                Some(0xffff_b000_0000_0000)
+            ),
+            "the low three bits of the descriptor field are the object manager's own"
+        );
+    }
+
+    /// A name is matched without regard to ASCII case, as the object manager matches it.
+    #[test]
+    fn a_name_is_matched_without_regard_to_case() {
+        let fake = namespace();
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace
+                .object_at("\\device\\MOUNTPOINTMANAGER")
+                .map(|found| found.address),
+            Ok(DEVICE)
+        );
+    }
+
+    /// A component that is not there is **not found**, naming what was being looked in — and not
+    /// an empty answer, which reads as a namespace with nothing in it.
+    #[test]
+    fn a_missing_component_names_the_directory_it_was_not_in() {
+        let fake = namespace();
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.object_at("\\Device\\Nothing"),
+            Err(ObjectError::NotFound {
+                directory: "\\Device".to_string(),
+                component: "Nothing".to_string(),
+            })
+        );
+    }
+
+    /// Walking *through* something that is not a directory is refused rather than followed.
+    ///
+    /// A device's body is not a directory, and reading one as a directory reads 37 pointers out of
+    /// a driver's own fields and follows whatever they hold.
+    #[test]
+    fn a_leaf_is_not_walked_through() {
+        let fake = namespace();
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.object_at("\\Device\\MountPointManager\\Deeper"),
+            Err(ObjectError::NotADirectory {
+                component: "MountPointManager".to_string(),
+                rest: "Deeper".to_string(),
+            })
+        );
+    }
+
+    /// A directory lists what it holds, named.
+    #[test]
+    fn a_directory_lists_what_it_holds() {
+        let fake = namespace();
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace
+                .objects_in("\\Device")
+                .map(|found| found.into_iter().map(|one| one.name).collect::<Vec<_>>()),
+            Ok(vec!["MountPointManager".to_string()])
+        );
+    }
+
+    /// A target whose namespace will not read says **which read failed**, rather than answering
+    /// with an empty namespace.
+    ///
+    /// This is a kernel minidump, where `nt`'s data pages are not in the file at all: measured on
+    /// `docs/samples/081226-2187-01.dmp`, `ObpRootDirectoryObject` itself reads `????????`.
+    #[test]
+    fn a_target_with_no_namespace_says_so_rather_than_answering_empty() {
+        let fake = Fake::default();
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.object_at("\\Device"),
+            Err(ObjectError::Unreadable {
+                at: ROOT_POINTER,
+                len: 8
+            })
+        );
+    }
+
+    /// A chain that points at itself is refused, rather than walked until the process dies.
+    #[test]
+    fn a_looping_chain_is_refused_rather_than_walked() {
+        let mut fake = namespace();
+        // The first bucket's entry chains to itself.
+        let entry = DEVICE_DIR + 0x2000;
+        fake.pointer(DEVICE_DIR, entry);
+        fake.pointer(entry, entry);
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.objects_in("\\Device"),
+            Err(ObjectError::TooMany {
+                what: "a directory's entries",
+                bound: MAX_ENTRIES
+            })
+        );
+    }
+
+    /// A link target is read as a string, and something that is not one is refused.
+    ///
+    /// The field shares storage with a callback pointer, so a link this walk cannot vouch for is
+    /// an error rather than a string decoded out of a function address.
+    #[test]
+    fn a_link_target_is_checked_before_it_is_decoded() {
+        let mut fake = namespace();
+        const LINK: u64 = 0xffff_a000_0040_0000;
+        fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\MountPointManager");
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.link_target(LINK).as_deref(),
+            Ok("\\Device\\MountPointManager")
+        );
+
+        // The union's **other** arm, laid out as it really is: a callback address where the two
+        // lengths are, a context pointer where the buffer is, and all sixteen bytes mapped -- so
+        // what refuses this is the check rather than a read that happened to fail.
+        const CALLBACK: u64 = 0xffff_a000_0041_0000;
+        fake.pointer(CALLBACK + 0x08, 0xffff_f805_cb41_2341);
+        fake.pointer(CALLBACK + 0x10, 0xffff_a000_0050_0000);
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.link_target(CALLBACK),
+            Err(ObjectError::Malformed {
+                reason: "the link target is not a string this can vouch for"
+            }),
+            "a code address is not a whole number of UTF-16 units"
+        );
+    }
+
+    /// A path that is not a path is refused before anything is read.
+    #[test]
+    fn a_path_that_is_not_one_is_refused() {
+        let fake = namespace();
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert!(matches!(
+            namespace.object_at("Device"),
+            Err(ObjectError::BadPath { .. })
+        ));
+        assert!(matches!(
+            namespace.object_at("\\"),
+            Err(ObjectError::BadPath { .. })
+        ));
+    }
+}
