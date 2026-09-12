@@ -62,6 +62,16 @@ const MAX_NAME_BYTES: usize = 1024;
 /// What the object manager calls a directory's type, and the one type name this walk acts on.
 const DIRECTORY: &str = "Directory";
 
+/// The bit in `_OBJECT_SYMBOLIC_LINK::Flags` that says the object's callback arm is live.
+///
+/// **Read out of the kernel rather than out of a document.** `nt!ObpParseSymbolicLinkEx` on
+/// 26100 x64 loads `Flags`, tests `10h`, and on that branch calls through the pointer at `+0x08`
+/// with the context at `+0x10`; with the bit clear it takes `+0x08` as the `_UNICODE_STRING` it
+/// is in the other arm. The neighbouring bits are all something else -- `2h` asks whether the
+/// token is sandboxed, `8h` masks an access mask, `1h` is a silo check -- which is why this was
+/// measured rather than guessed: the first bit anyone would have tried is the sandbox one.
+const SYMBOLIC_LINK_CALLBACK: u32 = 0x10;
+
 /// Why a namespace walk could not answer.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ObjectError {
@@ -134,8 +144,9 @@ pub struct Layout {
     /// `_UNICODE_STRING::Length` and `::Buffer`.
     pub unicode_length: u32,
     pub unicode_buffer: u32,
-    /// `_OBJECT_SYMBOLIC_LINK::LinkTarget`.
+    /// `_OBJECT_SYMBOLIC_LINK::LinkTarget`, and the `Flags` that say whether it is live.
     pub link_target: u32,
+    pub link_flags: u32,
     /// `_OBJECT_TYPE::Name`.
     pub type_name: u32,
 }
@@ -151,8 +162,8 @@ pub struct Globals {
     /// `nt!ObHeaderCookie` and `nt!ObTypeIndexTable`, which together turn a header's obfuscated
     /// `TypeIndex` into a type object. Optional: a build without them still resolves names, and a
     /// `type_name` of `None` is the honest answer there.
-    pub header_cookie: Option<u64>,
-    pub type_index_table: Option<u64>,
+    pub header_cookie: u64,
+    pub type_index_table: u64,
 }
 
 /// Which optional header is wanted, as the bit the kernel's own lookup is keyed on.
@@ -251,11 +262,18 @@ impl<'a> Namespace<'a> {
     fn unicode_at(&self, at: u64) -> Result<String, ObjectError> {
         let size = (self.layout.unicode_buffer as usize) + self.layout.pointer;
         let bytes = self.read(at, size)?;
-        let length = u16::from_le_bytes(
-            bytes[self.layout.unicode_length as usize..][..2]
-                .try_into()
-                .unwrap_or_default(),
-        ) as usize;
+        let field = |offset: u32| {
+            u16::from_le_bytes(bytes[offset as usize..][..2].try_into().unwrap_or_default())
+        };
+        let length = field(self.layout.unicode_length) as usize;
+        // **A string that is longer than its own buffer is torn**, and reading `Length` alone
+        // takes whatever follows into a name the walk then matches paths against -- which
+        // resolves some other object, rather than failing to resolve this one.
+        if length > field(self.layout.unicode_length + 2) as usize {
+            return Err(ObjectError::Malformed {
+                reason: "a UNICODE_STRING is longer than its own maximum",
+            });
+        }
         let buffer = self.pointer_at(at.wrapping_add(u64::from(self.layout.unicode_buffer)))?;
         if length == 0 {
             return Ok(String::new());
@@ -343,7 +361,7 @@ impl<'a> Namespace<'a> {
     /// byte of the header's own address — so a build whose cookie this cannot find gets `None`
     /// rather than a type read out of the wrong table slot.
     fn type_of(&self, body: u64) -> Option<String> {
-        let (cookie, table) = (self.globals.header_cookie?, self.globals.type_index_table?);
+        let (cookie, table) = (self.globals.header_cookie, self.globals.type_index_table);
         let header = self.header_of(body);
         let raw = self
             .read(
@@ -406,13 +424,10 @@ impl<'a> Namespace<'a> {
                 return Ok(found);
             }
             // Anything with a directory under it has to *be* one, and the type is how that is
-            // known. A build this cannot read the type table on gets the benefit of the doubt --
-            // the next read fails as an unreadable directory rather than as a wrong answer.
-            if found
-                .type_name
-                .as_deref()
-                .is_some_and(|kind| kind != DIRECTORY)
-            {
+            // known. **Fail closed**: an object whose type could not be read is not one to walk
+            // through on the chance that it is a directory, because what that reads is a device's
+            // own fields as bucket pointers.
+            if found.type_name.as_deref() != Some(DIRECTORY) {
                 return Err(ObjectError::NotADirectory {
                     component: component.clone(),
                     rest: components[at + 1..].join("\\"),
@@ -438,11 +453,7 @@ impl<'a> Namespace<'a> {
             "" => self.pointer_at(self.globals.root)?,
             path => {
                 let found = self.object_at(path)?;
-                if found
-                    .type_name
-                    .as_deref()
-                    .is_some_and(|kind| kind != DIRECTORY)
-                {
+                if found.type_name.as_deref() != Some(DIRECTORY) {
                     return Err(ObjectError::NotADirectory {
                         component: found.name,
                         rest: String::new(),
@@ -467,13 +478,22 @@ impl<'a> Namespace<'a> {
     /// lengths gets that far and no further, because what its context points at does not begin
     /// with one.
     ///
-    /// **The discriminating flag is deliberately not read.** `_OBJECT_SYMBOLIC_LINK::Flags` is
-    /// what the object manager itself branches on, and which bit that is could not be measured on
-    /// this bench: local kernel debugging is not enabled here, a minidump carries no namespace,
-    /// and a bit guessed from reading about it would be a rule nothing checked. Refusing a
-    /// callback link is the answer that cannot be wrong in the direction that matters; reading the
-    /// flag would let one be *answered*, and that is worth doing from a live kernel.
+    /// **And the discriminator is read first**, because the checks above are evidence and the flag
+    /// is the answer: [`SYMBOLIC_LINK_CALLBACK`] is the bit the object manager itself branches on,
+    /// taken out of `nt!ObpParseSymbolicLinkEx` rather than out of a document. A link whose
+    /// callback arm is live has no target to read, and saying so is not the same as failing to
+    /// decode one.
     pub fn link_target(&self, link: u64) -> Result<String, ObjectError> {
+        let flags = self.read(
+            link.wrapping_add(u64::from(self.layout.link_flags)),
+            size_of::<u32>(),
+        )?;
+        let flags = u32::from_le_bytes(flags[..4].try_into().unwrap_or_default());
+        if flags & SYMBOLIC_LINK_CALLBACK != 0 {
+            return Err(ObjectError::Malformed {
+                reason: "this link resolves through a callback, so it has no target to read",
+            });
+        }
         let at = link.wrapping_add(u64::from(self.layout.link_target));
         let size = (self.layout.unicode_buffer as usize) + self.layout.pointer;
         let bytes = self.read(at, size)?;
@@ -581,6 +601,7 @@ impl DebugEngine {
             unicode_length: of("_UNICODE_STRING", "Length")?,
             unicode_buffer: of("_UNICODE_STRING", "Buffer")?,
             link_target: of("_OBJECT_SYMBOLIC_LINK", "LinkTarget")?,
+            link_flags: of("_OBJECT_SYMBOLIC_LINK", "Flags")?,
             type_name: of("_OBJECT_TYPE", "Name")?,
         })
     }
@@ -593,8 +614,8 @@ impl DebugEngine {
         Ok(Globals {
             root: self.symbol_offset("nt!ObpRootDirectoryObject")?,
             info_mask_to_offset: self.symbol_offset("nt!ObpInfoMaskToOffset")?,
-            header_cookie: self.symbol_offset("nt!ObHeaderCookie").ok(),
-            type_index_table: self.symbol_offset("nt!ObTypeIndexTable").ok(),
+            header_cookie: self.symbol_offset("nt!ObHeaderCookie")?,
+            type_index_table: self.symbol_offset("nt!ObTypeIndexTable")?,
         })
     }
 
@@ -658,6 +679,7 @@ mod tests {
             unicode_length: 0x00,
             unicode_buffer: 0x08,
             link_target: 0x08,
+            link_flags: 0x1c,
             type_name: 0x10,
         }
     }
@@ -673,8 +695,8 @@ mod tests {
         Globals {
             root: ROOT_POINTER,
             info_mask_to_offset: INFO_OFFSETS,
-            header_cookie: Some(COOKIE),
-            type_index_table: Some(TYPE_TABLE),
+            header_cookie: COOKIE,
+            type_index_table: TYPE_TABLE,
         }
     }
 
@@ -747,6 +769,11 @@ mod tests {
                 self.pointer(entry + 0x08, *object);
                 self.pointer(at + bucket * 8, entry);
             }
+        }
+
+        /// The flags a symbolic link carries, which say which arm of its union is live.
+        fn flags(&mut self, link: u64, flags: u32) {
+            self.put(link + 0x1c, &flags.to_le_bytes());
         }
 
         /// A type object whose index the header will be obfuscated against.
@@ -943,6 +970,7 @@ mod tests {
     fn a_length_with_no_buffer_is_malformed_rather_than_empty() {
         let mut fake = namespace();
         const LINK: u64 = 0xffff_a000_0042_0000;
+        fake.flags(LINK, 0);
         fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\X");
         // Everything the link check looks at still holds; only the buffer is gone.
         fake.pointer(LINK + 0x10, 0);
@@ -981,6 +1009,7 @@ mod tests {
     fn a_link_target_is_checked_before_it_is_decoded() {
         let mut fake = namespace();
         const LINK: u64 = 0xffff_a000_0040_0000;
+        fake.flags(LINK, 0);
         fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\MountPointManager");
         let namespace = Namespace::new(&fake, layout(), globals());
         assert_eq!(
@@ -992,6 +1021,7 @@ mod tests {
         // lengths are, a context pointer where the buffer is, and all sixteen bytes mapped -- so
         // what refuses this is the check rather than a read that happened to fail.
         const CALLBACK: u64 = 0xffff_a000_0041_0000;
+        fake.flags(CALLBACK, 0);
         fake.pointer(CALLBACK + 0x08, 0xffff_f805_cb41_2341);
         fake.pointer(CALLBACK + 0x10, 0xffff_a000_0050_0000);
         let namespace = Namespace::new(&fake, layout(), globals());
@@ -1010,6 +1040,7 @@ mod tests {
         // this: a callback-backed link is a `SymbolicLink` like any other.
         const PASSES: u64 = 0xffff_a000_0043_0000;
         const CONTEXT: u64 = 0xffff_a000_0051_0000;
+        fake.flags(PASSES, 0);
         fake.pointer(PASSES + 0x08, 0xffff_f805_cb41_0010);
         fake.pointer(PASSES + 0x10, CONTEXT);
         fake.put(
@@ -1026,6 +1057,83 @@ mod tests {
                 reason: "the link target is not an object path, so this is not a target"
             }),
             "the lengths passed, and what they described was not a target"
+        );
+    }
+
+    /// A link whose **callback** arm is live has no target, and says so.
+    ///
+    /// This is the case the content checks cannot reach: the lengths are a string's, the buffer
+    /// reads, and what it holds is a path. Only the flag the object manager itself branches on
+    /// separates the two arms, which is why it is read first.
+    #[test]
+    fn a_callback_link_has_no_target_to_read() {
+        let mut fake = namespace();
+        const LINK: u64 = 0xffff_a000_0044_0000;
+        // A target that would decode perfectly well, and a flag saying it is not the live arm.
+        fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\X");
+        fake.flags(LINK, 0);
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.link_target(LINK).as_deref(),
+            Ok("\\Device\\X"),
+            "with the bit clear the union holds the target"
+        );
+
+        fake.flags(LINK, SYMBOLIC_LINK_CALLBACK);
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.link_target(LINK),
+            Err(ObjectError::Malformed {
+                reason: "this link resolves through a callback, so it has no target to read"
+            }),
+            "and with it set the same bytes are a callback and a context"
+        );
+    }
+
+    /// An object whose **type could not be read** is not walked through or listed.
+    ///
+    /// The guard is what stops a device's own fields being read as bucket pointers, and a guard
+    /// that passes when it cannot tell is not one. Here the type table slot is empty, which is
+    /// every way that read can fail rolled into one.
+    #[test]
+    fn an_object_of_unknown_type_is_not_treated_as_a_directory() {
+        let mut fake = namespace();
+        // The slot the Device directory's own type index selects, emptied.
+        fake.pointer(TYPE_TABLE + 3 * 8, 0);
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.object_at("\\Device\\MountPointManager"),
+            Err(ObjectError::NotADirectory {
+                component: "Device".to_string(),
+                rest: "MountPointManager".to_string(),
+            }),
+            "an unreadable type is not a directory"
+        );
+        assert!(
+            matches!(
+                namespace.objects_in("\\Device"),
+                Err(ObjectError::NotADirectory { .. })
+            ),
+            "and listing it is the same refusal"
+        );
+    }
+
+    /// A name longer than its own maximum is **torn**, and taking its length would read past the
+    /// buffer into whatever follows -- which the walk then matches a path against, resolving some
+    /// other object rather than failing to resolve this one.
+    #[test]
+    fn a_name_longer_than_its_own_maximum_is_refused() {
+        let mut fake = namespace();
+        let header = DEVICE - 0x30;
+        let name_info = header - 0x20;
+        // Length past MaximumLength, with the buffer left as it was.
+        fake.put(name_info + 0x08, &200u16.to_le_bytes());
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.objects_in("\\Device"),
+            Err(ObjectError::Malformed {
+                reason: "a UNICODE_STRING is longer than its own maximum"
+            })
         );
     }
 
