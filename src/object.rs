@@ -59,6 +59,9 @@ const MAX_COMPONENTS: usize = 32;
 /// long is not one the object manager made.
 const MAX_NAME_BYTES: usize = 1024;
 
+/// What the object manager calls a directory's type, and the one type name this walk acts on.
+const DIRECTORY: &str = "Directory";
+
 /// Why a namespace walk could not answer.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ObjectError {
@@ -97,8 +100,8 @@ pub struct KernelObject {
     /// The object type's name (`Device`, `SymbolicLink`, `Directory`), when the type table could
     /// be read. `None` is "this walk could not say", never "untyped".
     pub type_name: Option<String>,
-    /// `_OBJECT_HEADER::SecurityDescriptor`, with the three low bits the object manager keeps its
-    /// own flags in masked off. `None` where the object carries none.
+    /// `_OBJECT_HEADER::SecurityDescriptor`, with the fast-reference count masked out of it.
+    /// `None` where the object carries none.
     pub security_descriptor: Option<u64>,
 }
 
@@ -207,6 +210,7 @@ impl<'a> Namespace<'a> {
     /// The object body every entry of a directory points at.
     fn entries_of(&self, directory: u64) -> Result<Vec<u64>, ObjectError> {
         let mut out = Vec::new();
+        let mut followed = 0usize;
         for bucket in 0..self.layout.buckets {
             let at = directory
                 .wrapping_add(u64::from(self.layout.hash_buckets))
@@ -214,8 +218,14 @@ impl<'a> Namespace<'a> {
             let mut entry = self.pointer_at(at)?;
             // A chain is bounded by the whole directory's bound rather than one of its own: a
             // cycle inside a bucket and a cycle across buckets are the same corruption.
+            //
+            // **The bound counts links followed, not objects found.** Counting what came out of
+            // the walk leaves a chain of entries whose `Object` is null unbounded -- one of them
+            // pointing at itself is a loop this never leaves, which on a live kernel is a
+            // debugger that stops answering rather than a walk that refuses.
             while entry != 0 {
-                if out.len() >= MAX_ENTRIES {
+                followed += 1;
+                if followed > MAX_ENTRIES {
                     return Err(ObjectError::TooMany {
                         what: "a directory's entries",
                         bound: MAX_ENTRIES,
@@ -247,8 +257,16 @@ impl<'a> Namespace<'a> {
                 .unwrap_or_default(),
         ) as usize;
         let buffer = self.pointer_at(at.wrapping_add(u64::from(self.layout.unicode_buffer)))?;
-        if length == 0 || buffer == 0 {
+        if length == 0 {
             return Ok(String::new());
+        }
+        // **A length with no buffer is not an empty string**, it is a structure contradicting
+        // itself -- and an empty string is what a caller would publish as a symbolic link's
+        // target, which is worse than saying nothing.
+        if buffer == 0 {
+            return Err(ObjectError::Malformed {
+                reason: "a UNICODE_STRING has a length and no buffer",
+            });
         }
         if !length.is_multiple_of(2) {
             return Err(ObjectError::Malformed {
@@ -298,13 +316,24 @@ impl<'a> Namespace<'a> {
         )?))
     }
 
-    /// The security descriptor an object carries, with the object manager's flag bits cleared.
+    /// The security descriptor an object carries, with the reference count cleared out of it.
+    ///
+    /// **The field is an `_EX_FAST_REF`, not a pointer**: the object manager keeps a count of
+    /// outstanding fast references in the bits an aligned address leaves spare, and that is
+    /// **four** bits on a 64-bit kernel — measured, `nt!_EX_FAST_REF::RefCnt` is `Pos 0, 4 Bits`
+    /// on 26100 x64. Clearing three of them leaves the fourth set on any object with eight or more
+    /// live references, and the address handed back is then eight bytes into the descriptor: what
+    /// gets decoded is a DACL read from the middle of a header, which is a wrong answer about who
+    /// may open a device rather than a failure to answer.
+    ///
+    /// So the mask is derived from the pointer width the layout already derived — the count fills
+    /// what the descriptor's alignment leaves, which is one bit more than the pointer's own.
     fn security_of(&self, body: u64) -> Result<Option<u64>, ObjectError> {
         let at = self
             .header_of(body)
             .wrapping_add(u64::from(self.layout.header_security));
-        // The low three bits are the object manager's own, never part of the address.
-        let descriptor = self.pointer_at(at)? & !0b111;
+        let counted = (2 * self.layout.pointer as u64) - 1;
+        let descriptor = self.pointer_at(at)? & !counted;
         Ok((descriptor != 0).then_some(descriptor))
     }
 
@@ -382,7 +411,7 @@ impl<'a> Namespace<'a> {
             if found
                 .type_name
                 .as_deref()
-                .is_some_and(|kind| kind != "Directory")
+                .is_some_and(|kind| kind != DIRECTORY)
             {
                 return Err(ObjectError::NotADirectory {
                     component: component.clone(),
@@ -399,10 +428,28 @@ impl<'a> Namespace<'a> {
     }
 
     /// Everything a directory holds.
+    ///
+    /// **A path that resolves to a leaf is refused rather than enumerated.** `object_at` guards
+    /// walking *through* a device on the way to something else; this is the same guard at the end
+    /// of the path, and without it `\Device\MountPointManager` has a driver's own fields read as
+    /// thirty-seven bucket pointers and whatever they hold followed as chains.
     pub fn objects_in(&self, path: &str) -> Result<Vec<KernelObject>, ObjectError> {
         let directory = match path.trim_end_matches('\\') {
             "" => self.pointer_at(self.globals.root)?,
-            path => self.object_at(path)?.address,
+            path => {
+                let found = self.object_at(path)?;
+                if found
+                    .type_name
+                    .as_deref()
+                    .is_some_and(|kind| kind != DIRECTORY)
+                {
+                    return Err(ObjectError::NotADirectory {
+                        component: found.name,
+                        rest: String::new(),
+                    });
+                }
+                found.address
+            }
         };
         self.named_in(directory)
     }
@@ -718,7 +765,7 @@ mod tests {
             DEVICE,
             "MountPointManager",
             obfuscated(4, DEVICE),
-            0xffff_b000_0000_0007,
+            0xffff_b000_0000_000f,
         );
         fake.directory(DEVICE_DIR, &[DEVICE]);
         fake
@@ -750,7 +797,7 @@ mod tests {
                 Some("Device"),
                 Some(0xffff_b000_0000_0000)
             ),
-            "the low three bits of the descriptor field are the object manager's own"
+            "the descriptor field is a fast reference, and the count in its low bits is not              part of the address"
         );
     }
 
@@ -826,6 +873,68 @@ mod tests {
             Err(ObjectError::Unreadable {
                 at: ROOT_POINTER,
                 len: 8
+            })
+        );
+    }
+
+    /// A **null-object** chain is bounded too, and that is a different counter from the one that
+    /// bounds what comes out.
+    ///
+    /// An entry whose `Object` is null contributes nothing to the list, so a bound counting the
+    /// list never reaches it — and one of those pointing at itself is a loop this never leaves. On
+    /// a live kernel that is a debugger that stops answering, which is the failure a bound exists
+    /// to turn into a refusal.
+    #[test]
+    fn a_chain_of_entries_that_name_nothing_is_bounded_as_well() {
+        let mut fake = namespace();
+        const EMPTY: u64 = DEVICE_DIR + 0x8000;
+        fake.pointer(DEVICE_DIR, EMPTY);
+        fake.pointer(EMPTY, EMPTY);
+        fake.pointer(EMPTY + 0x08, 0);
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.objects_in("\\Device"),
+            Err(ObjectError::TooMany {
+                what: "a directory's entries",
+                bound: MAX_ENTRIES
+            })
+        );
+    }
+
+    /// Listing a **leaf** is refused rather than answered.
+    ///
+    /// `object_at` guards walking *through* a device on the way to something else; this is the
+    /// same guard at the end of a path. Without it a driver's own fields are read as thirty-seven
+    /// bucket pointers and whatever they hold is followed as chains.
+    #[test]
+    fn a_leaf_is_not_listed_as_a_directory() {
+        let fake = namespace();
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.objects_in("\\Device\\MountPointManager"),
+            Err(ObjectError::NotADirectory {
+                component: "MountPointManager".to_string(),
+                rest: String::new(),
+            })
+        );
+    }
+
+    /// A string with a length and **no buffer** is malformed, not empty.
+    ///
+    /// Answered as an empty string it becomes a symbolic link whose target is `""`, which a
+    /// caller publishes as a device reachable under no name at all.
+    #[test]
+    fn a_length_with_no_buffer_is_malformed_rather_than_empty() {
+        let mut fake = namespace();
+        const LINK: u64 = 0xffff_a000_0042_0000;
+        fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\X");
+        // Everything the link check looks at still holds; only the buffer is gone.
+        fake.pointer(LINK + 0x10, 0);
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.link_target(LINK),
+            Err(ObjectError::Malformed {
+                reason: "a UNICODE_STRING has a length and no buffer"
             })
         );
     }
