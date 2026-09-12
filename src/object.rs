@@ -95,6 +95,14 @@ pub enum ObjectError {
     /// A component resolved to something that is not a directory, with path left to walk.
     #[error("{component:?} is not a directory, so {rest:?} cannot be under it")]
     NotADirectory { component: String, rest: String },
+    /// A component could not be **typed**, so this walk will not treat it as a directory.
+    ///
+    /// Distinct from [`Self::NotADirectory`], and the distinction is the whole reason this variant
+    /// exists: that one says an object *is* something else, which for a directory this could not
+    /// name would be a lie. The walk still refuses, because a guard that passes on doubt passes on
+    /// exactly the case it is for -- but it refuses saying it could not tell.
+    #[error("{component:?} could not be typed, so this walk will not descend through it")]
+    Untyped { component: String },
     /// A cap was reached, so what this could answer with is a **short** list.
     #[error("{what} exceeded its bound of {bound}, so this list would be shorter than the truth")]
     TooMany { what: &'static str, bound: usize },
@@ -107,6 +115,14 @@ pub struct KernelObject {
     pub address: u64,
     /// Its name in the directory that holds it, not a path.
     pub name: String,
+    /// Whether [`Self::name`] **is** that name, or only shows it.
+    ///
+    /// A name is a counted run of UTF-16 units, which an unpaired surrogate makes legal as a name
+    /// and illegal as text. Such a name is rendered with replacements so the object still lists,
+    /// and this says the rendering is not an identity: [`Namespace::object_at`] will not resolve to
+    /// an object whose name it cannot reproduce exactly, because two such names render alike and a
+    /// caller would get whichever came first.
+    pub exact_name: bool,
     /// The object type's name (`Device`, `SymbolicLink`, `Directory`), when the type table could
     /// be read. `None` is "this walk could not say", never "untyped".
     pub type_name: Option<String>,
@@ -162,8 +178,8 @@ pub struct Globals {
     /// `nt!ObHeaderCookie` and `nt!ObTypeIndexTable`, which together turn a header's obfuscated
     /// `TypeIndex` into a type object. Optional: a build without them still resolves names, and a
     /// `type_name` of `None` is the honest answer there.
-    pub header_cookie: u64,
-    pub type_index_table: u64,
+    pub header_cookie: Option<u64>,
+    pub type_index_table: Option<u64>,
 }
 
 /// Which optional header is wanted, as the bit the kernel's own lookup is keyed on.
@@ -259,7 +275,7 @@ impl<'a> Namespace<'a> {
     }
 
     /// One `_UNICODE_STRING`, read from wherever it sits.
-    fn unicode_at(&self, at: u64) -> Result<String, ObjectError> {
+    fn unicode_at(&self, at: u64) -> Result<(String, bool), ObjectError> {
         let size = (self.layout.unicode_buffer as usize) + self.layout.pointer;
         let bytes = self.read(at, size)?;
         let field = |offset: u32| {
@@ -276,7 +292,7 @@ impl<'a> Namespace<'a> {
         }
         let buffer = self.pointer_at(at.wrapping_add(u64::from(self.layout.unicode_buffer)))?;
         if length == 0 {
-            return Ok(String::new());
+            return Ok((String::new(), true));
         }
         // **A length with no buffer is not an empty string**, it is a structure contradicting
         // itself -- and an empty string is what a caller would publish as a symbolic link's
@@ -305,7 +321,7 @@ impl<'a> Namespace<'a> {
     ///
     /// `Ok(None)` is an object filed under no name at all, which is ordinary — most objects are
     /// reached by handle and never named.
-    fn name_of(&self, body: u64) -> Result<Option<String>, ObjectError> {
+    fn name_of(&self, body: u64) -> Result<Option<(String, bool)>, ObjectError> {
         let header = self.header_of(body);
         let mask = self.read(
             header.wrapping_add(u64::from(self.layout.header_info_mask)),
@@ -361,7 +377,7 @@ impl<'a> Namespace<'a> {
     /// byte of the header's own address — so a build whose cookie this cannot find gets `None`
     /// rather than a type read out of the wrong table slot.
     fn type_of(&self, body: u64) -> Option<String> {
-        let (cookie, table) = (self.globals.header_cookie, self.globals.type_index_table);
+        let (cookie, table) = (self.globals.header_cookie?, self.globals.type_index_table?);
         let header = self.header_of(body);
         let raw = self
             .read(
@@ -377,7 +393,7 @@ impl<'a> Namespace<'a> {
         if entry == 0 {
             return None;
         }
-        let name = self
+        let (name, _) = self
             .unicode_at(entry.wrapping_add(u64::from(self.layout.type_name)))
             .ok()?;
         (!name.is_empty()).then_some(name)
@@ -387,12 +403,13 @@ impl<'a> Namespace<'a> {
     fn named_in(&self, directory: u64) -> Result<Vec<KernelObject>, ObjectError> {
         let mut out = Vec::new();
         for body in self.entries_of(directory)? {
-            let Some(name) = self.name_of(body)? else {
+            let Some((name, exact_name)) = self.name_of(body)? else {
                 continue;
             };
             out.push(KernelObject {
                 address: body,
                 name,
+                exact_name,
                 type_name: self.type_of(body),
                 security_descriptor: self.security_of(body)?,
             });
@@ -415,7 +432,7 @@ impl<'a> Namespace<'a> {
             let found = self
                 .named_in(directory)?
                 .into_iter()
-                .find(|object| object.name.eq_ignore_ascii_case(component))
+                .find(|object| object.exact_name && object.name.eq_ignore_ascii_case(component))
                 .ok_or_else(|| ObjectError::NotFound {
                     directory: walked.clone(),
                     component: component.clone(),
@@ -427,11 +444,19 @@ impl<'a> Namespace<'a> {
             // known. **Fail closed**: an object whose type could not be read is not one to walk
             // through on the chance that it is a directory, because what that reads is a device's
             // own fields as bucket pointers.
-            if found.type_name.as_deref() != Some(DIRECTORY) {
-                return Err(ObjectError::NotADirectory {
-                    component: component.clone(),
-                    rest: components[at + 1..].join("\\"),
-                });
+            match found.type_name.as_deref() {
+                Some(DIRECTORY) => {}
+                Some(_) => {
+                    return Err(ObjectError::NotADirectory {
+                        component: component.clone(),
+                        rest: components[at + 1..].join("\\"),
+                    });
+                }
+                None => {
+                    return Err(ObjectError::Untyped {
+                        component: component.clone(),
+                    });
+                }
             }
             directory = found.address;
             if walked.len() > 1 {
@@ -453,11 +478,19 @@ impl<'a> Namespace<'a> {
             "" => self.pointer_at(self.globals.root)?,
             path => {
                 let found = self.object_at(path)?;
-                if found.type_name.as_deref() != Some(DIRECTORY) {
-                    return Err(ObjectError::NotADirectory {
-                        component: found.name,
-                        rest: String::new(),
-                    });
+                match found.type_name.as_deref() {
+                    Some(DIRECTORY) => {}
+                    Some(_) => {
+                        return Err(ObjectError::NotADirectory {
+                            component: found.name,
+                            rest: String::new(),
+                        });
+                    }
+                    None => {
+                        return Err(ObjectError::Untyped {
+                            component: found.name,
+                        });
+                    }
                 }
                 found.address
             }
@@ -507,7 +540,12 @@ impl<'a> Namespace<'a> {
                 reason: "the link target is not a string this can vouch for",
             });
         }
-        let target = self.unicode_at(at)?;
+        let (target, exact) = self.unicode_at(at)?;
+        if !exact {
+            return Err(ObjectError::Malformed {
+                reason: "the link target is not text, so it is not a path to follow",
+            });
+        }
         if !target.starts_with('\\') {
             return Err(ObjectError::Malformed {
                 reason: "the link target is not an object path, so this is not a target",
@@ -542,12 +580,22 @@ fn components_of(path: &str) -> Result<Vec<String>, ObjectError> {
     Ok(parts)
 }
 
-/// UTF-16 little-endian, with anything unpaired replaced rather than refused: a name is being read
-/// to show someone, and a lone surrogate in it is not a reason to lose the object.
-fn utf16(bytes: &[u8]) -> String {
+/// UTF-16 little-endian, and whether what came back **is** the name or only shows it.
+///
+/// A name the object manager holds is a counted run of UTF-16 units, which is not the same thing
+/// as text: an unpaired surrogate is a legal name and not a legal `String`. Replacing one keeps the
+/// object listable, and the flag is what stops that rendering being used as an identity -- two
+/// different names with a lone surrogate each render alike, so a walk matching on the rendering
+/// resolves whichever came first, and a caller asking for the replacement character resolves an
+/// object whose name has no such character in it. For a security question that is a device
+/// answering under a name that is not its own.
+fn utf16(bytes: &[u8]) -> (String, bool) {
     let (pairs, _) = bytes.as_chunks::<2>();
     let units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
-    String::from_utf16_lossy(&units)
+    match String::from_utf16(&units) {
+        Ok(exact) => (exact, true),
+        Err(_) => (String::from_utf16_lossy(&units), false),
+    }
 }
 
 impl DebugEngine {
@@ -614,8 +662,8 @@ impl DebugEngine {
         Ok(Globals {
             root: self.symbol_offset("nt!ObpRootDirectoryObject")?,
             info_mask_to_offset: self.symbol_offset("nt!ObpInfoMaskToOffset")?,
-            header_cookie: self.symbol_offset("nt!ObHeaderCookie")?,
-            type_index_table: self.symbol_offset("nt!ObTypeIndexTable")?,
+            header_cookie: self.symbol_offset("nt!ObHeaderCookie").ok(),
+            type_index_table: self.symbol_offset("nt!ObTypeIndexTable").ok(),
         })
     }
 
@@ -695,8 +743,8 @@ mod tests {
         Globals {
             root: ROOT_POINTER,
             info_mask_to_offset: INFO_OFFSETS,
-            header_cookie: COOKIE,
-            type_index_table: TYPE_TABLE,
+            header_cookie: Some(COOKIE),
+            type_index_table: Some(TYPE_TABLE),
         }
     }
 
@@ -769,6 +817,24 @@ mod tests {
                 self.pointer(entry + 0x08, *object);
                 self.pointer(at + bucket * 8, entry);
             }
+        }
+
+        /// An object whose name is written as raw UTF-16 units rather than as text, which is
+        /// what the object manager actually holds.
+        fn units_named(&mut self, body: u64, units: &[u16], type_index: u8) {
+            let header = body - 0x30;
+            self.put(header + 0x18, &[type_index]);
+            self.put(header + 0x1a, &[0x02]);
+            self.pointer(header + 0x28, 0);
+            self.put(INFO_OFFSETS + u64::from(0x02u8 & 0x03), &[0x20]);
+            let name_info = header - 0x20;
+            let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+            let length = bytes.len() as u16;
+            self.put(name_info + 0x08, &[0u8; 16]);
+            self.put(name_info + 0x08, &length.to_le_bytes());
+            self.put(name_info + 0x0a, &length.to_le_bytes());
+            self.pointer(name_info + 0x10, name_info + 0x1000);
+            self.put(name_info + 0x1000, &bytes);
         }
 
         /// The flags a symbolic link carries, which say which arm of its union is live.
@@ -1103,16 +1169,15 @@ mod tests {
         let namespace = Namespace::new(&fake, layout(), globals());
         assert_eq!(
             namespace.object_at("\\Device\\MountPointManager"),
-            Err(ObjectError::NotADirectory {
+            Err(ObjectError::Untyped {
                 component: "Device".to_string(),
-                rest: "MountPointManager".to_string(),
             }),
-            "an unreadable type is not a directory"
+            "it refuses, and says it could not tell rather than that this is something else"
         );
         assert!(
             matches!(
                 namespace.objects_in("\\Device"),
-                Err(ObjectError::NotADirectory { .. })
+                Err(ObjectError::Untyped { .. })
             ),
             "and listing it is the same refusal"
         );
@@ -1134,6 +1199,94 @@ mod tests {
             Err(ObjectError::Malformed {
                 reason: "a UNICODE_STRING is longer than its own maximum"
             })
+        );
+    }
+
+    /// A name that is **not text** lists, and does not resolve.
+    ///
+    /// An unpaired surrogate is a legal object name and an illegal `String`. Rendering it with
+    /// replacements keeps the object visible, which is what a listing is for; matching on that
+    /// rendering would let two different names answer to one query, and would let a caller asking
+    /// for the replacement character reach an object whose name has no such character in it. For a
+    /// device that is answering under a name that is not its own.
+    #[test]
+    fn a_name_that_is_not_text_lists_but_does_not_resolve() {
+        let mut fake = namespace();
+        const ODD: u64 = 0xffff_a000_0060_0000;
+        const OTHER: u64 = 0xffff_a000_0061_0000;
+        // Two different names, each with a lone high surrogate, which render identically.
+        fake.units_named(ODD, &[0x41, 0xd800, 0x42], obfuscated(4, ODD));
+        fake.units_named(OTHER, &[0x41, 0xdbff, 0x42], obfuscated(4, OTHER));
+        fake.directory(DEVICE_DIR, &[DEVICE, ODD, OTHER]);
+        let namespace = Namespace::new(&fake, layout(), globals());
+
+        let listed = namespace
+            .objects_in("\\Device")
+            .expect("the directory lists");
+        let rendered: Vec<&str> = listed
+            .iter()
+            .filter(|one| !one.exact_name)
+            .map(|one| one.name.as_str())
+            .collect();
+        assert_eq!(
+            rendered.len(),
+            2,
+            "both are listed, so neither object is lost: {listed:?}"
+        );
+        assert_eq!(
+            rendered[0], rendered[1],
+            "and they render alike, which is what makes the rendering useless as an identity"
+        );
+
+        assert!(
+            matches!(
+                namespace.object_at(&format!("\\Device\\{}", rendered[0])),
+                Err(ObjectError::NotFound { .. })
+            ),
+            "so neither answers to it"
+        );
+        assert_eq!(
+            namespace
+                .object_at("\\Device\\MountPointManager")
+                .map(|found| found.address),
+            Ok(DEVICE),
+            "and the ordinary name beside them still resolves"
+        );
+    }
+
+    /// A target that cannot name **types** still answers everything that does not need one.
+    ///
+    /// Requiring the type globals was the previous round's answer and was too broad: resolving a
+    /// one-component path, listing the root, and reading a link target all need no type at all. The
+    /// guards still fail closed -- they just say [`ObjectError::Untyped`] when they cannot tell.
+    #[test]
+    fn a_target_that_cannot_name_types_still_answers_what_needs_none() {
+        let fake = namespace();
+        let untyped = Globals {
+            header_cookie: None,
+            type_index_table: None,
+            ..globals()
+        };
+        let namespace = Namespace::new(&fake, layout(), untyped);
+
+        assert_eq!(
+            namespace.object_at("\\Device").map(|found| found.address),
+            Ok(DEVICE_DIR),
+            "one component needs no type"
+        );
+        assert_eq!(
+            namespace
+                .objects_in("\\")
+                .map(|found| found.into_iter().map(|one| one.name).collect::<Vec<_>>()),
+            Ok(vec!["Device".to_string()]),
+            "nor does listing the root"
+        );
+        assert_eq!(
+            namespace.object_at("\\Device\\MountPointManager"),
+            Err(ObjectError::Untyped {
+                component: "Device".to_string()
+            }),
+            "and descending is refused, saying which of the two it is"
         );
     }
 
