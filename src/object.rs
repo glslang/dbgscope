@@ -255,14 +255,39 @@ impl<'a> Namespace<'a> {
         }
     }
 
+    /// A pointer, at whichever of the two widths this target uses.
+    ///
+    /// **Any other width is refused rather than treated as eight.** [`Layout`] is public and its
+    /// fields are a caller's to fill in, so a width of two would have this read two bytes and then
+    /// take eight of them — a panic, inside calls whose whole contract is that they return an
+    /// error. Nothing here trusts a layout to be one this crate built.
     fn pointer_at(&self, at: u64) -> Result<u64, ObjectError> {
         let bytes = self.read(at, self.layout.pointer)?;
-        Ok(match self.layout.pointer {
-            4 => u64::from(u32::from_le_bytes(
+        match self.layout.pointer {
+            4 => Ok(u64::from(u32::from_le_bytes(
                 bytes[..4].try_into().unwrap_or_default(),
+            ))),
+            8 => Ok(u64::from_le_bytes(
+                bytes[..8].try_into().unwrap_or_default(),
             )),
-            _ => u64::from_le_bytes(bytes[..8].try_into().unwrap_or_default()),
-        })
+            _ => Err(ObjectError::Malformed {
+                reason: "a pointer on this target is neither four bytes nor eight",
+            }),
+        }
+    }
+
+    /// Two bytes out of a structure this walk read, at an offset a [`Layout`] gave it.
+    ///
+    /// Bounds-checked for the same reason as the widths above: the offsets are public fields, and
+    /// one past the end of what was read is a panic where this owes an error.
+    fn field_at(bytes: &[u8], offset: u32) -> Result<u16, ObjectError> {
+        bytes
+            .get(offset as usize..)
+            .and_then(|rest| rest.first_chunk::<2>())
+            .map(|pair| u16::from_le_bytes(*pair))
+            .ok_or(ObjectError::Malformed {
+                reason: "a field sits outside the structure this layout describes",
+            })
     }
 
     /// The object body every entry of a directory points at.
@@ -314,14 +339,11 @@ impl<'a> Namespace<'a> {
     ) -> Result<(String, bool), ObjectError> {
         let size = (self.layout.unicode_buffer as usize) + self.layout.pointer;
         let bytes = self.read(at, size)?;
-        let field = |offset: u32| {
-            u16::from_le_bytes(bytes[offset as usize..][..2].try_into().unwrap_or_default())
-        };
-        let length = field(self.layout.unicode_length) as usize;
+        let length = Self::field_at(&bytes, self.layout.unicode_length)? as usize;
         // **A string that is longer than its own buffer is torn**, and reading `Length` alone
         // takes whatever follows into a name the walk then matches paths against -- which
         // resolves some other object, rather than failing to resolve this one.
-        if length > field(self.layout.unicode_length + 2) as usize {
+        if length > Self::field_at(&bytes, self.layout.unicode_length + 2)? as usize {
             return Err(ObjectError::Malformed {
                 reason: "a UNICODE_STRING is longer than its own maximum",
             });
@@ -543,11 +565,14 @@ impl<'a> Namespace<'a> {
     /// exactly on `Length` and `MaximumLength`, `CallbackContext` lands on `Buffer`, so decoding
     /// without looking reads a name out of whatever a context pointer happens to address.
     ///
-    /// So what is checked is what a **link target** is rather than what a string is. The lengths
-    /// have to be a string's, and then the thing they describe has to be an object path — which
-    /// begins at the root, with a backslash. A code address whose low halves happen to pass for
-    /// lengths gets that far and no further, because what its context points at does not begin
-    /// with one.
+    /// What remains after the flag is **structural** and nothing more: a whole number of UTF-16
+    /// units, within its own maximum, addressing a buffer that reads. A target is deliberately not
+    /// held to looking like an object path, and the shape of that mistake is worth recording --
+    /// this did require one to begin with a backslash, which refuses `\\KnownDlls\\KnownDllPath`,
+    /// whose target is the DOS path `C:\\Windows\\System32`. The kernel does test a leading
+    /// backslash two blocks earlier in that routine, and it is testing the **remaining name** being
+    /// parsed rather than the target; reading one as the other is how a real link came to be
+    /// refused.
     ///
     /// **And the discriminator is read first**, because the checks above are evidence and the flag
     /// is the answer: [`SYMBOLIC_LINK_CALLBACK`] is the bit the object manager itself branches on,
@@ -568,11 +593,8 @@ impl<'a> Namespace<'a> {
         let at = link.wrapping_add(u64::from(self.layout.link_target));
         let size = (self.layout.unicode_buffer as usize) + self.layout.pointer;
         let bytes = self.read(at, size)?;
-        let field = |offset: u32| {
-            u16::from_le_bytes(bytes[offset as usize..][..2].try_into().unwrap_or_default())
-        };
-        let length = field(self.layout.unicode_length);
-        let maximum = field(self.layout.unicode_length + 2);
+        let length = Self::field_at(&bytes, self.layout.unicode_length)?;
+        let maximum = Self::field_at(&bytes, self.layout.unicode_length + 2)?;
         if length == 0 || !length.is_multiple_of(2) || length > maximum {
             return Err(ObjectError::Malformed {
                 reason: "the link target is not a string this can vouch for",
@@ -582,11 +604,6 @@ impl<'a> Namespace<'a> {
         if !exact {
             return Err(ObjectError::Malformed {
                 reason: "the link target is not text, so it is not a path to follow",
-            });
-        }
-        if !target.starts_with('\\') {
-            return Err(ObjectError::Malformed {
-                reason: "the link target is not an object path, so this is not a target",
             });
         }
         Ok(target)
@@ -1137,30 +1154,18 @@ mod tests {
             "a code address is not a whole number of UTF-16 units"
         );
 
-        // **And the case the lengths do not catch**, which is the one that matters: a callback
-        // address whose low half is an even, non-zero, in-range length. Everything a string must
-        // satisfy holds, the context pointer is mapped, and what it addresses decodes perfectly
-        // well -- as text that is not an object path. Nothing about the *type* would have stopped
-        // this: a callback-backed link is a `SymbolicLink` like any other.
-        const PASSES: u64 = 0xffff_a000_0043_0000;
-        const CONTEXT: u64 = 0xffff_a000_0051_0000;
-        fake.flags(PASSES, 0);
-        fake.pointer(PASSES + 0x08, 0xffff_f805_cb41_0010);
-        fake.pointer(PASSES + 0x10, CONTEXT);
-        fake.put(
-            CONTEXT,
-            &"HeapFree"
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes)
-                .collect::<Vec<_>>(),
-        );
+        // **A target that is not an object path at all**, which is ordinary rather than
+        // suspicious: `\\KnownDlls\\KnownDllPath` points at a DOS path. This walk used to require a
+        // leading backslash and refused exactly that link -- a content rule standing in for the
+        // flag, and wrong as soon as there was a flag to ask.
+        const DOS: u64 = 0xffff_a000_0043_0000;
+        fake.flags(DOS, 0);
+        fake.string(DOS + 0x08, DOS + 0x1000, "C:\\Windows\\System32");
         let namespace = Namespace::new(&fake, layout(), globals());
         assert_eq!(
-            namespace.link_target(PASSES),
-            Err(ObjectError::Malformed {
-                reason: "the link target is not an object path, so this is not a target"
-            }),
-            "the lengths passed, and what they described was not a target"
+            namespace.link_target(DOS).as_deref(),
+            Ok("C:\\Windows\\System32"),
+            "the flag said this is a target, so what it holds is the answer"
         );
     }
 
@@ -1379,6 +1384,46 @@ mod tests {
             namespace.link_target(LINK).as_deref(),
             Ok(long.as_str()),
             "a target this long is a path, not a name that got out of hand"
+        );
+    }
+
+    /// A layout this crate did not build is **refused**, never panicked on.
+    ///
+    /// [`Layout`] is public and so is [`Namespace::new`], so its fields are a caller's to fill in
+    /// -- and every one of them is an index into bytes this walk read. A pointer width of two has
+    /// two bytes read and eight taken; an offset past the end of a structure is the same fault by
+    /// another route. Both are a panic inside calls whose whole contract is that they return an
+    /// error, so both are errors.
+    #[test]
+    fn a_layout_this_crate_did_not_build_is_refused_rather_than_panicked_on() {
+        let fake = namespace();
+
+        let narrow = Layout {
+            pointer: 2,
+            ..layout()
+        };
+        assert_eq!(
+            Namespace::new(&fake, narrow, globals()).object_at("\\Device"),
+            Err(ObjectError::Malformed {
+                reason: "a pointer on this target is neither four bytes nor eight"
+            })
+        );
+
+        // A string field placed past the end of the structure the walk reads for it. The link
+        // itself is whole, so what refuses this is the offset rather than a read that failed.
+        let mut fake = fake;
+        const LINK: u64 = 0xffff_a000_0047_0000;
+        fake.flags(LINK, 0);
+        fake.string(LINK + 0x08, LINK + 0x1000, "\\Device\\X");
+        let adrift = Layout {
+            unicode_length: 0x40,
+            ..layout()
+        };
+        assert_eq!(
+            Namespace::new(&fake, adrift, globals()).link_target(LINK),
+            Err(ObjectError::Malformed {
+                reason: "a field sits outside the structure this layout describes"
+            })
         );
     }
 
