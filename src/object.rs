@@ -456,13 +456,23 @@ impl<'a> Namespace<'a> {
 
     /// What a symbolic link points at.
     ///
-    /// **`LinkTarget` shares its storage with a callback pointer**, so what is there is checked
-    /// before it is followed rather than after: `Callback` lands exactly on `Length` and
-    /// `MaximumLength`, and `CallbackContext` lands on `Buffer`, so decoding without looking
-    /// reads a name out of whatever a context pointer happens to address. The checks are what a
-    /// string must satisfy and a function address need not -- a whole number of UTF-16 units,
-    /// within its own maximum -- and they are **not** a way to tell the two arms apart on their
-    /// own: filter by [`KernelObject::type_name`] first, and treat this as the second gate.
+    /// **`LinkTarget` shares its storage with a callback pointer**, and the type does not tell
+    /// the two apart: a callback-backed link is a `SymbolicLink` like any other. `Callback` lands
+    /// exactly on `Length` and `MaximumLength`, `CallbackContext` lands on `Buffer`, so decoding
+    /// without looking reads a name out of whatever a context pointer happens to address.
+    ///
+    /// So what is checked is what a **link target** is rather than what a string is. The lengths
+    /// have to be a string's, and then the thing they describe has to be an object path — which
+    /// begins at the root, with a backslash. A code address whose low halves happen to pass for
+    /// lengths gets that far and no further, because what its context points at does not begin
+    /// with one.
+    ///
+    /// **The discriminating flag is deliberately not read.** `_OBJECT_SYMBOLIC_LINK::Flags` is
+    /// what the object manager itself branches on, and which bit that is could not be measured on
+    /// this bench: local kernel debugging is not enabled here, a minidump carries no namespace,
+    /// and a bit guessed from reading about it would be a rule nothing checked. Refusing a
+    /// callback link is the answer that cannot be wrong in the direction that matters; reading the
+    /// flag would let one be *answered*, and that is worth doing from a live kernel.
     pub fn link_target(&self, link: u64) -> Result<String, ObjectError> {
         let at = link.wrapping_add(u64::from(self.layout.link_target));
         let size = (self.layout.unicode_buffer as usize) + self.layout.pointer;
@@ -477,7 +487,13 @@ impl<'a> Namespace<'a> {
                 reason: "the link target is not a string this can vouch for",
             });
         }
-        self.unicode_at(at)
+        let target = self.unicode_at(at)?;
+        if !target.starts_with('\\') {
+            return Err(ObjectError::Malformed {
+                reason: "the link target is not an object path, so this is not a target",
+            });
+        }
+        Ok(target)
     }
 }
 
@@ -985,6 +1001,31 @@ mod tests {
                 reason: "the link target is not a string this can vouch for"
             }),
             "a code address is not a whole number of UTF-16 units"
+        );
+
+        // **And the case the lengths do not catch**, which is the one that matters: a callback
+        // address whose low half is an even, non-zero, in-range length. Everything a string must
+        // satisfy holds, the context pointer is mapped, and what it addresses decodes perfectly
+        // well -- as text that is not an object path. Nothing about the *type* would have stopped
+        // this: a callback-backed link is a `SymbolicLink` like any other.
+        const PASSES: u64 = 0xffff_a000_0043_0000;
+        const CONTEXT: u64 = 0xffff_a000_0051_0000;
+        fake.pointer(PASSES + 0x08, 0xffff_f805_cb41_0010);
+        fake.pointer(PASSES + 0x10, CONTEXT);
+        fake.put(
+            CONTEXT,
+            &"HeapFree"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let namespace = Namespace::new(&fake, layout(), globals());
+        assert_eq!(
+            namespace.link_target(PASSES),
+            Err(ObjectError::Malformed {
+                reason: "the link target is not an object path, so this is not a target"
+            }),
+            "the lengths passed, and what they described was not a target"
         );
     }
 
