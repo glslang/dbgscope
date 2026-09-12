@@ -2844,11 +2844,35 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
 /// memory rather than about a register and cannot appear here; it is matched with the reads so the
 /// arms stay exhaustive over the enum rather than over a wildcard, which is what keeps this honest
 /// when iced adds one.
+///
+/// **One factory, kept for the thread.** iced's factory exists to be reused -- it owns the vectors
+/// the answer is built in -- so making one per instruction throws those away and allocates again
+/// for the next, which `decode_range` does once per instruction over hundreds of functions.
+/// Thread-local rather than a parameter because the other caller is `split_instruction`, which is
+/// public and is handed one line at a time; a signature that made every caller carry scratch would
+/// spread this crate's bookkeeping into theirs. `NO_MEMORY_USAGE` because the memory half of the
+/// answer is gathered and thrown away here.
 fn written_registers(decoded: &iced_x86::Instruction, bitness: u32) -> Vec<RegisterOperand> {
+    use iced_x86::InstructionInfoOptions;
+    thread_local! {
+        static FACTORY: std::cell::RefCell<iced_x86::InstructionInfoFactory> =
+            std::cell::RefCell::new(iced_x86::InstructionInfoFactory::new());
+    }
+    FACTORY.with(|factory| {
+        let mut factory = factory.borrow_mut();
+        let info = factory.info_options(decoded, InstructionInfoOptions::NO_MEMORY_USAGE);
+        written_from(info.used_registers(), bitness)
+    })
+}
+
+/// The registers an instruction's info says it writes, as operands.
+///
+/// Split from the factory above so the borrow ends with it: the answer is owned rather than
+/// borrowed out of scratch storage the next instruction will overwrite.
+fn written_from(used: &[iced_x86::UsedRegister], bitness: u32) -> Vec<RegisterOperand> {
     use iced_x86::{OpAccess, Register};
-    let mut info = iced_x86::InstructionInfoFactory::new();
     let mut written: Vec<RegisterOperand> = Vec::new();
-    for used in info.info(decoded).used_registers() {
+    for used in used {
         let writes = match used.access() {
             OpAccess::Write
             | OpAccess::CondWrite
