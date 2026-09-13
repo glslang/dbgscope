@@ -203,12 +203,23 @@ pub struct Listing {
 }
 
 impl Listing {
-    /// Everything the directory holds that this could not present, however it failed.
+    /// Entries this **reached** and could not present, however they failed.
     ///
-    /// For a caller that only needs to know the list is short -- which is most of them, since a
-    /// short list read as a complete one is the failure either count exists to prevent.
+    /// **Not a completeness test**, and the distinction is why [`Self::is_complete`] exists
+    /// beside it: a walk stopped by [`Namespace::halting`] never reaches the rest of the
+    /// directory, so this returns zero for a listing that is missing an unknown number of
+    /// entries. A caller branching on `skipped() == 0` would read that as the whole directory,
+    /// which is the one reading these counts exist to prevent.
     pub fn skipped(&self) -> usize {
         self.unreadable + self.malformed
+    }
+
+    /// Whether this is the whole directory: every entry reached, and every one of them presented.
+    ///
+    /// What a caller should branch on before treating an absence as a fact. An empty list is
+    /// "nothing is filed here" under this and nothing at all otherwise.
+    pub fn is_complete(&self) -> bool {
+        !self.halted && self.skipped() == 0
     }
 }
 
@@ -473,6 +484,14 @@ impl<'a> Namespace<'a> {
         let mut out = Vec::new();
         let mut followed = 0usize;
         for bucket in 0..self.layout.buckets {
+            // **Polled before the bucket is read, not only while a chain is followed.** An empty
+            // bucket never enters the loop below, so a directory that is empty -- or merely has a
+            // long run of empty buckets -- was unstoppable: `halting(&|| true)` still paid one
+            // target read per bucket, up to the thousand a layout may declare, and answered
+            // `halted: false` having done all of it.
+            if self.stopped() {
+                return Ok((out, true));
+            }
             let at = directory
                 .wrapping_add(u64::from(self.layout.hash_buckets))
                 .wrapping_add((bucket * self.layout.pointer) as u64);
@@ -1665,7 +1684,29 @@ mod tests {
             "and stopped, it comes back at once rather than running to the bound"
         );
 
-        // Three: the **entry** poll, on a construction the chain poll cannot reach. Held off
+        // Three: the **bucket** poll, on a construction neither of the others can reach. An empty
+        // directory enters no chain and names no entry, so it is the one shape where the only
+        // poll that can fire is the one before a bucket is read -- and without it the walk pays a
+        // target read per bucket, up to the thousand a layout may declare, and then says it was
+        // not stopped.
+        let mut bare = namespace();
+        bare.directory(ROOT, &[]);
+        let empty = Namespace::new(&bare, layout(), globals())
+            .expect("the fixture layout is one this crate builds")
+            .halting(&|| true);
+        let listed = empty
+            .objects_in("\\")
+            .expect("an empty directory still lists");
+        assert!(
+            listed.halted,
+            "an empty directory is buckets to read, and stopping means not reading them: {listed:?}"
+        );
+        assert!(
+            !listed.is_complete(),
+            "and a halted listing is not a complete one, whatever its counts say"
+        );
+
+        // Four: the **entry** poll, on a construction the chain poll cannot reach. Held off
         // until the chain has finished, the only poll left that can fire is the one inside
         // `named_in` -- so an empty list here is that poll and nothing else, where without it the
         // entry would be named and listed.
