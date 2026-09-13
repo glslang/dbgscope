@@ -141,6 +141,13 @@ pub enum ObjectError {
     /// A cap was reached, so what this could answer with is a **short** list.
     #[error("{what} exceeded its bound of {bound}, so this list would be shorter than the truth")]
     TooMany { what: &'static str, bound: usize },
+    /// The walk was stopped before it could answer -- a caller's deadline, or an interrupt.
+    ///
+    /// **Not [`Self::NotFound`] and not [`Self::TooMany`]**: the first says the target does not
+    /// hold it and the second that this walk refuses to answer about it, while this says nobody
+    /// asked long enough. A caller retries it with more time; the other two never succeed.
+    #[error("the namespace walk was stopped before it reached {what}")]
+    Halted { what: String },
     /// It is not among the entries of its directory that could be named, and some could not be.
     ///
     /// **Distinct from [`Self::NotFound`], and the distinction is the whole reason this exists.**
@@ -187,6 +194,12 @@ pub struct Listing {
     /// is a finding rather than a wrinkle. A walk that reported "1 unreadable" for both would
     /// hand a reader the benign reading of the alarming case.
     pub malformed: usize,
+    /// True when the walk was stopped before the directory ran out.
+    ///
+    /// **The list is then a prefix of the directory rather than the directory**, and the counts
+    /// beside it describe only what was reached. Separate from them because it is not an entry
+    /// this could not read -- it is entries it never looked at, and there is no saying how many.
+    pub halted: bool,
 }
 
 impl Listing {
@@ -350,6 +363,7 @@ pub struct Namespace<'a> {
     memory: &'a dyn Memory,
     layout: Layout,
     globals: Globals,
+    halt: Option<&'a dyn Fn() -> bool>,
 }
 
 impl<'a> Namespace<'a> {
@@ -373,7 +387,32 @@ impl<'a> Namespace<'a> {
             memory,
             layout,
             globals,
+            halt: None,
         })
+    }
+
+    /// The same walk, stoppable.
+    ///
+    /// **A directory is an unbounded amount of work behind one call**, which is the whole reason
+    /// this exists: `\GLOBAL??` on an ordinary Windows guest holds a couple of hundred entries and
+    /// each costs several reads of target memory, so over a kernel debugging wire the enumeration
+    /// alone can outlast a caller's patience. Without this the caller's only bound is a timeout on
+    /// *waiting*, which abandons the waiter and not the walk -- so the work carries on holding the
+    /// session it runs on, which is the one thing a deadline is supposed to prevent.
+    ///
+    /// `halt` is polled per directory entry and per link of a bucket's chain, which is where the
+    /// reads are. What it stops is reported rather than raised wherever there is a partial answer
+    /// to give: [`Listing::halted`] on an enumeration, and [`ObjectError::Halted`] on a lookup,
+    /// which has no partial answer.
+    #[must_use]
+    pub fn halting(mut self, halt: &'a dyn Fn() -> bool) -> Self {
+        self.halt = Some(halt);
+        self
+    }
+
+    /// Whether the caller has asked this to stop.
+    fn stopped(&self) -> bool {
+        self.halt.is_some_and(|halt| halt())
     }
 
     /// One global this operation cannot do without.
@@ -430,7 +469,7 @@ impl<'a> Namespace<'a> {
     }
 
     /// The object body every entry of a directory points at.
-    fn entries_of(&self, directory: u64) -> Result<Vec<u64>, ObjectError> {
+    fn entries_of(&self, directory: u64) -> Result<(Vec<u64>, bool), ObjectError> {
         let mut out = Vec::new();
         let mut followed = 0usize;
         for bucket in 0..self.layout.buckets {
@@ -446,6 +485,12 @@ impl<'a> Namespace<'a> {
             // pointing at itself is a loop this never leaves, which on a live kernel is a
             // debugger that stops answering rather than a walk that refuses.
             while entry != 0 {
+                // Polled per link rather than per bucket: a chain is where a long directory's
+                // work is, and a bound checked only between buckets leaves a thirty-entry chain
+                // unstoppable.
+                if self.stopped() {
+                    return Ok((out, true));
+                }
                 followed += 1;
                 if followed > MAX_ENTRIES {
                     return Err(ObjectError::TooMany {
@@ -461,7 +506,7 @@ impl<'a> Namespace<'a> {
                 entry = self.pointer_at(entry.wrapping_add(u64::from(self.layout.entry_chain)))?;
             }
         }
-        Ok(out)
+        Ok((out, false))
     }
 
     /// The header that belongs to an object body.
@@ -603,7 +648,14 @@ impl<'a> Namespace<'a> {
         let mut objects = Vec::new();
         let mut unreadable = 0usize;
         let mut malformed = 0usize;
-        for body in self.entries_of(directory)? {
+        let (bodies, mut halted) = self.entries_of(directory)?;
+        for body in bodies {
+            // And again per entry, because naming one is several reads of its own -- the header,
+            // the offset table, the name, the security field and the type.
+            if self.stopped() {
+                halted = true;
+                break;
+            }
             // **An entry this cannot read is skipped and counted, not propagated**, and that is
             // the difference between one paged-out name and a directory nobody can list.
             // Measured on a live Windows Server 26100 guest 2026-09-13: `\GLOBAL??` holds some
@@ -660,6 +712,7 @@ impl<'a> Namespace<'a> {
             objects,
             unreadable,
             malformed,
+            halted,
         })
     }
 
@@ -685,6 +738,7 @@ impl<'a> Namespace<'a> {
         for (at, component) in components.iter().enumerate() {
             let listing = self.named_in(directory)?;
             let skipped = (listing.unreadable, listing.malformed);
+            let halted = listing.halted;
             // **Absent, or absent from what could be read.** A directory with an entry this could
             // not name may hold the very object being asked for, so "not found" is a thing this
             // is only entitled to say when the directory read in full.
@@ -693,6 +747,11 @@ impl<'a> Namespace<'a> {
                 .into_iter()
                 .find(|object| object.exact_name && object.name.eq_ignore_ascii_case(component))
                 .ok_or_else(|| match skipped {
+                    // A walk that stopped says so first: the component may be in the part of the
+                    // directory it never reached, so neither absence below is a thing it knows.
+                    _ if halted => ObjectError::Halted {
+                        what: component.clone(),
+                    },
                     (0, 0) => ObjectError::NotFound {
                         directory: walked.clone(),
                         component: component.clone(),
@@ -1544,6 +1603,101 @@ mod tests {
                 what: "nt!ObpInfoMaskToOffset"
             }),
             "and so is a lookup, rather than reporting the name absent"
+        );
+    }
+
+    /// **A caller's clock reaches inside the enumeration, not only around it.**
+    ///
+    /// A directory is an unbounded amount of work behind one call, and a timeout on *waiting* for
+    /// that call abandons the waiter rather than the walk -- so the work carries on holding
+    /// whatever it runs on, which is the one thing a deadline exists to prevent.
+    ///
+    /// **Three assertions, because there are two polls and they hid each other.** Removing either
+    /// one left this green while the other still stopped the walk, so each is checked on a
+    /// construction the other cannot reach.
+    #[test]
+    fn a_walk_stops_where_its_caller_asks_and_keeps_what_it_read() {
+        let fake = namespace();
+
+        // One: a stopped enumeration is an **answer**, not a failure. What it reached comes back
+        // with `halted` set, so a caller reports a short list as short rather than losing the
+        // work. The prefix is empty here because this fixture's directories hold one entry each.
+        let asked = std::cell::Cell::new(0usize);
+        let at_once = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+        let stopped = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds")
+            .halting(&at_once);
+        let listed = stopped
+            .objects_in("\\")
+            .expect("a stopped enumeration still answers");
+        assert!(listed.halted, "it says the list is a prefix: {listed:?}");
+        assert!(
+            asked.get() > 0,
+            "and the predicate was polled inside the enumeration, not around it"
+        );
+
+        // Two: the **chain** poll, on a construction the entry poll cannot reach. A bucket whose
+        // entries all name nothing is followed to the bound and refused, and `named_in` never
+        // runs because `entries_of` fails first. The loop goes in the **root**, which
+        // `objects_in` reaches from the root pointer with no lookup in front of it -- a sub-path
+        // would resolve its directory first and halt there instead, proving nothing about the
+        // enumeration.
+        let mut looping = namespace();
+        const EMPTY: u64 = ROOT + 0x8000;
+        looping.pointer(ROOT, EMPTY);
+        looping.pointer(EMPTY, EMPTY);
+        looping.pointer(EMPTY + 0x08, 0);
+        let bounded = Namespace::new(&looping, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
+        assert!(
+            matches!(bounded.objects_in("\\"), Err(ObjectError::TooMany { .. })),
+            "unstoppable, this walks to its bound"
+        );
+        let halting = Namespace::new(&looping, layout(), globals())
+            .expect("the fixture layout is one this crate builds")
+            .halting(&|| true);
+        assert_eq!(
+            halting.objects_in("\\").map(|found| found.halted),
+            Ok(true),
+            "and stopped, it comes back at once rather than running to the bound"
+        );
+
+        // Three: the **entry** poll, on a construction the chain poll cannot reach. Held off
+        // until the chain has finished, the only poll left that can fire is the one inside
+        // `named_in` -- so an empty list here is that poll and nothing else, where without it the
+        // entry would be named and listed.
+        let polls = std::cell::Cell::new(0usize);
+        let after_the_chain = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        };
+        let late = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds")
+            .halting(&after_the_chain);
+        let listed = late
+            .objects_in("\\")
+            .expect("a stopped enumeration answers");
+        assert_eq!(
+            (listed.objects.len(), listed.halted),
+            (0, true),
+            "the entry was reached and not named, which is the entry poll: {listed:?}"
+        );
+
+        // And a lookup has no partial answer to give, so it is an error -- **not** one that says
+        // the object is absent, since it may be in the part never reached. A caller told
+        // `NotFound` here would stop looking for something that is there.
+        let stopped = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds")
+            .halting(&|| true);
+        assert!(
+            matches!(
+                stopped.object_at("\\Device"),
+                Err(ObjectError::Halted { .. })
+            ),
+            "a stopped lookup says it was stopped, not that the name is not there"
         );
     }
 
