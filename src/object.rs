@@ -669,6 +669,19 @@ impl<'a> Namespace<'a> {
         let mut malformed = 0usize;
         let (bodies, mut halted) = self.entries_of(directory)?;
         for body in bodies {
+            // **A halt this was already told about is not asked about again, because asking can
+            // consume the answer.** `DebugEngine::interrupted` is `GetInterrupt`, which clears
+            // the pending request on its first poll -- measured in this crate rather than
+            // assumed, by `test_get_interrupt_drain_semantics`, whose asserted vector is
+            // `[true, false, false, false, false]`. So a Ctrl+C caught while the buckets were
+            // walked came back here as `halted`, this loop re-polled, the second answer was
+            // false because the first poll had taken it, and every entry the walk had gathered
+            // was named regardless: thousands of reads on a remote target after the stop, and
+            // `object_at` returning a found object as though the lookup had finished, since it
+            // consults `halted` only when the name is *not* in the listing.
+            if halted {
+                break;
+            }
             // And again per entry, because naming one is several reads of its own -- the header,
             // the offset table, the name, the security field and the type.
             if self.stopped() {
@@ -1622,6 +1635,66 @@ mod tests {
                 what: "nt!ObpInfoMaskToOffset"
             }),
             "and so is a lookup, rather than reporting the name absent"
+        );
+    }
+
+    /// **A halt already reported is not polled for a second time, because polling consumes it.**
+    ///
+    /// `DebugEngine::interrupted` is `GetInterrupt`, which clears the pending request on its first
+    /// poll -- `test_get_interrupt_drain_semantics` in this crate asserts the vector
+    /// `[true, false, false, false, false]`. A predicate like that is **one-shot**, and every
+    /// other construction here uses one that stays true or counts up, so not one of them can see
+    /// this: `entries_of` returned `halted`, `named_in` asked again, the answer was false because
+    /// the first ask had taken it, and the gathered entries were named anyway.
+    #[test]
+    fn a_halt_the_walk_already_reported_is_not_polled_for_a_second_time() {
+        let fake = namespace();
+
+        // Fires exactly once, on the poll after the root's only entry has been gathered: bucket
+        // zero's poll, then its chain's -- which is where the body is pushed -- then bucket one's.
+        // So `entries_of` comes back holding a body *and* saying it was stopped, which is the
+        // shape this needs: a halt at bucket zero gathers nothing and would hide the bug.
+        let polls = std::cell::Cell::new(0usize);
+        let once = || {
+            polls.set(polls.get() + 1);
+            polls.get() == 3
+        };
+        let walk = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds")
+            .halting(&once);
+        let listed = walk
+            .objects_in("\\")
+            .expect("a stopped enumeration still answers");
+        assert_eq!(
+            (listed.objects.len(), listed.halted),
+            (0, true),
+            "the entry was gathered before the stop and must not be named after it: {listed:?}"
+        );
+        assert_eq!(
+            polls.get(),
+            3,
+            "and nothing asked again once the halt came back, which is what consumes it"
+        );
+
+        // And the lookup built on it says it was stopped rather than answering. Without the break
+        // the entry above is in the listing, so this finds it and reports a completed lookup --
+        // `object_at` reaches its `halted` arm only when the name is *not* there.
+        // Its own counter: `once` above is spent, and a one-shot that has already fired is not
+        // one-shot any more -- reusing it here walked to the end and proved nothing.
+        let again = std::cell::Cell::new(0usize);
+        let once_more = || {
+            again.set(again.get() + 1);
+            again.get() == 3
+        };
+        let looking = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds")
+            .halting(&once_more);
+        assert!(
+            matches!(
+                looking.object_at("\\Device"),
+                Err(ObjectError::Halted { .. })
+            ),
+            "a stopped lookup does not answer with the object it had already gathered"
         );
     }
 
