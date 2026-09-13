@@ -48,7 +48,10 @@ use crate::dbgeng::{DbgEngError, DebugEngine};
 /// `\GLOBAL??` on a busy machine holds a few thousand; this is well above that and far below a
 /// chain that has looped. It bounds the whole directory rather than one bucket, because a cycle
 /// can be spread across buckets as easily as kept inside one.
-const MAX_ENTRIES: usize = 65_536;
+// The looping-chain unit tests exhaust this bound. At 65,536 entries their byte-addressed
+// fixtures take hours under Miri; 32 exercises the same refusal with far fewer interpreted reads.
+// Keep the full bound in production and normal tests, including non-test builds under Miri.
+const MAX_ENTRIES: usize = if cfg!(all(test, miri)) { 32 } else { 65_536 };
 
 /// The most path components a name may have. `\Device\HarddiskVolume1` is two.
 const MAX_COMPONENTS: usize = 32;
