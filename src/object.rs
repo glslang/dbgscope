@@ -1171,7 +1171,8 @@ mod tests {
                 Some("Device"),
                 Some(0xffff_b000_0000_0000)
             ),
-            "the descriptor field is a fast reference, and the count in its low bits is not              part of the address"
+            "the descriptor field is a fast reference, and the count in its low bits is not \
+             part of the address"
         );
     }
 
