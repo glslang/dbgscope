@@ -1706,25 +1706,62 @@ mod tests {
             "and a halted listing is not a complete one, whatever its counts say"
         );
 
-        // Four: the **entry** poll, on a construction the chain poll cannot reach. Held off
-        // until the chain has finished, the only poll left that can fire is the one inside
-        // `named_in` -- so an empty list here is that poll and nothing else, where without it the
-        // entry would be named and listed.
-        let polls = std::cell::Cell::new(0usize);
-        let after_the_chain = || {
-            polls.set(polls.get() + 1);
-            polls.get() > 1
+        // Four: the **entry** poll, and the first two goes at this were both green with the poll
+        // deleted. The trap is that every other halt leaves an **empty** listing -- `entries_of`
+        // returns before a single entry is named -- and an empty listing is exactly what deleting
+        // the entry poll produces too, so `objects.len() == 0` cannot tell them apart. What only
+        // a stop *between two namings* can produce is a **proper prefix**: one object out of two.
+        //
+        // So the directory gets a second entry, and the threshold is counted off the fixture
+        // rather than off the walk: one poll per bucket the layout declares, then one per chain
+        // link, and only then one per entry. Deriving it from a counting run instead would move
+        // with the mutation and pass against it again.
+        let mut two = namespace();
+        const SECOND: u64 = ROOT + 0x4_0000;
+        two.object(SECOND, "Second", obfuscated(3, SECOND), 0);
+        two.directory(ROOT, &[DEVICE_DIR, SECOND]);
+
+        // The structure that threshold rests on, asserted rather than assumed -- and on its own
+        // enough to fail if a phase stops polling.
+        let counted = std::cell::Cell::new(0usize);
+        let never = || {
+            counted.set(counted.get() + 1);
+            false
         };
-        let late = Namespace::new(&fake, layout(), globals())
+        let whole = Namespace::new(&two, layout(), globals())
             .expect("the fixture layout is one this crate builds")
-            .halting(&after_the_chain);
+            .halting(&never);
+        let all = whole.objects_in("\\").expect("nothing stopped this one");
+        assert_eq!(
+            (all.objects.len(), all.halted),
+            (2, false),
+            "the fixture holds two and nothing stopped the walk: {all:?}"
+        );
+        assert_eq!(
+            counted.get(),
+            layout().buckets + 2 + 2,
+            "a poll per bucket, then per chain link, then per entry -- the three phases the \
+             threshold below counts past"
+        );
+
+        // Held off through every bucket and chain poll and through the *first* entry's, this can
+        // only fire on the second -- after one object is listed and before the other is.
+        let polls = std::cell::Cell::new(0usize);
+        let after_the_first_naming = || {
+            polls.set(polls.get() + 1);
+            polls.get() > layout().buckets + 2 + 1
+        };
+        let late = Namespace::new(&two, layout(), globals())
+            .expect("the fixture layout is one this crate builds")
+            .halting(&after_the_first_naming);
         let listed = late
             .objects_in("\\")
             .expect("a stopped enumeration answers");
         assert_eq!(
             (listed.objects.len(), listed.halted),
-            (0, true),
-            "the entry was reached and not named, which is the entry poll: {listed:?}"
+            (1, true),
+            "one of the two was named and the walk then stopped, which no other poll can do: \
+             {listed:?}"
         );
 
         // And a lookup has no partial answer to give, so it is an error -- **not** one that says
