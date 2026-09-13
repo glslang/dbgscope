@@ -770,7 +770,18 @@ impl<'a> Namespace<'a> {
         for (at, component) in components.iter().enumerate() {
             let listing = self.named_in(directory)?;
             let skipped = (listing.unreadable, listing.malformed);
-            let halted = listing.halted;
+            // **A stop is the answer whatever the prefix happened to contain**, and this used to
+            // be asked only when the component was *missing* -- so a walk stopped after naming it
+            // handed it back, and for a path with another component behind it descended into that
+            // directory with the interrupt already spent, doing the rest of the lookup's remote
+            // reads after the Ctrl+C meant to end them. A name is not less found for the walk
+            // having been stopped; it is that the caller asked for no more work, and the prefix a
+            // one-shot predicate leaves behind is exactly where that reads as success.
+            if listing.halted {
+                return Err(ObjectError::Halted {
+                    what: component.clone(),
+                });
+            }
             // **Absent, or absent from what could be read.** A directory with an entry this could
             // not name may hold the very object being asked for, so "not found" is a thing this
             // is only entitled to say when the directory read in full.
@@ -779,11 +790,6 @@ impl<'a> Namespace<'a> {
                 .into_iter()
                 .find(|object| object.exact_name && object.name.eq_ignore_ascii_case(component))
                 .ok_or_else(|| match skipped {
-                    // A walk that stopped says so first: the component may be in the part of the
-                    // directory it never reached, so neither absence below is a thing it knows.
-                    _ if halted => ObjectError::Halted {
-                        what: component.clone(),
-                    },
                     (0, 0) => ObjectError::NotFound {
                         directory: walked.clone(),
                         component: component.clone(),
@@ -1635,6 +1641,58 @@ mod tests {
                 what: "nt!ObpInfoMaskToOffset"
             }),
             "and so is a lookup, rather than reporting the name absent"
+        );
+    }
+
+    /// **A component already named does not override the stop that arrived after it.**
+    ///
+    /// The sibling below fixed the walk; this is the lookup built on it, and the hole it left. A
+    /// one-shot predicate that fires *between* two namings leaves a listing that holds the first
+    /// name **and** says it was halted -- and `object_at` consulted `halted` only down the
+    /// not-found path, so it took the name, descended into it, and finished the lookup with the
+    /// interrupt already spent. A multi-component path is what shows it: with one component the
+    /// answer is merely returned early, with two the walk carries on reading.
+    #[test]
+    fn a_lookup_stopped_after_naming_a_component_does_not_go_on_through_it() {
+        let mut two = namespace();
+        const SECOND: u64 = ROOT + 0x4_0000;
+        two.object(SECOND, "Second", obfuscated(3, SECOND), 0);
+        two.directory(ROOT, &[DEVICE_DIR, SECOND]);
+
+        // Fires on the second entry poll: a bucket each, a chain link each, then one per entry.
+        // So `Device` is named and the stop lands before `Second` is -- the prefix case.
+        let polls = std::cell::Cell::new(0usize);
+        let between_namings = || {
+            polls.set(polls.get() + 1);
+            polls.get() == layout().buckets + 2 + 2
+        };
+        let looking = Namespace::new(&two, layout(), globals())
+            .expect("the fixture layout is one this crate builds")
+            .halting(&between_namings);
+        assert!(
+            matches!(
+                looking.object_at("\\Device\\MountPointManager"),
+                Err(ObjectError::Halted { .. })
+            ),
+            "the lookup was stopped holding `Device`, and must not walk on into it"
+        );
+
+        // And the component the stop names is the one it was reached at, not the one asked for,
+        // so a caller can see how far the path got.
+        let polls = std::cell::Cell::new(0usize);
+        let between_namings = || {
+            polls.set(polls.get() + 1);
+            polls.get() == layout().buckets + 2 + 2
+        };
+        let looking = Namespace::new(&two, layout(), globals())
+            .expect("the fixture layout is one this crate builds")
+            .halting(&between_namings);
+        assert!(
+            matches!(
+                looking.object_at("\\Device\\MountPointManager"),
+                Err(ObjectError::Halted { what }) if what == "Device"
+            ),
+            "the halt names the component the walk was stopped at"
         );
     }
 
