@@ -6,8 +6,32 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-13
+
+This release adds typed instruction analysis, kernel object namespace queries, breakpoint
+management and crash-event reads, and fixes live-target arrival and interrupt handling.
+
+### Migration from 0.1
+
+- `DebugEngine` is no longer `Send` or `Sync`. Create and use it on the same thread; send an
+  `InterruptHandle` to another thread when it needs to interrupt the engine.
+- The public `Breakpoint` wrapper is removed. Use `set_breakpoint`, `remove_breakpoint` and
+  `enable_breakpoint` with breakpoint IDs.
+- `Instruction` and `BreakpointInfo` gain fields, and public enums gain variants. Update
+  struct literals and exhaustive matches when upgrading.
+
 ### Added
 
+- **Kernel object namespace queries** through the new `object` module:
+  `DebugEngine::object_at`, `objects_in` and `symbolic_link_target` resolve names, list directory
+  entries and read symbolic-link targets as values. Layouts come from target symbols and are
+  validated before walking. Listings report unreadable and malformed entries separately;
+  failed lookups distinguish absence from an incomplete search. `Namespace::halting` lets a
+  caller stop the walk and reports that stop explicitly. Names use ASCII case folding, and
+  queries require the target's namespace data pages.
+- **Instruction semantics** include privilege requirements, effects, conditions, register
+  identity and width, and registers written. These accompany the operands and control flow
+  decoded from x86/x64 instruction bytes.
 - **Disassembly carries its operands as values, decoded from the encoding.** `Instruction` gains
   `mnemonic`, `operands` and `flow` beside the `text` it already had, so a caller asking what an
   instruction *compares against* or *branches to* reads a field instead of re-parsing a rendering
@@ -755,5 +779,6 @@ the API, is that every answer carries what the answering cost — see
 - **Pre-1.0.** The `dbgeng` surface is large and expected to change; breaking changes may land
   in any `0.x` release.
 
-[Unreleased]: https://github.com/glslang/dbgscope/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/glslang/dbgscope/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/glslang/dbgscope/releases/tag/v0.2.0
 [0.1.0]: https://github.com/glslang/dbgscope/releases/tag/v0.1.0

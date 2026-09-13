@@ -1,6 +1,6 @@
 [package]
 name = "dbgscope"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Typed WinDbg/DbgEng debug sessions, with kernel pool and user heap walkers built on them."
 repository = "https://github.com/glslang/dbgscope"
