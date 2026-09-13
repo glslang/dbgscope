@@ -141,22 +141,27 @@ pub enum ObjectError {
     /// A cap was reached, so what this could answer with is a **short** list.
     #[error("{what} exceeded its bound of {bound}, so this list would be shorter than the truth")]
     TooMany { what: &'static str, bound: usize },
-    /// It is not among the entries of its directory that could be read, and some could not be.
+    /// It is not among the entries of its directory that could be named, and some could not be.
     ///
     /// **Distinct from [`Self::NotFound`], and the distinction is the whole reason this exists.**
     /// That one says the directory was read in full and this name is not in it, which is a fact
-    /// about the target. This one cannot say that: an entry whose name is paged out is an object
-    /// that is *there* and could not be named, so it may be the very one being asked for. Reported
-    /// as the two different answers they are, because the first sends a reader to correct a name
-    /// and the second to try again when the page is in.
+    /// about the target. This one cannot say that: an entry whose name could not be read is an
+    /// object that is *there* and was not named, so it may be the very one being asked for.
+    ///
+    /// **And it carries both counts rather than their sum**, for the reason [`Listing`] keeps them
+    /// apart: a page that was out will be back, and an entry the object manager cannot have
+    /// written will not. One figure, under a message saying the entries could not be *read*, would
+    /// report structural corruption as transient paging and send a reader away to retry it.
     #[error(
-        "{component:?} is not among the entries of {directory:?} that could be read, and \
-         {skipped} of them could not be -- so this cannot say it is absent"
+        "{component:?} is not among the entries of {directory:?} that could be named \
+         ({unreadable} would not read, {malformed} contradict themselves) -- so this cannot say \
+         it is absent"
     )]
     NotFoundInPart {
         directory: String,
         component: String,
-        skipped: usize,
+        unreadable: usize,
+        malformed: usize,
     },
 }
 
@@ -679,7 +684,7 @@ impl<'a> Namespace<'a> {
         let last = components.len() - 1;
         for (at, component) in components.iter().enumerate() {
             let listing = self.named_in(directory)?;
-            let skipped = listing.skipped();
+            let skipped = (listing.unreadable, listing.malformed);
             // **Absent, or absent from what could be read.** A directory with an entry this could
             // not name may hold the very object being asked for, so "not found" is a thing this
             // is only entitled to say when the directory read in full.
@@ -688,14 +693,15 @@ impl<'a> Namespace<'a> {
                 .into_iter()
                 .find(|object| object.exact_name && object.name.eq_ignore_ascii_case(component))
                 .ok_or_else(|| match skipped {
-                    0 => ObjectError::NotFound {
+                    (0, 0) => ObjectError::NotFound {
                         directory: walked.clone(),
                         component: component.clone(),
                     },
-                    skipped => ObjectError::NotFoundInPart {
+                    (unreadable, malformed) => ObjectError::NotFoundInPart {
                         directory: walked.clone(),
                         component: component.clone(),
-                        skipped,
+                        unreadable,
+                        malformed,
                     },
                 })?;
             if at == last {
@@ -1492,9 +1498,14 @@ mod tests {
         assert!(
             matches!(
                 namespace.object_at("\\Device\\MountPointManager"),
-                Err(ObjectError::NotFoundInPart { skipped: 1, .. })
+                Err(ObjectError::NotFoundInPart {
+                    unreadable: 0,
+                    malformed: 1,
+                    ..
+                })
             ),
-            "and a lookup says it cannot call this absent, rather than that it is"
+            "and a lookup says it cannot call this absent, rather than that it is -- naming \
+             the structural fault rather than a page that was out"
         );
     }
 
@@ -1563,6 +1574,20 @@ mod tests {
             (listed.objects.len(), listed.unreadable, listed.malformed),
             (0, 1, 0),
             "the entry is dropped and counted as the transient thing it is"
+        );
+
+        // And a lookup of it names the transient fault rather than the structural one, which is
+        // the other half of the pair `NotFoundInPart` carries two counts for.
+        assert!(
+            matches!(
+                namespace.object_at("\\Device\\MountPointManager"),
+                Err(ObjectError::NotFoundInPart {
+                    unreadable: 1,
+                    malformed: 0,
+                    ..
+                })
+            ),
+            "a page that was out is reported as one, not as corruption"
         );
 
         // The root still resolves through, which is the half the live failure was really about:
