@@ -141,6 +141,57 @@ pub enum ObjectError {
     /// A cap was reached, so what this could answer with is a **short** list.
     #[error("{what} exceeded its bound of {bound}, so this list would be shorter than the truth")]
     TooMany { what: &'static str, bound: usize },
+    /// It is not among the entries of its directory that could be read, and some could not be.
+    ///
+    /// **Distinct from [`Self::NotFound`], and the distinction is the whole reason this exists.**
+    /// That one says the directory was read in full and this name is not in it, which is a fact
+    /// about the target. This one cannot say that: an entry whose name is paged out is an object
+    /// that is *there* and could not be named, so it may be the very one being asked for. Reported
+    /// as the two different answers they are, because the first sends a reader to correct a name
+    /// and the second to try again when the page is in.
+    #[error(
+        "{component:?} is not among the entries of {directory:?} that could be read, and \
+         {skipped} of them could not be -- so this cannot say it is absent"
+    )]
+    NotFoundInPart {
+        directory: String,
+        component: String,
+        skipped: usize,
+    },
+}
+
+/// What a directory holds, and how much of it could not be read.
+///
+/// **A count beside the objects rather than a marker among them.** An entry whose name is paged
+/// out is an object that is there and cannot be presented under a name, so it is left out of
+/// [`Self::objects`] -- and without this a listing short by one is indistinguishable from a
+/// directory holding one fewer object, which is the reading this walk exists not to produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// Everything the directory holds that could be read and named, in bucket order.
+    pub objects: Vec<KernelObject>,
+    /// Entries whose memory would not read -- a name paged out, which is the ordinary case on a
+    /// live kernel and says nothing about the target beyond what was resident.
+    pub unreadable: usize,
+    /// Entries whose structure contradicts itself: a name longer than its own maximum, an
+    /// optional-header distance shorter than the header it locates.
+    ///
+    /// **Counted apart from [`Self::unreadable`] because the two mean opposite things about the
+    /// target.** One is a page that was out and will be back; the other is a directory entry that
+    /// cannot have been written by the object manager, which on a directory anybody cares about
+    /// is a finding rather than a wrinkle. A walk that reported "1 unreadable" for both would
+    /// hand a reader the benign reading of the alarming case.
+    pub malformed: usize,
+}
+
+impl Listing {
+    /// Everything the directory holds that this could not present, however it failed.
+    ///
+    /// For a caller that only needs to know the list is short -- which is most of them, since a
+    /// short list read as a complete one is the failure either count exists to prevent.
+    pub fn skipped(&self) -> usize {
+        self.unreadable + self.malformed
+    }
 }
 
 /// One object, as much of it as the namespace says.
@@ -543,21 +594,68 @@ impl<'a> Namespace<'a> {
     }
 
     /// Everything one directory holds, named.
-    fn named_in(&self, directory: u64) -> Result<Vec<KernelObject>, ObjectError> {
-        let mut out = Vec::new();
+    fn named_in(&self, directory: u64) -> Result<Listing, ObjectError> {
+        let mut objects = Vec::new();
+        let mut unreadable = 0usize;
+        let mut malformed = 0usize;
         for body in self.entries_of(directory)? {
-            let Some((name, exact_name)) = self.name_of(body)? else {
+            // **An entry this cannot read is skipped and counted, not propagated**, and that is
+            // the difference between one paged-out name and a directory nobody can list.
+            // Measured on a live Windows Server 26100 guest 2026-09-13: `\GLOBAL??` holds some
+            // two hundred links and one whose `Name.Buffer` is paged out, which the debugger's
+            // own `!object` prints as `(*** Name not accessible ***)` and walks past. Failing on
+            // it took away the entire directory -- and, since `object_at` resolves each component
+            // through here, every lookup whose path crossed that directory as well.
+            //
+            // **Only the two errors that are about the entry.** `Unavailable` says this *target*
+            // does not resolve `nt!ObpInfoMaskToOffset`, which is equally true of every entry
+            // there will ever be: skipping that would answer with an empty directory for a build
+            // this walk cannot decode at all, which is the failure the whole module is against.
+            let named = match self.name_of(body) {
+                Ok(named) => named,
+                Err(ObjectError::Unreadable { .. }) => {
+                    unreadable += 1;
+                    continue;
+                }
+                Err(ObjectError::Malformed { .. }) => {
+                    malformed += 1;
+                    continue;
+                }
+                Err(fatal) => return Err(fatal),
+            };
+            let Some((name, exact_name)) = named else {
                 continue;
             };
-            out.push(KernelObject {
+            // The same treatment, for the same reason. This reads a field of the header
+            // `name_of` has just read a byte of, so a target that answers one and not the other
+            // is barely a real case -- and the last thing here that was barely a real case is
+            // the paragraph above. An object dropped for it is counted like any other, rather
+            // than listed with a `None` that would read as "carries no descriptor".
+            let security_descriptor = match self.security_of(body) {
+                Ok(found) => found,
+                Err(ObjectError::Unreadable { .. }) => {
+                    unreadable += 1;
+                    continue;
+                }
+                Err(ObjectError::Malformed { .. }) => {
+                    malformed += 1;
+                    continue;
+                }
+                Err(fatal) => return Err(fatal),
+            };
+            objects.push(KernelObject {
                 address: body,
                 name,
                 exact_name,
                 type_name: self.type_of(body),
-                security_descriptor: self.security_of(body)?,
+                security_descriptor,
             });
         }
-        Ok(out)
+        Ok(Listing {
+            objects,
+            unreadable,
+            malformed,
+        })
     }
 
     /// Resolves a path to the object filed under it.
@@ -580,13 +678,25 @@ impl<'a> Namespace<'a> {
         let mut walked = String::from("\\");
         let last = components.len() - 1;
         for (at, component) in components.iter().enumerate() {
-            let found = self
-                .named_in(directory)?
+            let listing = self.named_in(directory)?;
+            let skipped = listing.skipped();
+            // **Absent, or absent from what could be read.** A directory with an entry this could
+            // not name may hold the very object being asked for, so "not found" is a thing this
+            // is only entitled to say when the directory read in full.
+            let found = listing
+                .objects
                 .into_iter()
                 .find(|object| object.exact_name && object.name.eq_ignore_ascii_case(component))
-                .ok_or_else(|| ObjectError::NotFound {
-                    directory: walked.clone(),
-                    component: component.clone(),
+                .ok_or_else(|| match skipped {
+                    0 => ObjectError::NotFound {
+                        directory: walked.clone(),
+                        component: component.clone(),
+                    },
+                    skipped => ObjectError::NotFoundInPart {
+                        directory: walked.clone(),
+                        component: component.clone(),
+                        skipped,
+                    },
                 })?;
             if at == last {
                 return Ok(found);
@@ -624,7 +734,7 @@ impl<'a> Namespace<'a> {
     /// walking *through* a device on the way to something else; this is the same guard at the end
     /// of the path, and without it `\Device\MountPointManager` has a driver's own fields read as
     /// thirty-seven bucket pointers and whatever they hold followed as chains.
-    pub fn objects_in(&self, path: &str) -> Result<Vec<KernelObject>, ObjectError> {
+    pub fn objects_in(&self, path: &str) -> Result<Listing, ObjectError> {
         // **The same parser `object_at` uses**, which is the point rather than a tidy-up: this
         // had its own, and the two disagreed twice -- an empty argument listed the root, and so
         // did a path of nothing but separators, both of which `object_at` refused. One question
@@ -827,7 +937,7 @@ impl DebugEngine {
     }
 
     /// Everything a directory holds.
-    pub fn objects_in(&self, path: &str) -> Result<Vec<KernelObject>, ObjectError> {
+    pub fn objects_in(&self, path: &str) -> Result<Listing, ObjectError> {
         self.with_namespace(|namespace| namespace.objects_in(path))
     }
 
@@ -1120,9 +1230,11 @@ mod tests {
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
         assert_eq!(
-            namespace
-                .objects_in("\\Device")
-                .map(|found| found.into_iter().map(|one| one.name).collect::<Vec<_>>()),
+            namespace.objects_in("\\Device").map(|found| found
+                .objects
+                .into_iter()
+                .map(|one| one.name)
+                .collect::<Vec<_>>()),
             Ok(vec!["MountPointManager".to_string()])
         );
     }
@@ -1342,10 +1454,20 @@ mod tests {
     }
 
     /// A name longer than its own maximum is **torn**, and taking its length would read past the
-    /// buffer into whatever follows -- which the walk then matches a path against, resolving some
-    /// other object rather than failing to resolve this one.
+    /// buffer into whatever follows -- which the walk would then match a path against, resolving
+    /// some other object rather than failing to resolve this one.
+    ///
+    /// **It is dropped from the listing and counted, rather than refused.** That was the first
+    /// answer here and it protected the right thing in the wrong place: the danger is a torn name
+    /// *resolving*, and an entry that is not in the listing resolves to nothing at all, so
+    /// skipping it is exactly as safe and leaves the rest of the directory answerable. What is
+    /// asserted below is both halves of that -- the torn entry is gone and its neighbour is not.
+    ///
+    /// **Counted as `malformed` and not as `unreadable`**, because the two say opposite things
+    /// about a target: a page that was out will be back, while a directory entry the object
+    /// manager cannot have written is a finding.
     #[test]
-    fn a_name_longer_than_its_own_maximum_is_refused() {
+    fn a_name_longer_than_its_own_maximum_is_dropped_rather_than_taken_or_refused() {
         let mut fake = namespace();
         let header = DEVICE - 0x30;
         let name_info = header - 0x20;
@@ -1353,11 +1475,105 @@ mod tests {
         fake.put(name_info + 0x08, &200u16.to_le_bytes());
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
+
+        let listed = namespace
+            .objects_in("\\Device")
+            .expect("the directory still lists");
         assert_eq!(
-            namespace.objects_in("\\Device"),
-            Err(ObjectError::Malformed {
-                reason: "a UNICODE_STRING is longer than its own maximum"
-            })
+            (listed.objects.len(), listed.unreadable, listed.malformed),
+            (0, 0, 1),
+            "the torn entry is dropped, and counted as the structural fault it is"
+        );
+        assert_eq!(listed.skipped(), 1);
+
+        // And it resolves to nothing rather than to whatever follows its buffer -- said about
+        // **this** name, since a path is matched against what the listing holds.
+        assert!(
+            matches!(
+                namespace.object_at("\\Device\\MountPointManager"),
+                Err(ObjectError::NotFoundInPart { skipped: 1, .. })
+            ),
+            "and a lookup says it cannot call this absent, rather than that it is"
+        );
+    }
+
+    /// **A global this target does not resolve is still fatal, and skipping an entry must not
+    /// have quietly made it survivable.**
+    ///
+    /// The two live side by side and pull opposite ways: an entry that will not read is skipped,
+    /// and a missing `nt!ObpInfoMaskToOffset` makes *every* entry fail to read. Catch both in one
+    /// arm and a build this walk cannot decode at all answers with an empty directory -- which
+    /// says "nothing is filed here", the one reading this module exists to never produce.
+    ///
+    /// Written because the obvious mutation -- widening the `Err(fatal)` arm to a catch-all --
+    /// left the whole suite green. The neighbouring test that looked like it covered this hands
+    /// the walk an **empty** target, so it fails on the root pointer long before an entry is
+    /// reached, and could not have caught it.
+    #[test]
+    fn a_global_the_target_lacks_is_not_swallowed_by_the_skip() {
+        let fake = namespace();
+        let nameless = Globals {
+            info_mask_to_offset: None,
+            ..globals()
+        };
+        let namespace = Namespace::new(&fake, layout(), nameless)
+            .expect("the fixture layout is one this crate builds");
+        assert_eq!(
+            namespace.objects_in("\\"),
+            Err(ObjectError::Unavailable {
+                what: "nt!ObpInfoMaskToOffset"
+            }),
+            "a directory whose every entry is unnameable for want of a global is refused, not \
+             answered as empty"
+        );
+        assert_eq!(
+            namespace.object_at("\\Device"),
+            Err(ObjectError::Unavailable {
+                what: "nt!ObpInfoMaskToOffset"
+            }),
+            "and so is a lookup, rather than reporting the name absent"
+        );
+    }
+
+    /// **One entry whose name is paged out does not take the directory with it.**
+    ///
+    /// Measured on a live Windows Server 26100 guest 2026-09-13, which is where this came from
+    /// rather than from imagination: `\GLOBAL??` holds some two hundred symbolic links and one
+    /// whose `Name.Buffer` is not resident -- the debugger's own `!object` prints it as
+    /// `(*** Name not accessible ***)` and carries on. This walk failed the whole listing, and
+    /// because `object_at` resolves every component through the same code, it also failed every
+    /// lookup whose path crossed that directory. A tool asking "what reaches this device" got
+    /// "this directory cannot be listed", which reads as a device nothing reaches.
+    #[test]
+    fn a_directory_survives_an_entry_whose_name_will_not_read() {
+        let mut fake = namespace();
+        let header = DEVICE - 0x30;
+        let name_info = header - 0x20;
+        // The buffer pointer sent somewhere the fixture does not map, which is what a page that
+        // is out answers: the string's own length and maximum still agree.
+        fake.put(name_info + 0x10, &0xffff_c000_dead_0000u64.to_le_bytes());
+        let namespace = Namespace::new(&fake, layout(), globals())
+            .expect("the fixture layout is one this crate builds");
+
+        let listed = namespace
+            .objects_in("\\Device")
+            .expect("the directory still lists");
+        assert_eq!(
+            (listed.objects.len(), listed.unreadable, listed.malformed),
+            (0, 1, 0),
+            "the entry is dropped and counted as the transient thing it is"
+        );
+
+        // The root still resolves through, which is the half the live failure was really about:
+        // a lookup does not have to be *of* the unreadable entry to have been taken away by it.
+        assert_eq!(
+            namespace.objects_in("\\").map(|found| found
+                .objects
+                .into_iter()
+                .map(|one| one.name)
+                .collect::<Vec<_>>()),
+            Ok(vec!["Device".to_string()]),
+            "a neighbouring directory is untouched by it"
         );
     }
 
@@ -1384,6 +1600,7 @@ mod tests {
             .objects_in("\\Device")
             .expect("the directory lists");
         let rendered: Vec<&str> = listed
+            .objects
             .iter()
             .filter(|one| !one.exact_name)
             .map(|one| one.name.as_str())
@@ -1436,9 +1653,11 @@ mod tests {
             "one component needs no type"
         );
         assert_eq!(
-            namespace
-                .objects_in("\\")
-                .map(|found| found.into_iter().map(|one| one.name).collect::<Vec<_>>()),
+            namespace.objects_in("\\").map(|found| found
+                .objects
+                .into_iter()
+                .map(|one| one.name)
+                .collect::<Vec<_>>()),
             Ok(vec!["Device".to_string()]),
             "nor does listing the root"
         );
@@ -1624,9 +1843,13 @@ mod tests {
         );
 
         let root = |path: &str| {
-            namespace
-                .objects_in(path)
-                .map(|found| found.into_iter().map(|one| one.name).collect::<Vec<_>>())
+            namespace.objects_in(path).map(|found| {
+                found
+                    .objects
+                    .into_iter()
+                    .map(|one| one.name)
+                    .collect::<Vec<_>>()
+            })
         };
         assert_eq!(
             root("\\"),
@@ -1634,7 +1857,9 @@ mod tests {
             "while the root itself lists"
         );
         assert_eq!(
-            namespace.objects_in("\\Device\\").map(|found| found.len()),
+            namespace
+                .objects_in("\\Device\\")
+                .map(|found| found.objects.len()),
             Ok(1),
             "and one trailing separator is still a caller's convenience"
         );
