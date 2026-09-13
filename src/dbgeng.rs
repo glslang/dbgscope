@@ -8592,6 +8592,9 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn test_an_operations_request_dies_with_it() {
+        // Even without a target, dropping this client ends the process-wide session. Keep it
+        // serialized with the live-debuggee tests that share this process under `cargo test`.
+        let _debuggee = one_debuggee();
         let e = DebugEngine::new();
         {
             let operation = e.begin_operation();
