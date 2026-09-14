@@ -28,10 +28,9 @@
 //! is answers "which symbolic links point here" wrongly, which is the one thing a security question
 //! must not do.
 //!
-//! Names are compared the way `nt!ObpLookupDirectoryEntry` compares them -- see
-//! [`same_object_name`] -- and where that fold cannot speak for the kernel's own table the answer
-//! is **undecided** rather than "not found". A lookup here never reports an absence it has not
-//! established.
+//! Names are folded the way `nt!ObpLookupDirectoryEntry` folds them, by calling the same
+//! `RtlUpcaseUnicodeChar` it calls -- see [`same_object_name`]. Reproducing that fold instead was
+//! measurably wrong for 326 of the 65,536 code units, and wrong *confidently* for 224 of them.
 //!
 //! # Where it works
 //!
@@ -152,165 +151,116 @@ pub enum ObjectError {
     /// asked long enough. A caller retries it with more time; the other two never succeed.
     #[error("the namespace walk was stopped before it reached {what}")]
     Halted { what: String },
-    /// It is not among the entries of its directory this walk could compare it against, and some
-    /// it could not.
+    /// It is not among the entries of its directory that could be named, and some could not be.
     ///
     /// **Distinct from [`Self::NotFound`], and the distinction is the whole reason this exists.**
-    /// That one says the directory was read in full, every name in it was compared, and this name
-    /// is not there -- which is a fact about the target. This one cannot say that: an entry that
-    /// went uncompared is an object that is *there* and was not ruled out, so it may be the very
-    /// one being asked for.
+    /// That one says the directory was read in full and this name is not in it, which is a fact
+    /// about the target. This one cannot say that: an entry whose name could not be read is an
+    /// object that is *there* and was not named, so it may be the very one being asked for.
     ///
-    /// **Three counts rather than their sum**, for the reason [`Listing`] keeps the first two
-    /// apart and then one more: a page that was out will be back, an entry the object manager
-    /// cannot have written will not, and a name this crate could not fold the way the kernel folds
-    /// one will not either however long anybody waits -- but it is a limit of *this* code rather
-    /// than of the target, which is the opposite thing to tell a reader. One figure, under a
-    /// message saying the entries could not be *read*, would report structural corruption as
-    /// transient paging, send a reader away to retry it, and hide this crate's own fold behind
-    /// both.
+    /// **And it carries both counts rather than their sum**, for the reason [`Listing`] keeps them
+    /// apart: a page that was out will be back, and an entry the object manager cannot have
+    /// written will not. One figure, under a message saying the entries could not be *read*, would
+    /// report structural corruption as transient paging and send a reader away to retry it.
+    ///
+    /// **The fold is not a third way to fall short here**, and it was one for a day.
+    /// [`same_object_name`] performs the object manager's own fold rather than reproducing it, so
+    /// every name either matches or does not; there is no comparison it declines to make, and so
+    /// nothing to count.
     #[error(
-        "{component:?} is not among the entries of {directory:?} this walk could compare it \
-         against ({unreadable} would not read, {malformed} contradict themselves, {undecided} \
-         could not be folded the way the object manager folds a name) -- so this cannot say it \
-         is absent"
+        "{component:?} is not among the entries of {directory:?} that could be named \
+         ({unreadable} would not read, {malformed} contradict themselves) -- so this cannot say \
+         it is absent"
     )]
     NotFoundInPart {
         directory: String,
         component: String,
         unreadable: usize,
         malformed: usize,
-        /// Entries that were read and named, and whose name differs from the one sought **only**
-        /// where [`same_object_name`] will not speak for the kernel's upcase table.
-        undecided: usize,
     },
-}
-
-/// What a fold is entitled to say about two object names.
-///
-/// **Three answers rather than two, because folding is an approximation of the kernel's own
-/// table.** [`same_object_name`] reproduces `nt!ObpLookupDirectoryEntry`'s three bands out of what
-/// a host has, and for a handful of code units a host has nothing that answers -- see that
-/// function. Every one of those would otherwise be reported as *not a match*, which in a lookup is
-/// an object reported absent, and absent is the one answer a caller acts on irreversibly. So a
-/// comparison that turns on a code unit this cannot fold the way the kernel does is
-/// [`Self::Undecided`], and a walk that meets one says it could not decide instead of saying the
-/// object is not there. Nothing here can answer *wrongly* any more, only vaguely.
-///
-/// This is the same three-way answer `windbg-mcp`'s `device::same_object_path` settled on over
-/// three rounds of review, arrived at there first and moved here so there is one of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NameMatch {
-    /// One name, as the object manager would file it.
-    Same,
-    /// Two names.
-    Different,
-    /// They differ only where this fold cannot speak for the kernel's table.
-    Undecided,
 }
 
 /// Whether two object **names** are the one name the object manager would file an object under.
 ///
 /// The object manager is case-insensitive -- `nt!ObpCaseInsensitive` is 1 on 26100 -- so `Device`
-/// and `DEVICE` are one name. It is not insensitive the way ASCII is, and it is not insensitive
-/// the way Unicode is either, which is the whole difficulty: it folds through **its own upcase
-/// table**, and the two obvious stand-ins are each wrong in a direction that matters.
+/// and `DEVICE` are one name. It is not insensitive the way ASCII is, and it is **not insensitive
+/// the way Unicode is either**, which is the whole difficulty: it folds through the system's own
+/// upcase table, and that table is not Unicode's simple case mapping.
+///
+/// So this does not reproduce the fold, it **performs** it. [`upcase`] calls
+/// `RtlUpcaseUnicodeChar`, which is the function `nt!ObpLookupDirectoryEntry` itself calls -- see
+/// there for what was measured and why a reproduction was wrong.
 ///
 /// **This compares one name, not a path.** A caller holding a whole path may pass it: the fold is
-/// per code unit, so a separator folds to itself and comparing `\Device\Foo` against
-/// `\DEVICE\FOO` gives the same answer as comparing the components pairwise. What it does not do
-/// is anything about *prefixes* -- `\Device\HarddiskVolume1\dir` is not
-/// `\Device\HarddiskVolume1`, and a caller wanting that has to ask it -- or about a trailing
-/// separator, which is a caller's habit rather than part of a name and a caller's to trim.
-///
-/// **Equal needs no certainty.** Equal sequences of code units fold to equal sequences under any
-/// per-unit table, whatever this could not say about the units themselves -- so a match is a match
-/// even where the fold was guessing, and only a *mismatch* can come back [`NameMatch::Undecided`].
-pub fn same_object_name(one: &str, other: &str) -> NameMatch {
-    let (one, one_sure) = upcase(one);
-    let (other, other_sure) = upcase(other);
-    match (one == other, one_sure && other_sure) {
-        (true, _) => NameMatch::Same,
-        (false, true) => NameMatch::Different,
-        (false, false) => NameMatch::Undecided,
-    }
+/// per code unit, so a separator folds to itself and comparing `\Device\Foo` against `\DEVICE\FOO`
+/// gives the same answer as comparing the components pairwise. What it does not do is anything
+/// about *prefixes* -- `\Device\HarddiskVolume1\dir` is not `\Device\HarddiskVolume1`, and a caller
+/// wanting that has to ask it -- or about a trailing separator, which is a caller's habit rather
+/// than part of a name and a caller's to trim.
+pub fn same_object_name(one: &str, other: &str) -> bool {
+    upcase(one) == upcase(other)
 }
 
 /// A name folded the way the object manager folds one: **one UTF-16 code unit in, one out.**
 ///
-/// Read out of `nt!ObpLookupDirectoryEntry` on 26100 rather than assumed. It compares a name one
-/// `WCHAR` at a time, in three bands: `U+0061`..`U+007A` gets `0x20` subtracted inline; **anything
-/// else below `U+00C0` is not folded at all**, no table being consulted for it; and at or above
-/// `U+00C0` the code unit indexes `UnicodeUpcaseTable844`, an 8-4-4 trie -- high byte, then middle
-/// nibble, then low nibble -- whose leaf is a delta added to the code unit. One unit in, one out,
-/// no expansion, no context.
+/// # It is the object manager's own fold, not a reproduction of one
 ///
-/// **Rust's `to_lowercase`/`to_uppercase` is the *full* Unicode mapping, and it is wrong in both
-/// directions.** It **expands**: `U+0130` lowercases to `i` followed by `U+0307`, so that name and
-/// the two-code-unit spelling of it -- two objects to the kernel -- compare equal, and a lookup
-/// for one would resolve to the other. And it is **contextual**: a sigma at the end of a word
-/// lowercases to the final form and elsewhere to the medial one, so two spellings the kernel folds
-/// together compare unequal, and a lookup reports an object that is there as absent.
+/// `nt!ObpLookupDirectoryEntry` on 26100 folds in three bands: `U+0061`..`U+007A` gets `0x20`
+/// subtracted inline, anything else below `U+00C0` is not folded at all, and at or above `U+00C0`
+/// the code unit indexes `UnicodeUpcaseTable844` -- an 8-4-4 trie, high byte then middle nibble
+/// then low nibble, whose leaf is a **delta added** to the code unit. The first two bands are
+/// reproduced below, because they consult no table and are therefore knowledge rather than a
+/// guess. The third is `RtlUpcaseUnicodeChar`, which is **the very function the lookup calls**:
+/// measured on a live 26100 ARM64 kernel, `ObpLookupDirectoryEntry` has two `bl` sites to it, one
+/// on each of its comparison and hash paths, and inlines the same trie against the same table
+/// pointer -- `PsGetCurrentServerSiloGlobals()->RtlNlsState.UnicodeUpcaseTable844`, which is
+/// silo globals `+0x4B0` on that build.
 ///
-/// So the bands above are reproduced, and each earns its place. Keeping only single-code-unit
-/// results is what makes this one-to-one, and it is why `U+00DF` stays put instead of becoming
-/// `SS`. The `U+00C0` floor is why `U+00B5` stays put too, its Unicode uppercase being a Greek
-/// capital mu and so a change of script the kernel's table does not make. A surrogate is left alone
-/// because a `WCHAR` fold is handed half a character at a time and cannot fold a non-BMP letter, so
-/// two spellings of one Deseret name are genuinely two objects and folding over scalar values would
-/// merge them.
+/// # Why a reproduction was wrong, measured rather than reasoned
 ///
-/// **What this is not is the target's own table.** That is
-/// `PsGetCurrentServerSiloGlobals()->RtlNlsState.UnicodeUpcaseTable844`, which is per-silo and
-/// would want a [`Namespace`]'s reads -- and this is a free function on purpose, so that the fold
-/// is exercised by tests that need no target at all. What the substitution leaves is the Unicode
-/// version behind each table, for code units at or above `U+00C0`: the silo's is frozen at the
-/// target's build and this one moves with the toolchain. The `bool` is what carries that: `false`
-/// says a unit went through unfolded because nothing here could say what the table does to it.
-fn upcase(name: &str) -> (Vec<u16>, bool) {
-    let mut sure = true;
-    let folded = name
-        .encode_utf16()
-        .map(|unit| match unit {
-            // The comparison's own fast path, written the way it writes it.
-            0x61..=0x7a => unit - 0x20,
-            // Below the floor the kernel reaches for no table, so neither does this -- and that
-            // is knowledge rather than a guess, so certainty survives it.
-            0..=0xbf => unit,
-            _ => {
-                // A surrogate is not a scalar value, so this is also the non-BMP case: the half
-                // goes through unfolded, as the kernel's per-`WCHAR` fold leaves it. Certain for
-                // the same reason -- a `WCHAR` fold cannot reach it either.
-                let Some(one) = char::from_u32(u32::from(unit)) else {
-                    return unit;
-                };
-                let mut upper = one.to_uppercase();
-                match (upper.next(), upper.next()) {
-                    (Some(only), None) => match u16::try_from(u32::from(only)) {
-                        Ok(folded) => folded,
-                        // A BMP unit folding out of the BMP is not something this can express as
-                        // one unit, and not something to claim the kernel does either.
-                        Err(_) => {
-                            sure = false;
-                            unit
-                        }
-                    },
-                    // **The expansion case, and the one this cannot answer.** Rust offers the
-                    // *full* mapping only, so a unit whose full uppercase is several units hides
-                    // whatever its one-unit simple mapping is -- `U+1F80` expands to `U+1F08`
-                    // `U+0399` here while the kernel's table maps it to `U+1F88`, one unit, and
-                    // `U+00DF` expands to `SS` where the table leaves it alone. Both look
-                    // identical from inside this `match`, so the unit is left as it is and the
-                    // fold stops claiming to know.
-                    _ => {
-                        sure = false;
-                        unit
-                    }
-                }
-            }
-        })
-        .collect();
-    (folded, sure)
+/// This was `char::to_uppercase` until it was checked against the target's own table, and the
+/// failure is worth keeping because it is not the one anybody predicts. Rust's `std` exposes only
+/// the **full** Unicode case mapping, which expands, so 102 code units had no one-unit answer at
+/// all and the fold declined to speak for them. That was the known limit. The **unknown** one was
+/// worse: for **224** further code units the fold was *confident* and *wrong*, in the direction
+/// that matters -- it folded where Windows does not, so two objects compared equal. `U+0131` is
+/// the cleanest of them, whose Unicode simple uppercase is `I` and which the system's table leaves
+/// alone, so `\Device\ı` and `\Device\I` -- two objects to the object manager -- were one here.
+/// Windows' table is not Unicode's: it declines mappings that would break round-tripping
+/// (`U+0131`, `U+017F`, the titlecase digraphs) and predates the `U+A7xx` additions.
+///
+/// The dumped kernel table and this host's `RtlUpcaseUnicodeChar` agreed on **all 65,536** code
+/// units, which is what makes calling the host's copy sound rather than convenient. What that does
+/// not establish is a host and a target of *different vintages*, where the NLS data could differ;
+/// nothing here detects that, and reading the target's own table is what would close it.
+fn upcase(name: &str) -> Vec<u16> {
+    name.encode_utf16().map(upcase_unit).collect()
+}
+
+/// One code unit, in the three bands the lookup folds in.
+fn upcase_unit(unit: u16) -> u16 {
+    match unit {
+        // The comparison's own fast path, written the way it writes it -- and the reason this is
+        // not simply one call: these two bands read no table, so they are the same answer on any
+        // host, and keeping them here is what lets the walk's tests run where the call cannot.
+        0x61..=0x7a => unit - 0x20,
+        // Below the floor the lookup reaches for no table, so neither does this.
+        0..=0xbf => unit,
+        // **A surrogate is passed through, and that is the kernel's answer too.** A per-`WCHAR`
+        // fold is handed half a character at a time and cannot fold a non-BMP letter, so two
+        // spellings of one Deseret name are genuinely two objects. `RtlUpcaseUnicodeChar` moves
+        // no unit in `D800..DFFF` -- measured across the range -- so this band needs no exception
+        // and does not have one.
+        //
+        // Miri cannot call a foreign function, and the walk's tests are worth running under it:
+        // they are the pointer arithmetic this module is, over a fake target. Every name they use
+        // is ASCII, which the bands above answer identically, so the shim costs those tests
+        // nothing. The two tests that are *about* this band say so and are ignored there.
+        _ => match cfg!(miri) {
+            true => unit,
+            false => unsafe { windows::Wdk::System::SystemServices::RtlUpcaseUnicodeChar(unit) },
+        },
+    }
 }
 
 /// What a directory holds, and how much of it could not be read.
@@ -923,44 +873,31 @@ impl<'a> Namespace<'a> {
                     what: component.clone(),
                 });
             }
-            // **Absent, absent from what could be read, or absent from what could be compared.**
-            // A directory with an entry this could not name may hold the very object being asked
-            // for, and so may one whose name differs only where `same_object_name` will not speak
-            // for the kernel's table. "Not found" is a thing this is only entitled to say when the
-            // directory read in full *and* every name in it was decided.
+            // **Absent, or absent from what could be read.** A directory with an entry this could
+            // not name may hold the very object being asked for, so "not found" is a thing this is
+            // only entitled to say when the directory read in full.
             //
-            // A name that is not text is neither: it is rendered with replacements, and a rendering
-            // cannot equal a component of a `&str` path -- an unpaired surrogate is the only thing
-            // that makes `exact_name` false and no `&str` contains one. Skipping those loses
-            // nothing this could have found, which is why they are not a fourth count.
-            let mut undecided = 0usize;
-            let mut found = None;
-            for object in listing.objects {
-                if !object.exact_name {
-                    continue;
-                }
-                match same_object_name(&object.name, component) {
-                    NameMatch::Same => {
-                        found = Some(object);
-                        break;
-                    }
-                    NameMatch::Undecided => undecided += 1,
-                    NameMatch::Different => {}
-                }
-            }
-            let found = found.ok_or_else(|| match (skipped, undecided) {
-                ((0, 0), 0) => ObjectError::NotFound {
-                    directory: walked.clone(),
-                    component: component.clone(),
-                },
-                ((unreadable, malformed), undecided) => ObjectError::NotFoundInPart {
-                    directory: walked.clone(),
-                    component: component.clone(),
-                    unreadable,
-                    malformed,
-                    undecided,
-                },
-            })?;
+            // A name that is not text is neither absent nor uncertain: it is rendered with
+            // replacements, and a rendering cannot equal a component of a `&str` path -- an
+            // unpaired surrogate is the only thing that makes `exact_name` false and no `&str`
+            // contains one. Skipping those loses nothing this could have found, which is why they
+            // are not a third count.
+            let found = listing
+                .objects
+                .into_iter()
+                .find(|object| object.exact_name && same_object_name(&object.name, component))
+                .ok_or_else(|| match skipped {
+                    (0, 0) => ObjectError::NotFound {
+                        directory: walked.clone(),
+                        component: component.clone(),
+                    },
+                    (unreadable, malformed) => ObjectError::NotFoundInPart {
+                        directory: walked.clone(),
+                        component: component.clone(),
+                        unreadable,
+                        malformed,
+                    },
+                })?;
             if at == last {
                 return Ok(found);
             }
@@ -1453,91 +1390,73 @@ mod tests {
         );
     }
 
-    /// **The fold is the object manager's, and the nearest `str` method is not it.**
+    /// **The fold is the object manager's, and it is performed rather than reproduced.**
     ///
-    /// Six constructions, because the rounds that settled this shape in `windbg-mcp` broke in
-    /// opposite directions and each property fails on a case the others reach right past. What is
-    /// *not* pinned below is the direction: the kernel upcases, and no construction this is sure
-    /// of tells a one-to-one uppercase from a one-to-one lowercase, so that rests on reading the
-    /// fold out of `nt!ObpLookupDirectoryEntry` rather than on an assertion.
-    ///
-    /// Bare names rather than paths, which is what a directory entry holds and what
-    /// [`Namespace::object_at`] compares.
+    /// Every expectation here was read off a **live 26100 kernel's own**
+    /// `RtlNlsState.UnicodeUpcaseTable844`, dumped over KD and walked as an 8-4-4 trie, and the
+    /// host's `RtlUpcaseUnicodeChar` agreed with it on all 65,536 code units. So these are the
+    /// object manager's answers, not Unicode's -- which is the distinction the whole function
+    /// turns on, and the four below are where the two part company.
+    #[cfg_attr(miri, ignore = "folds through ntdll; see `upcase_unit`'s Miri shim")]
     #[test]
-    fn a_name_is_folded_one_code_unit_at_a_time_as_the_object_manager_folds_it() {
-        // The band the old `eq_ignore_ascii_case` got right, kept so that the fast path is pinned
-        // rather than inherited.
-        assert_eq!(
-            same_object_name("MountPointManager", "MOUNTPOINTMANAGER"),
-            NameMatch::Same
+    fn a_name_is_folded_by_the_object_managers_own_table_and_not_by_unicodes() {
+        // The two bands that read no table, which this crate still answers itself.
+        assert!(same_object_name("MountPointManager", "MOUNTPOINTMANAGER"));
+        // `U+00B5` is below the `U+00C0` floor, so no table is consulted and it stays put --
+        // where Unicode would fold it to a Greek capital mu, changing its script on the way.
+        assert!(!same_object_name("\u{00b5}", "\u{039c}"));
+
+        // The band the old `eq_ignore_ascii_case` got wrong: one object to the table, two to
+        // twenty-six letters of ASCII.
+        assert!(same_object_name("K\u{e4}se", "K\u{c4}SE"));
+
+        // **The 224 the reproduction was confidently wrong about**, of which this is the
+        // cleanest. `U+0131`'s Unicode simple uppercase is `I`; the system's table leaves it
+        // alone, because folding it would break Turkish round-tripping. Two objects.
+        assert!(
+            !same_object_name("\u{0131}", "I"),
+            "dotless i is not I here"
+        );
+        assert!(!same_object_name("\u{017f}", "S"), "long s is not S here");
+        assert!(
+            !same_object_name("\u{01c5}", "\u{01c4}"),
+            "a titlecase digraph is not its uppercase here"
         );
 
-        // **And the band it got wrong**, which is the whole defect: one object to the kernel's
-        // table, two to twenty-six letters of ASCII.
-        assert_eq!(same_object_name("K\u{e4}se", "K\u{c4}SE"), NameMatch::Same);
-
-        // **Expansion, downwards.** `to_lowercase` turns `U+0130` into `i` and `U+0307`, which is
-        // code unit for code unit the other name -- so a fold built on it makes one object out of
-        // two, and a lookup for one resolves to the other.
-        assert_eq!(
-            same_object_name("\u{0130}", "i\u{0307}"),
-            NameMatch::Different,
-            "a fold that expands makes one object out of two"
+        // **The 102 it had no answer for at all**, because Rust exposes only the full mapping.
+        // The table has a one-unit answer for both of these, and they are opposite answers --
+        // which is exactly why declining was the only honest thing to do without it.
+        assert!(
+            same_object_name("\u{1f80}", "\u{1f88}"),
+            "the table maps U+1F80 to U+1F88, one unit"
+        );
+        assert!(
+            !same_object_name("\u{00df}", "SS"),
+            "and leaves U+00DF alone, so it is not SS"
         );
 
-        // **Context.** `to_lowercase` picks the final sigma at the end of a word and the medial one
-        // elsewhere, so a fold built on it calls these two objects. Both upcase to `U+03A3`.
-        assert_eq!(
+        // Context and expansion, the two ways `to_lowercase` was wrong in opposite directions.
+        // Both still hold, now for the table's reasons rather than for Unicode's.
+        assert!(
             same_object_name("\u{0391}\u{03A3}", "\u{0391}\u{03C3}"),
-            NameMatch::Same,
             "one object spelt with either sigma is still one object"
         );
-
-        // **Expansion, upwards.** `U+00DF` fully uppercases to `SS` and the kernel's table leaves
-        // it alone -- but the full mapping is exactly where Rust stops being able to show the
-        // one-unit mapping, so this cannot tell `U+00DF`, which the table does not move, from
-        // `U+1F80`, which it moves to `U+1F88`. It declines for both rather than being right about
-        // one and wrong about the other.
-        assert_eq!(
-            same_object_name("\u{00df}", "SS"),
-            NameMatch::Undecided,
-            "a fold that cannot see the one-unit mapping does not get to rule the match out"
-        );
-        assert_eq!(
-            same_object_name("\u{1f80}", "\u{1f88}"),
-            NameMatch::Undecided,
-            "the fold cannot reach this one, and says so rather than guessing"
+        assert!(
+            !same_object_name("\u{0130}", "i\u{0307}"),
+            "a fold that expands would make one object out of two"
         );
 
-        // **A surrogate pair is not a letter to a `WCHAR` fold.** The kernel cannot case-fold a
-        // non-BMP letter at all, so these are two objects; folding over scalar values would merge
-        // them.
-        assert_eq!(
-            same_object_name("\u{10400}", "\u{10428}"),
-            NameMatch::Different,
-            "what the kernel cannot fold, this does not fold either -- and knows it"
-        );
-
-        // **The floor at `U+00C0`.** `U+00B5` is below it, so the comparison consults no table and
-        // leaves it alone -- where Unicode would fold it to `U+039C`, a Greek capital mu, changing
-        // its script on the way. Two objects to the kernel.
-        assert_eq!(
-            same_object_name("\u{00b5}", "\u{039c}"),
-            NameMatch::Different,
-            "a fold the kernel does not reach for is not one to make here"
-        );
-
-        // **Equal needs no certainty.** Both sides carry the unit this cannot fold, and equal
-        // sequences fold equal under any per-unit table -- so the answer is a match rather than
-        // the `Undecided` a mismatch on the same unit gets.
-        assert_eq!(same_object_name("\u{00df}", "\u{00df}"), NameMatch::Same);
+        // A surrogate pair is not a letter to a per-`WCHAR` fold, and the table moves no unit in
+        // `D800..DFFF` -- measured across the range.
+        assert!(!same_object_name("\u{10400}", "\u{10428}"));
     }
 
     /// A name differing outside ASCII resolves, which is the defect this fold replaced.
     ///
     /// `eq_ignore_ascii_case` folds twenty-six letters and the object manager folds through its
-    /// own table, so `K\u{e4}se` and `K\u{c4}SE` are one object there and were two here -- reported
-    /// as [`ObjectError::NotFound`], which is the answer a caller acts on.
+    /// own table, so `K\u{e4}se` and `K\u{c4}SE` are one object there and were two here --
+    /// reported as [`ObjectError::NotFound`], which is the answer a caller acts on.
+    #[cfg_attr(miri, ignore = "folds through ntdll; see `upcase_unit`'s Miri shim")]
     #[test]
     fn a_name_is_matched_through_the_object_managers_fold_and_not_through_ascii() {
         let mut fake = namespace();
@@ -1556,44 +1475,35 @@ mod tests {
         );
     }
 
-    /// A lookup the fold cannot decide says so, rather than saying the object is absent.
+    /// And a name the table does **not** fold together stays two objects through the walk.
     ///
-    /// **The asymmetry is the point.** A directory holding a name this cannot fold the way the
-    /// kernel does may hold the very object being asked for, so the walk is not entitled to
-    /// `NotFound` -- which is a fact about the target -- for what is a limit of this crate's fold.
-    /// It is counted apart from the two read faults for the same reason those are counted apart
-    /// from each other: a reader told "1 entry would not read" goes away and retries, and there is
-    /// nothing here to retry.
+    /// The mirror of the test above, and the one that would have caught the 224: a reproduction
+    /// that folds where the system does not resolves a lookup to an object the object manager
+    /// would not have found, which is worse than failing to find one.
+    #[cfg_attr(miri, ignore = "folds through ntdll; see `upcase_unit`'s Miri shim")]
     #[test]
-    fn a_name_the_fold_cannot_decide_is_not_reported_as_absent() {
+    fn a_name_the_table_does_not_fold_together_is_two_objects() {
         let mut fake = namespace();
-        const SHARP_S: u64 = 0xffff_a000_0071_0000;
-        // `U+00DF` fully uppercases to `SS` and the kernel's one-to-one table leaves it alone;
-        // nothing on a host shows the one-unit mapping, so a comparison turning on it is undecided.
-        fake.object(SHARP_S, "\u{00df}", obfuscated(4, SHARP_S), 0);
-        fake.directory(DEVICE_DIR, &[DEVICE, SHARP_S]);
+        const DOTLESS: u64 = 0xffff_a000_0071_0000;
+        fake.object(DOTLESS, "\u{0131}", obfuscated(4, DOTLESS), 0);
+        fake.directory(DEVICE_DIR, &[DEVICE, DOTLESS]);
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
 
         assert_eq!(
-            namespace.object_at("\\Device\\SS"),
-            Err(ObjectError::NotFoundInPart {
-                directory: "\\Device".to_string(),
-                component: "SS".to_string(),
-                unreadable: 0,
-                malformed: 0,
-                undecided: 1,
-            }),
-            "the directory read in full and the walk still cannot call this absent"
-        );
-
-        // And the name it *can* decide is still decided, so one undecidable entry does not make
-        // the directory unusable.
-        assert_eq!(
             namespace
-                .object_at("\\Device\\MountPointManager")
+                .object_at("\\Device\\\u{0131}")
                 .map(|found| found.address),
-            Ok(DEVICE)
+            Ok(DOTLESS),
+            "its own name still resolves"
+        );
+        assert_eq!(
+            namespace.object_at("\\Device\\I"),
+            Err(ObjectError::NotFound {
+                directory: "\\Device".to_string(),
+                component: "I".to_string(),
+            }),
+            "and `I` is a different object, which Unicode's simple mapping would have merged"
         );
     }
 
@@ -1902,7 +1812,6 @@ mod tests {
                 Err(ObjectError::NotFoundInPart {
                     unreadable: 0,
                     malformed: 1,
-                    undecided: 0,
                     ..
                 })
             ),
@@ -2245,15 +2154,13 @@ mod tests {
         );
 
         // And a lookup of it names the transient fault rather than the structural one, which is
-        // the other half of the pair `NotFoundInPart` keeps apart -- and neither of them is the
-        // third count, which is this crate's fold rather than anything about the target.
+        // the other half of the pair `NotFoundInPart` carries two counts for.
         assert!(
             matches!(
                 namespace.object_at("\\Device\\MountPointManager"),
                 Err(ObjectError::NotFoundInPart {
                     unreadable: 1,
                     malformed: 0,
-                    undecided: 0,
                     ..
                 })
             ),
