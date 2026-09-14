@@ -2204,6 +2204,40 @@ pub struct Instruction {
     /// [`Flow::Unknown`] is the flow there -- nothing was read, so nothing is claimed, and a
     /// consumer that needs the difference reads the flow.
     pub writes: Vec<RegisterOperand>,
+    /// Every register the instruction **reads**, explicit and implicit.
+    ///
+    /// [`Self::writes`]' other half, and it is here for the same reason that one is:
+    /// [`Self::operands`] names the reads an instruction was *written* with, and an instruction
+    /// reads registers it does not name. `mul ecx` reads `eax`, `cmpxchg` reads `rax`, the string
+    /// instructions read `rsi`/`rdi`/`rcx`, and a `cmp dword ptr [rcx+8],5` reads `rcx` while
+    /// naming it only inside a memory operand. A consumer asking "is this arithmetic about the
+    /// value I am tracking" answers no for every one of those, and answers it from a list that was
+    /// never the question.
+    ///
+    /// **A conditional read is in the list**, the mirror of the reason a conditional write is in
+    /// the other one: the question is whether a value may have reached this instruction, and the
+    /// conservative answer is the only safe one. A **read-write** operand is in both lists, those
+    /// being different questions.
+    ///
+    /// **A register read only to form an address is here too**, because the instruction does read
+    /// it. What this does not say is that the instruction's *result* is about what that register
+    /// held -- `cmp eax,[rdx+rcx*8]` compares against a loaded value, not against `rcx` -- and a
+    /// consumer that needs the difference has [`Self::operands`] beside this, where a memory
+    /// operand's [`MemoryOperand::base`] and [`MemoryOperand::index`] are exactly the registers in question.
+    ///
+    /// **A read is reported at the width it reads, which is where this differs from
+    /// [`Self::writes`].** A 32-bit write zeroes the upper half, so the decoder reports the whole
+    /// of `rax` for `mov eax,1`; a 32-bit read reads four bytes, so `mov ecx,eax` reports `eax`.
+    /// [`RegisterOperand::full`] is still the field to match on -- what `rax` holds is what `eax`
+    /// reads part of -- and [`RegisterOperand::width`] is what says how much of it was read.
+    ///
+    /// The flags are not registers here, as they are not in [`Self::writes`]: [`Self::condition`]
+    /// is what a branch reads them for.
+    ///
+    /// Empty for an instruction set this build does not decode, and empty means **"not decoded"**
+    /// rather than "reads nothing" -- the same contract [`Self::writes`] states, and a consumer
+    /// that needs the difference reads [`Self::flow`].
+    pub reads: Vec<RegisterOperand>,
 }
 
 /// The engine's current **scope**: which instruction, which frame, and the register context
@@ -2734,6 +2768,7 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
         condition: decoded.condition,
         writes_flags: decoded.writes_flags,
         writes: decoded.writes,
+        reads: decoded.reads,
     }
 }
 
@@ -2771,6 +2806,7 @@ struct Decoded {
     condition: Option<Condition>,
     writes_flags: bool,
     writes: Vec<RegisterOperand>,
+    reads: Vec<RegisterOperand>,
 }
 
 impl Decoded {
@@ -2785,6 +2821,7 @@ impl Decoded {
             condition: None,
             writes_flags: false,
             writes: Vec::new(),
+            reads: Vec::new(),
         }
     }
 }
@@ -2819,6 +2856,7 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
     let operands = (0..decoded.op_count())
         .map(|index| read_decoded_operand(&decoded, index, bitness))
         .collect();
+    let (reads, writes) = touched_registers(&decoded, bitness);
     Decoded {
         mnemonic,
         operands,
@@ -2829,21 +2867,21 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
         // Any flag at all: what a caller is asking is "did this set the flags the branch after it
         // reads", and the decoder knows which bits each instruction writes.
         writes_flags: decoded.rflags_written() != 0,
-        writes: written_registers(&decoded, bitness),
+        writes,
+        reads,
     }
 }
 
-/// Every register an instruction writes, explicit and implicit.
+/// Every register an instruction reads and every register it writes, explicit and implicit.
 ///
 /// iced's instruction *info* rather than its operands, which is the whole point: the operand list
 /// is what the instruction was written with, and the info is what it touches. `mul ecx` names one
-/// register and writes three.
+/// register, writes two and reads two, and only one of the four is the one it names.
 ///
-/// A **conditional** write counts, because the question a consumer asks is "may this register have
-/// changed" and the conservative answer is the only safe one. `OpAccess::NoMemAccess` is about
-/// memory rather than about a register and cannot appear here; it is matched with the reads so the
-/// arms stay exhaustive over the enum rather than over a wildcard, which is what keeps this honest
-/// when iced adds one.
+/// **Both halves from one call, because they are one answer.** `used_registers()` is a single list
+/// carrying every access, so asking for the writes and then for the reads builds that list twice
+/// per instruction — which `decode_range` pays over hundreds of functions to split something it
+/// already had. The two filters below run over the one borrow.
 ///
 /// **One factory, kept for the thread.** iced's factory exists to be reused -- it owns the vectors
 /// the answer is built in -- so making one per instruction throws those away and allocates again
@@ -2851,8 +2889,12 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
 /// Thread-local rather than a parameter because the other caller is `split_instruction`, which is
 /// public and is handed one line at a time; a signature that made every caller carry scratch would
 /// spread this crate's bookkeeping into theirs. `NO_MEMORY_USAGE` because the memory half of the
-/// answer is gathered and thrown away here.
-fn written_registers(decoded: &iced_x86::Instruction, bitness: u32) -> Vec<RegisterOperand> {
+/// answer is gathered and thrown away here — the registers that *form* an address are in
+/// `used_registers()` either way, which is why [`Instruction::reads`] has them.
+fn touched_registers(
+    decoded: &iced_x86::Instruction,
+    bitness: u32,
+) -> (Vec<RegisterOperand>, Vec<RegisterOperand>) {
     use iced_x86::InstructionInfoOptions;
     thread_local! {
         static FACTORY: std::cell::RefCell<iced_x86::InstructionInfoFactory> =
@@ -2860,37 +2902,70 @@ fn written_registers(decoded: &iced_x86::Instruction, bitness: u32) -> Vec<Regis
     }
     FACTORY.with(|factory| {
         let mut factory = factory.borrow_mut();
-        let info = factory.info_options(decoded, InstructionInfoOptions::NO_MEMORY_USAGE);
-        written_from(info.used_registers(), bitness)
+        let used = factory
+            .info_options(decoded, InstructionInfoOptions::NO_MEMORY_USAGE)
+            .used_registers();
+        (read_from(used, bitness), written_from(used, bitness))
     })
 }
 
-/// The registers an instruction's info says it writes, as operands.
+/// The registers an instruction's info says it **writes**, as operands.
+///
+/// A **conditional** write counts, because the question a consumer asks is "may this register have
+/// changed" and the conservative answer is the only safe one. `OpAccess::NoMemAccess` is about
+/// memory rather than about a register and cannot appear here; it is matched with the reads so the
+/// arms stay exhaustive over the enum rather than over a wildcard, which is what keeps this honest
+/// when iced adds one.
 ///
 /// Split from the factory above so the borrow ends with it: the answer is owned rather than
 /// borrowed out of scratch storage the next instruction will overwrite.
 fn written_from(used: &[iced_x86::UsedRegister], bitness: u32) -> Vec<RegisterOperand> {
-    use iced_x86::{OpAccess, Register};
-    let mut written: Vec<RegisterOperand> = Vec::new();
+    use iced_x86::OpAccess;
+    registers_from(used, bitness, |access| match access {
+        OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite => {
+            true
+        }
+        OpAccess::None | OpAccess::Read | OpAccess::CondRead | OpAccess::NoMemAccess => false,
+    })
+}
+
+/// The registers an instruction's info says it **reads**, as operands.
+///
+/// [`written_from`]'s filter mirrored, arm for arm, and the mirroring is the point: a
+/// read-and-write access is in both answers, and `None`/`NoMemAccess` are in neither. Both matches
+/// are exhaustive over `OpAccess` for the same reason — an arm iced adds later has to be decided
+/// here rather than swallowed by a wildcard, and in *both* directions.
+fn read_from(used: &[iced_x86::UsedRegister], bitness: u32) -> Vec<RegisterOperand> {
+    use iced_x86::OpAccess;
+    registers_from(used, bitness, |access| match access {
+        OpAccess::Read | OpAccess::CondRead | OpAccess::ReadWrite | OpAccess::ReadCondWrite => true,
+        OpAccess::None | OpAccess::Write | OpAccess::CondWrite | OpAccess::NoMemAccess => false,
+    })
+}
+
+/// The registers of one access direction, deduplicated, in the order iced reports them.
+fn registers_from(
+    used: &[iced_x86::UsedRegister],
+    bitness: u32,
+    wanted: impl Fn(iced_x86::OpAccess) -> bool,
+) -> Vec<RegisterOperand> {
+    let mut picked: Vec<RegisterOperand> = Vec::new();
     for used in used {
-        let writes = match used.access() {
-            OpAccess::Write
-            | OpAccess::CondWrite
-            | OpAccess::ReadWrite
-            | OpAccess::ReadCondWrite => true,
-            OpAccess::None | OpAccess::Read | OpAccess::CondRead | OpAccess::NoMemAccess => false,
-        };
-        if !writes || used.register() == Register::None {
+        if !wanted(used.access()) || used.register() == iced_x86::Register::None {
             continue;
         }
         let operand = register_operand(used.register(), bitness);
-        // iced reports a register once per access kind, and an instruction can name one twice;
-        // what a consumer wants is the set.
-        if !written.iter().any(|seen| seen.name == operand.name) {
-            written.push(operand);
+        // iced reports a register once per access kind, and an instruction can name one twice --
+        // `test eax,eax` reports `eax/Read` twice. What a consumer wants is the set.
+        //
+        // **Keyed on the spelling and not on the full-width register**, because these are the
+        // registers the instruction touched: an access to `ah` and one to `al` are two accesses,
+        // and collapsing them onto `rax` would report a width that was never touched.
+        if !picked.iter().any(|seen| seen.name == operand.name) {
+            picked.push(operand);
         }
     }
-    written
+    picked
 }
 
 /// What the instruction does to its operands, from the decoder's own mnemonic rather than from the
@@ -6382,6 +6457,12 @@ impl DebugEngine {
             let encoding = bytes
                 .get(offset..offset + decoded.len())
                 .unwrap_or_default();
+            // Empty for bytes that did not decode, for the same reason the flow below is
+            // `Unknown` there: nothing was read, so nothing is claimed about what was touched.
+            let (reads, writes) = match decoded.is_invalid() {
+                true => (Vec::new(), Vec::new()),
+                false => touched_registers(&decoded, bitness),
+            };
             out.push(Instruction {
                 address: at,
                 bytes: hex::encode(encoding),
@@ -6418,10 +6499,8 @@ impl DebugEngine {
                     .then(|| decoded_condition(&decoded))
                     .flatten(),
                 writes_flags: !decoded.is_invalid() && decoded.rflags_written() != 0,
-                writes: match decoded.is_invalid() {
-                    true => Vec::new(),
-                    false => written_registers(&decoded, bitness),
-                },
+                writes,
+                reads,
             });
         }
         Ok(out)
@@ -9144,6 +9223,158 @@ mod tests {
         );
         assert_eq!(undecoded.flow, Flow::Unknown);
         assert!(undecoded.writes.is_empty(), "{undecoded:?}");
+    }
+
+    /// An instruction says which registers it **reads**, which its operands do not.
+    ///
+    /// The write side's argument, mirrored: the operand list is what an instruction was written
+    /// with, and the reads it does not name are the ones a consumer tracking a value through a
+    /// routine most needs. Every assertion below is a shape where the two answers differ, and the
+    /// operand list is asserted alongside so that the *gap* is what is pinned rather than the
+    /// reads alone -- a regression that made `operands` complete would otherwise leave this test
+    /// passing for a reason it is not about.
+    ///
+    /// `scasd` is the shape that costs a consumer most and is the reason this is not covered by
+    /// [`Instruction::writes`] already: it reads `eax`, writes the flags, and does **not** write
+    /// `rax` -- so a pass watching for the value to be overwritten sees nothing, and a pass
+    /// reading the operand list sees the `eax` it happens to name. Its neighbour `repne scasb`
+    /// reads `rcx` and names it nowhere at all.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn test_an_instruction_says_which_registers_it_reads() {
+        let reads = |bytes: &str| {
+            let raw = hex::decode(bytes).expect("the fixture is hex");
+            let decoded = decode_operation(&raw, 0x1000, InstructionSet::Amd64);
+            assert_ne!(
+                decoded.flow,
+                Flow::Unknown,
+                "`{bytes}` must decode: {decoded:?}"
+            );
+            let mut full: Vec<String> = decoded.reads.iter().map(|r| r.full.clone()).collect();
+            full.sort();
+            (decoded.mnemonic.clone(), full)
+        };
+        // What the operand list names as a register, for the same encoding -- the answer this
+        // field exists because a consumer cannot use.
+        let named = |bytes: &str| {
+            let raw = hex::decode(bytes).expect("the fixture is hex");
+            let decoded = decode_operation(&raw, 0x1000, InstructionSet::Amd64);
+            let mut full: Vec<String> = decoded
+                .operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    Operand::Register(register) => Some(register.full.clone()),
+                    _ => None,
+                })
+                .collect();
+            full.sort();
+            full
+        };
+
+        // **The implicit read beside the implicit write.** `mul ecx` names `ecx` and reads `eax`.
+        assert_eq!(
+            reads("f7e1"),
+            (
+                "mul".to_string(),
+                vec!["rax".to_string(), "rcx".to_string()]
+            )
+        );
+        assert_eq!(named("f7e1"), vec!["rcx".to_string()]);
+
+        // `cmpxchg edx,ecx` names two registers and reads three.
+        assert_eq!(
+            reads("0fb1ca"),
+            (
+                "cmpxchg".to_string(),
+                vec!["rax".to_string(), "rcx".to_string(), "rdx".to_string()]
+            )
+        );
+        assert_eq!(named("0fb1ca"), vec!["rcx".to_string(), "rdx".to_string()]);
+
+        // **A read with no matching write**, which is what makes this field more than a
+        // restatement of `writes`: `scasd` compares `eax` against `es:[rdi]` and leaves `rax`
+        // alone, so nothing about the write side says the value was looked at.
+        let scasd = decode_operation(
+            &hex::decode("af").expect("hex"),
+            0x1000,
+            InstructionSet::Amd64,
+        );
+        assert_eq!(
+            scasd
+                .reads
+                .iter()
+                .map(|r| r.full.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["rax", "rdi"].into_iter().collect()
+        );
+        assert!(
+            !scasd.writes.iter().any(|w| w.full == "rax"),
+            "scasd reads eax and writes no part of rax: {scasd:?}"
+        );
+        assert!(scasd.writes_flags, "{scasd:?}");
+
+        // And the same family with the count in it, which the operand list never names.
+        assert_eq!(
+            reads("f2ae"),
+            (
+                "scasb".to_string(),
+                vec!["rax".to_string(), "rcx".to_string(), "rdi".to_string()]
+            )
+        );
+        assert_eq!(named("f2ae"), vec!["rax".to_string()]);
+
+        // **A register read to form an address is a read**, and it is not in the operand list as
+        // a register -- it is the base of a memory operand there. `cmp dword ptr [rcx+8],5`.
+        assert_eq!(
+            reads("83790805"),
+            ("cmp".to_string(), vec!["rcx".to_string()])
+        );
+        assert!(named("83790805").is_empty());
+
+        // A read-write operand is on both lists, those being different questions.
+        assert_eq!(
+            reads("23c1"),
+            (
+                "and".to_string(),
+                vec!["rax".to_string(), "rcx".to_string()]
+            )
+        );
+
+        // A conditional read counts, for the mirror of the reason a conditional write does.
+        assert_eq!(
+            reads("0f45c1"),
+            (
+                "cmovne".to_string(),
+                vec!["rax".to_string(), "rcx".to_string()]
+            )
+        );
+
+        // **The width asymmetry with `writes`.** A 32-bit write reaches the whole of `rax`, so
+        // `mov eax,1` writes `rax` and reads nothing; a 32-bit read reads four bytes, so
+        // `mov eax,ecx` reports the `ecx` it read rather than the `rcx` around it.
+        assert_eq!(reads("b801000000"), ("mov".to_string(), Vec::new()));
+        let copy = decode_operation(
+            &hex::decode("8bc1").expect("hex"),
+            0x1000,
+            InstructionSet::Amd64,
+        );
+        assert_eq!(copy.reads.len(), 1, "{copy:?}");
+        assert_eq!(copy.reads[0].name, "ecx");
+        assert_eq!(copy.reads[0].full, "rcx");
+        assert_eq!(copy.reads[0].width, 4);
+
+        // An instruction set this build does not decode claims nothing, as its flow says --
+        // empty here is "not decoded" and not "reads nothing".
+        let undecoded = decode_operation(
+            &[0x00, 0x01, 0x02, 0x03],
+            0x1000,
+            InstructionSet::Other(0xaa64),
+        );
+        assert_eq!(undecoded.flow, Flow::Unknown);
+        assert!(undecoded.reads.is_empty(), "{undecoded:?}");
     }
 
     /// Privilege is the **decoder's** answer, which is the whole point of carrying it.
