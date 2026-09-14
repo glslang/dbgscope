@@ -50,6 +50,10 @@ features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_Debug_Extensions",
     "Win32_System_SystemInformation",
+    # `RtlUpcaseUnicodeChar`, which is how `object::same_object_name` folds a name: it is the
+    # object manager's own fold rather than a reproduction of it. Under `Wdk` rather than `Win32`
+    # because that is where Microsoft's metadata puts the ntdll Rtl surface.
+    "Wdk_System_SystemServices",
 ]
 
 # Only `examples/user_heap_smoke.rs` allocates on the host heap it then walks. Cargo unifies
