@@ -28,9 +28,13 @@
 //! is answers "which symbolic links point here" wrongly, which is the one thing a security question
 //! must not do.
 //!
-//! Names are folded the way `nt!ObpLookupDirectoryEntry` folds them, by calling the same
-//! `RtlUpcaseUnicodeChar` it calls -- see [`same_object_name`]. Reproducing that fold instead was
-//! measurably wrong for 326 of the 65,536 code units, and wrong *confidently* for 224 of them.
+//! Names are folded the way `nt!ObpLookupDirectoryEntry` folds them -- through **the target's
+//! own** upcase table, walked as the 8-4-4 trie `RtlUpcaseUnicodeChar` walks it, with this host's
+//! copy of that routine standing in where the target will not say where its table is. See
+//! [`Upcase`]. Reproducing the fold instead of performing it was measurably wrong for 326 of the
+//! 65,536 code units, and wrong *confidently* for 224 of them; performing it against the host's
+//! table was right for all 65,536 on one bench and had nothing to say about a target of another
+//! vintage, which is what reading the target's own closes.
 //!
 //! # Where it works
 //!
@@ -38,6 +42,9 @@
 //! work on a kernel minidump: measured against `docs/samples/081226-2187-01.dmp` in the consumer,
 //! `nt!ObpRootDirectoryObject` itself reads `????????`, so the walk stops at its first read and
 //! says so rather than reporting an empty namespace.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 use thiserror::Error;
 
@@ -180,16 +187,20 @@ pub enum ObjectError {
     },
 }
 
-/// Whether two object **names** are the one name the object manager would file an object under.
+/// Whether two object **names** are the one name the object manager would file an object under,
+/// folded through **this host's** upcase table.
 ///
 /// The object manager is case-insensitive -- `nt!ObpCaseInsensitive` is 1 on 26100 -- so `Device`
 /// and `DEVICE` are one name. It is not insensitive the way ASCII is, and it is **not insensitive
 /// the way Unicode is either**, which is the whole difficulty: it folds through the system's own
 /// upcase table, and that table is not Unicode's simple case mapping.
 ///
-/// So this does not reproduce the fold, it **performs** it. [`upcase`] calls
-/// `RtlUpcaseUnicodeChar`, which is the function `nt!ObpLookupDirectoryEntry` itself calls -- see
-/// there for what was measured and why a reproduction was wrong.
+/// So this does not reproduce the fold, it **performs** it -- against the table of whichever
+/// machine this runs on. [`Upcase::of_host`] is what that means and where the limit is written
+/// down; [`Namespace::upcase`] is the same fold against the **target's** table, which is what the
+/// walk itself uses and what a caller holding a target should use too. This is for a caller that
+/// has two names and no target, and gives the answer both agree on wherever the two machines' NLS
+/// data agrees.
 ///
 /// **This compares one name, not a path.** A caller holding a whole path may pass it: the fold is
 /// per code unit, so a separator folds to itself and comparing `\Device\Foo` against `\DEVICE\FOO`
@@ -198,68 +209,275 @@ pub enum ObjectError {
 /// wanting that has to ask it -- or about a trailing separator, which is a caller's habit rather
 /// than part of a name and a caller's to trim.
 pub fn same_object_name(one: &str, other: &str) -> bool {
-    upcase(one) == upcase(other)
+    Upcase::of_host().same_name(one, other)
 }
 
-/// A name folded the way the object manager folds one: **one UTF-16 code unit in, one out.**
+/// Where a target keeps the upcase table the object manager folds names through.
 ///
-/// # It is the object manager's own fold, not a reproduction of one
-///
-/// `nt!ObpLookupDirectoryEntry` on 26100 folds in three bands: `U+0061`..`U+007A` gets `0x20`
-/// subtracted inline, anything else below `U+00C0` is not folded at all, and at or above `U+00C0`
-/// the code unit indexes `UnicodeUpcaseTable844` -- an 8-4-4 trie, high byte then middle nibble
-/// then low nibble, whose leaf is a **delta added** to the code unit. The first two bands are
-/// reproduced below, because they consult no table and are therefore knowledge rather than a
-/// guess. The third is `RtlUpcaseUnicodeChar`, which is **the very function the lookup calls**:
-/// measured on a live 26100 ARM64 kernel, `ObpLookupDirectoryEntry` has two `bl` sites to it, one
-/// on each of its comparison and hash paths, and inlines the same trie against the same table
-/// pointer -- `PsGetCurrentServerSiloGlobals()->RtlNlsState.UnicodeUpcaseTable844`, which is
-/// silo globals `+0x4B0` on that build.
-///
-/// # Why a reproduction was wrong, measured rather than reasoned
-///
-/// This was `char::to_uppercase` until it was checked against the target's own table, and the
-/// failure is worth keeping because it is not the one anybody predicts. Rust's `std` exposes only
-/// the **full** Unicode case mapping, which expands, so 102 code units had no one-unit answer at
-/// all and the fold declined to speak for them. That was the known limit. The **unknown** one was
-/// worse: for **224** further code units the fold was *confident* and *wrong*, in the direction
-/// that matters -- it folded where Windows does not, so two objects compared equal. `U+0131` is
-/// the cleanest of them, whose Unicode simple uppercase is `I` and which the system's table leaves
-/// alone, so `\Device\ı` and `\Device\I` -- two objects to the object manager -- were one here.
-/// Windows' table is not Unicode's: it declines mappings that would break round-tripping
-/// (`U+0131`, `U+017F`, the titlecase digraphs) and predates the `U+A7xx` additions.
-///
-/// The dumped kernel table and this host's `RtlUpcaseUnicodeChar` agreed on **all 65,536** code
-/// units, which is what makes calling the host's copy sound rather than convenient. What that does
-/// not establish is a host and a target of *different vintages*, where the NLS data could differ;
-/// nothing here detects that, and reading the target's own table is what would close it.
-fn upcase(name: &str) -> Vec<u16> {
-    name.encode_utf16().map(upcase_unit).collect()
+/// Three coordinates rather than one address, because the table is reached through two structures
+/// and neither offset is a constant: `_ESERVERSILO_GLOBALS` grows between builds and
+/// `_RTL_NLS_STATE` sits inside it. Resolved from the target's own symbols and type information by
+/// [`DebugEngine::object_globals`], the way [`Layout`] is and for the same reason -- a table of
+/// literals here would decode a different build confidently and wrongly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpcaseTable {
+    /// `nt!PspHostSiloGlobals` -- the structure itself, not a pointer to it.
+    ///
+    /// **The host silo's globals, which is a limit rather than an oversight.** The fold the object
+    /// manager performs reads `PsGetCurrentServerSiloGlobals()`, which -- measured by
+    /// disassembling it on 26100 x64 -- returns `&PspHostSiloGlobals` unless the *calling thread*
+    /// is in a server silo, and that silo's globals when it is. A debugger walking a namespace has
+    /// no calling thread in it, so there is no current silo to ask for, and the host silo is both
+    /// the answer for every thread outside a container and the only one a symbol reaches. A server
+    /// silo with its own NLS data would fold its own names differently and nothing here would
+    /// know.
+    pub silo_globals: u64,
+    /// `_ESERVERSILO_GLOBALS::RtlNlsState` -- `0x408` on 26100 x64.
+    pub nls_state: u32,
+    /// `_RTL_NLS_STATE::UnicodeUpcaseTable844` -- `0xa8` on 26100 x64, which puts the pointer at
+    /// silo globals `+0x4b0` on that build, the same distance measured on 26100 ARM64.
+    pub upcase_table: u32,
 }
 
-/// One code unit, in the three bands the lookup folds in.
-fn upcase_unit(unit: u16) -> u16 {
-    match unit {
-        // The comparison's own fast path, written the way it writes it -- and the reason this is
-        // not simply one call: these two bands read no table, so they are the same answer on any
-        // host, and keeping them here is what lets the walk's tests run where the call cannot.
-        0x61..=0x7a => unit - 0x20,
-        // Below the floor the lookup reaches for no table, so neither does this.
-        0..=0xbf => unit,
-        // **A surrogate is passed through, and that is the kernel's answer too.** A per-`WCHAR`
-        // fold is handed half a character at a time and cannot fold a non-BMP letter, so two
-        // spellings of one Deseret name are genuinely two objects. `RtlUpcaseUnicodeChar` moves
-        // no unit in `D800..DFFF` -- measured across the range -- so this band needs no exception
-        // and does not have one.
-        //
-        // Miri cannot call a foreign function, and the walk's tests are worth running under it:
-        // they are the pointer arithmetic this module is, over a fake target. Every name they use
-        // is ASCII, which the bands above answer identically, so the shim costs those tests
-        // nothing. The two tests that are *about* this band say so and are ignored there.
-        _ => match cfg!(miri) {
+/// Which machine's table a fold answered from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpcaseFrom {
+    /// The target's own, at this address.
+    Target(u64),
+    /// **This host's**, because the target's could not be reached -- no [`Globals::upcase`] to
+    /// reach it by, or a read that did not come back. The answer is then this machine's NLS data
+    /// standing in for the target's, which is right wherever the two agree and says nothing about
+    /// where they do not.
+    Host,
+}
+
+/// The fold `nt!ObpLookupDirectoryEntry` performs on a name, over whichever table this can reach.
+///
+/// # The table is the target's, and the host's is what is left
+///
+/// `RtlUpcaseUnicodeChar` reads **the machine it runs on**. Calling the host's copy to fold a
+/// *target's* names is right exactly as far as the two machines' NLS data agrees, which on the
+/// bench this was settled on was all 65,536 code units -- both being 26100-era Windows, which is
+/// the easy case rather than the general one. Between vintages nothing guarantees it: Windows'
+/// table declines mappings Unicode makes and predates the `U+A7xx` additions, so it moves when
+/// Windows adopts them, and a fold that disagreed with the target would report two objects as one
+/// or one as two, silently and with nothing to detect it. So the table is read from the target
+/// when the target says where it is, and the host's call is what is left when it does not.
+///
+/// # The walk
+///
+/// Transcribed from `RtlUpcaseUnicodeChar` itself rather than from a description of it -- the
+/// disassembly is in [`Self::from_table`]. Three bands, of which the first two read no table at
+/// all, which is why an ASCII name costs no target read: `U+0061`..`U+007A` has `0x20` subtracted,
+/// anything else below `U+00C0` comes back unchanged, and the rest indexes an 8-4-4 trie.
+///
+/// **A surrogate is passed through, and that is the kernel's answer too.** A per-`WCHAR` fold is
+/// handed half a character at a time and cannot fold a non-BMP letter, so two spellings of one
+/// Deseret name are genuinely two objects. `RtlUpcaseUnicodeChar` moves no unit in `D800..DFFF` --
+/// measured across the range -- so the band needs no exception and has none; the trie's own leaves
+/// are zero there.
+///
+/// # What it costs
+///
+/// Three target reads per *distinct* code unit at or above `U+00C0`, once, and none after that --
+/// they are remembered, because one path component is compared against every entry in a directory
+/// and a directory holds tens of them. A name that is entirely ASCII -- which is nearly every name
+/// in the namespace -- reads nothing and remembers nothing.
+pub struct Upcase<'a> {
+    /// The target's table and the memory to reach it through, or [`None`] for the host's fold.
+    target: Option<(&'a dyn Memory, UpcaseTable)>,
+    /// What has been resolved so far. Behind a [`RefCell`] because folding happens through `&self`
+    /// -- the walk holds one of these and compares names from inside an iterator.
+    known: RefCell<Known>,
+}
+
+/// The table's address once it has been asked for, and the units folded through it.
+#[derive(Debug, Default)]
+struct Known {
+    /// [`None`] is "not asked yet"; `Some(None)` is "asked, and this target would not say", which
+    /// is remembered so a target whose globals do not read is not re-read once per code unit.
+    base: Option<Option<u64>>,
+    units: BTreeMap<u16, u16>,
+}
+
+impl<'a> Upcase<'a> {
+    /// The fold performed against **the target's** table, falling back to this host's.
+    pub fn of_target(memory: &'a dyn Memory, table: UpcaseTable) -> Self {
+        Self {
+            target: Some((memory, table)),
+            known: RefCell::default(),
+        }
+    }
+
+    /// The fold performed against **this host's** table, for a caller that has names and no
+    /// target.
+    ///
+    /// Sound wherever the host's NLS data matches the target's, which is not a thing this can
+    /// check -- see [`Upcase`] for what moves between builds. A caller holding a target should
+    /// fold through [`Namespace::upcase`] instead.
+    pub fn of_host() -> Self {
+        Self {
+            target: None,
+            known: RefCell::default(),
+        }
+    }
+
+    /// Which table this answers from -- **resolving it if that has not happened yet**, which for a
+    /// target costs the one read that finds the table.
+    ///
+    /// What lets a caller say which machine's NLS data an answer came from, rather than leaving a
+    /// fallback to look like a measurement.
+    pub fn source(&self) -> UpcaseFrom {
+        match self.base() {
+            Some(at) => UpcaseFrom::Target(at),
+            None => UpcaseFrom::Host,
+        }
+    }
+
+    /// Whether two object **names** are the one name the object manager would file an object
+    /// under. See [`same_object_name`] for what counts as a name here, and what a path does not.
+    pub fn same_name(&self, one: &str, other: &str) -> bool {
+        self.fold(one) == self.fold(other)
+    }
+
+    /// A name folded the way the object manager folds one: **one UTF-16 code unit in, one out.**
+    fn fold(&self, name: &str) -> Vec<u16> {
+        name.encode_utf16().map(|unit| self.unit(unit)).collect()
+    }
+
+    /// One code unit, in the three bands the lookup folds in.
+    fn unit(&self, unit: u16) -> u16 {
+        match unit {
+            // The comparison's own fast path, written the way it writes it -- and the reason the
+            // table is not simply read for every unit: these two bands consult no table, so they
+            // are the same answer on any machine, and keeping them here is what lets the walk's
+            // tests run against a target carrying no NLS data at all.
+            0x61..=0x7a => unit - 0x20,
+            // Below the floor the lookup reaches for no table, so neither does this.
+            0..=0xbf => unit,
+            _ => {
+                if let Some(remembered) = self.known.borrow().units.get(&unit) {
+                    return *remembered;
+                }
+                let folded = self.uncached(unit);
+                self.known.borrow_mut().units.insert(unit, folded);
+                folded
+            }
+        }
+    }
+
+    /// One code unit at or above `U+00C0`, from whichever table answers.
+    fn uncached(&self, unit: u16) -> u16 {
+        let (Some((memory, _)), Some(base)) = (self.target, self.base()) else {
+            return Self::on_host(unit);
+        };
+        // **The routine's own null check, and the one place a miss is not a fallback.**
+        // `RtlUpcaseUnicodeChar` tests the table pointer before it indexes anything and returns
+        // the code unit unchanged when it is zero -- so a target whose pointer reads as null folds
+        // by the two ASCII bands and by nothing else, and that is its answer rather than a gap in
+        // this one. Standing the host's table in here would fold where the target does not, which
+        // is the exact shape of the bug that stopped this crate reproducing the table at all.
+        if base == 0 {
+            return unit;
+        }
+        match Self::from_table(memory, base, unit) {
+            Some(folded) => folded,
+            // **A table that would not read is not a target that does not fold.** The reads above
+            // are of a structure this located by symbol, so a miss is a page that was out or an
+            // offset that is not this build's -- neither of which says anything about how the
+            // target folds. The host's table is the same stand-in it was before any of this, and
+            // [`Self::source`] is how a caller finds out it is standing in.
+            None => Self::on_host(unit),
+        }
+    }
+
+    /// The table's address, read once and remembered, or [`None`] for "fold on the host".
+    ///
+    /// **A null is resolved, not rejected.** A pointer that reads as zero is a table this target
+    /// does not have, which is an answer -- see [`Self::uncached`], which is where the routine's
+    /// own null check lives. What [`None`] means here is narrower: the read itself did not come
+    /// back, so nothing is known about the target's table and the host's stands in.
+    fn base(&self) -> Option<u64> {
+        if let Some(asked) = self.known.borrow().base {
+            return asked;
+        }
+        let (memory, table) = self.target?;
+        let at = table
+            .silo_globals
+            .wrapping_add(u64::from(table.nls_state))
+            .wrapping_add(u64::from(table.upcase_table));
+        // Eight bytes, because a target with an object namespace to walk is a kernel and this
+        // reads a kernel pointer. A 32-bit kernel read from a 64-bit debugger keeps its pointers
+        // at four, which `Layout::pointer` knows and this does not -- so on one of those this
+        // takes four bytes of table pointer and four of whatever follows, the address does not
+        // read, and the fold falls back to the host with `source()` saying so.
+        let base = memory.read(at, 8).and_then(|bytes| {
+            bytes
+                .first_chunk::<8>()
+                .map(|eight| u64::from_le_bytes(*eight))
+        });
+        self.known.borrow_mut().base = Some(base);
+        base
+    }
+
+    /// One code unit through the target's 8-4-4 trie.
+    ///
+    /// Transcribed instruction for instruction from `ntdll!RtlUpcaseUnicodeChar` on 26200 x64,
+    /// which is the same routine `nt!ObpLookupDirectoryEntry` inlines against the kernel's copy of
+    /// the table:
+    ///
+    /// ```text
+    ///     movzx r8d,cx                    ; the code unit
+    ///     movzx eax,cx
+    ///     shr   rax,8                     ; high byte
+    ///     movzx edx,word ptr [r9+rax*2]   ; level one: an element index
+    ///     mov   eax,r8d
+    ///     shr   eax,4
+    ///     and   r8d,0Fh                   ; low nibble
+    ///     and   eax,0Fh                   ; middle nibble
+    ///     add   edx,eax
+    ///     movzx edx,word ptr [r9+rdx*2]   ; level two: another element index
+    ///     add   edx,r8d
+    ///     add   cx,word ptr [r9+rdx*2]    ; level three: a delta, added
+    /// ```
+    ///
+    /// Three things in that are worth keeping. Every index is an index of `u16` **elements from
+    /// the same base** -- not a byte offset, and not relative to its own level. The leaf is a
+    /// **delta added** to the code unit rather than the folded unit itself, so a leaf of zero
+    /// means "this unit does not fold", which is most of the table. And the add is 16-bit, so it
+    /// wraps; nothing in a real table does, and reproducing the wrap costs a `wrapping_add` rather
+    /// than a decision about what to do instead.
+    ///
+    /// **The reads are bounded by the arithmetic rather than by a check.** A level's value is a
+    /// `u16` and a nibble is at most 15, so no index exceeds `0x1000e` and no read lands more than
+    /// 128 KiB past the base, whatever the table holds. A corrupt table therefore reads the wrong
+    /// element *of itself*; it cannot be made to read an address of its own choosing.
+    fn from_table(memory: &dyn Memory, base: u64, unit: u16) -> Option<u16> {
+        let element = |index: u32| -> Option<u16> {
+            let bytes = memory.read(base.wrapping_add(u64::from(index) * 2), 2)?;
+            bytes
+                .first_chunk::<2>()
+                .map(|pair| u16::from_le_bytes(*pair))
+        };
+        let level1 = u32::from(element(u32::from(unit >> 8))?);
+        let level2 = u32::from(element(level1 + u32::from((unit >> 4) & 0xf))?);
+        let delta = element(level2 + u32::from(unit & 0xf))?;
+        Some(unit.wrapping_add(delta))
+    }
+
+    /// One code unit through **this host's** table.
+    ///
+    /// Miri cannot call a foreign function, and the walk's tests are worth running under it: they
+    /// are the pointer arithmetic this module is, over a fake target. Every name they use is
+    /// ASCII, which the bands above answer identically, so the shim costs those tests nothing --
+    /// and the trie walk itself is reads through [`Memory`] and nothing else, so the tests that
+    /// are about *that* run under Miri unshimmed. The tests that are about this call say so and
+    /// are ignored there.
+    fn on_host(unit: u16) -> u16 {
+        match cfg!(miri) {
             true => unit,
             false => unsafe { windows::Wdk::System::SystemServices::RtlUpcaseUnicodeChar(unit) },
-        },
+        }
     }
 }
 
@@ -439,6 +657,21 @@ pub struct Globals {
     /// `type_name` of `None` is the honest answer there.
     pub header_cookie: Option<u64>,
     pub type_index_table: Option<u64>,
+    /// Where this target keeps the upcase table, for folding names the way it folds them.
+    ///
+    /// **Optional, and its absence is a degraded answer rather than a refused one.** Every other
+    /// global here is a thing the walk reads *or does not run*; this one has a fallback, because
+    /// [`Upcase`] can still fold on the host. A target that resolves no `nt!PspHostSiloGlobals`
+    /// therefore walks its namespace exactly as it did before this field existed -- see
+    /// [`UpcaseFrom::Host`] for what that is worth and what it is not.
+    ///
+    /// **It is here rather than in [`Layout`], although two of its three coordinates come from
+    /// type information.** What decides that is not where the numbers come from but what an
+    /// absence means: a `Layout` this cannot resolve stops the walk, every field in it being one
+    /// the walk reads, whereas this structure going missing costs only the target's own table.
+    /// Putting it there would let one missing type on an unusual build refuse a walk that has
+    /// nothing to do with folding.
+    pub upcase: Option<UpcaseTable>,
 }
 
 /// Which optional header is wanted, as the bit the kernel's own lookup is keyed on.
@@ -466,6 +699,7 @@ pub struct Namespace<'a> {
     layout: Layout,
     globals: Globals,
     halt: Option<&'a dyn Fn() -> bool>,
+    upcase: Upcase<'a>,
 }
 
 impl<'a> Namespace<'a> {
@@ -485,12 +719,32 @@ impl<'a> Namespace<'a> {
         globals: Globals,
     ) -> Result<Self, ObjectError> {
         layout.check()?;
+        // **Built here and not read here.** `Upcase` resolves the table on the first code unit
+        // that needs one, which for a namespace of ASCII names is never -- and `link_target` folds
+        // nothing at all, so a walk that only follows a symbolic link makes no NLS read whatever
+        // this target resolved. That is the same rule `needs` states for the other globals: an
+        // operation pays for what it reads.
+        let upcase = match globals.upcase {
+            Some(table) => Upcase::of_target(memory, table),
+            None => Upcase::of_host(),
+        };
         Ok(Self {
             memory,
             layout,
             globals,
             halt: None,
+            upcase,
         })
+    }
+
+    /// The fold this walk compares names with -- **the target's own table** where it resolved one.
+    ///
+    /// Exposed because a caller comparing a name this walk *returned* against one of its own is
+    /// asking the same question the walk asks, and answering it with [`same_object_name`] would
+    /// answer it on a different machine's table. A link target measured against a device's path is
+    /// the case this exists for.
+    pub fn upcase(&self) -> &Upcase<'a> {
+        &self.upcase
     }
 
     /// The same walk, stoppable.
@@ -885,7 +1139,7 @@ impl<'a> Namespace<'a> {
             let found = listing
                 .objects
                 .into_iter()
-                .find(|object| object.exact_name && same_object_name(&object.name, component))
+                .find(|object| object.exact_name && self.upcase.same_name(&object.name, component))
                 .ok_or_else(|| match skipped {
                     (0, 0) => ObjectError::NotFound {
                         directory: walked.clone(),
@@ -1128,6 +1382,31 @@ impl DebugEngine {
             info_mask_to_offset: self.symbol_offset("nt!ObpInfoMaskToOffset").ok(),
             header_cookie: self.symbol_offset("nt!ObHeaderCookie").ok(),
             type_index_table: self.symbol_offset("nt!ObTypeIndexTable").ok(),
+            upcase: self.object_upcase_table(),
+        })
+    }
+
+    /// Where this target keeps the upcase table, if it says.
+    ///
+    /// **Three lookups that have to agree, and any one of them failing gives up the whole thing**
+    /// rather than half of it: a silo-globals address with no offset to add is not a table, and an
+    /// offset with no base is not either. There is a good answer for giving up -- [`Upcase`] folds
+    /// on the host instead -- so this returns [`None`] where [`Self::object_layout`] would raise.
+    ///
+    /// Not an error for the same reason it is not in [`Layout`]: `_ESERVERSILO_GLOBALS` is not a
+    /// type every target carries type information for, and refusing to walk a namespace over an
+    /// absent NLS coordinate would take a whole capability away to protect a fold that has a
+    /// fallback.
+    fn object_upcase_table(&self) -> Option<UpcaseTable> {
+        let module = self.kernel_base().ok()?;
+        let of = |type_name: &str, field: &str| -> Option<u32> {
+            let id = self.type_id(module, type_name).ok()?;
+            self.field_offset(module, id, field).ok()
+        };
+        Some(UpcaseTable {
+            silo_globals: self.symbol_offset("nt!PspHostSiloGlobals").ok()?,
+            nls_state: of("_ESERVERSILO_GLOBALS", "RtlNlsState")?,
+            upcase_table: of("_RTL_NLS_STATE", "UnicodeUpcaseTable844")?,
         })
     }
 
@@ -1209,6 +1488,13 @@ mod tests {
             info_mask_to_offset: Some(INFO_OFFSETS),
             header_cookie: Some(COOKIE),
             type_index_table: Some(TYPE_TABLE),
+            // **No NLS coordinate, so these walk on the host's fold.** Every name in this module's
+            // fixtures is ASCII, which both tables answer identically and neither is read for, so
+            // the walk's own tests stay about the walk. The tests that are about the fold build a
+            // target table of their own, and one of them uses a table that *disagrees* with this
+            // host on purpose -- because a fixture where the two agree cannot tell which one
+            // answered.
+            upcase: None,
         }
     }
 
@@ -1397,7 +1683,7 @@ mod tests {
     /// host's `RtlUpcaseUnicodeChar` agreed with it on all 65,536 code units. So these are the
     /// object manager's answers, not Unicode's -- which is the distinction the whole function
     /// turns on, and the four below are where the two part company.
-    #[cfg_attr(miri, ignore = "folds through ntdll; see `upcase_unit`'s Miri shim")]
+    #[cfg_attr(miri, ignore = "folds through ntdll; see `Upcase::on_host`")]
     #[test]
     fn a_name_is_folded_by_the_object_managers_own_table_and_not_by_unicodes() {
         // The two bands that read no table, which this crate still answers itself.
@@ -1451,12 +1737,351 @@ mod tests {
         assert!(!same_object_name("\u{10400}", "\u{10428}"));
     }
 
+    /// Where a fixture's silo globals sit, and the two offsets that reach the table pointer from
+    /// them. The offsets are 26100 x64's, read off `dt nt!_ESERVERSILO_GLOBALS` and
+    /// `dt nt!_RTL_NLS_STATE` -- written out rather than taken from the resolver, because a
+    /// fixture that asks the code under test where a field is agrees with it about a wrong answer.
+    const SILO_GLOBALS: u64 = 0xffff_f800_0005_0000;
+    const NLS_STATE: u32 = 0x408;
+    const UPCASE_TABLE: u32 = 0xa8;
+    /// Where these fixtures lay the table itself out.
+    const TABLE: u64 = 0xffff_f800_0006_0000;
+
+    fn upcase_globals() -> UpcaseTable {
+        UpcaseTable {
+            silo_globals: SILO_GLOBALS,
+            nls_state: NLS_STATE,
+            upcase_table: UPCASE_TABLE,
+        }
+    }
+
+    impl Fake {
+        /// The table pointer, at the distance the two offsets put it.
+        fn nls_pointer(&mut self, table: u64) {
+            self.pointer(
+                SILO_GLOBALS + u64::from(NLS_STATE) + u64::from(UPCASE_TABLE),
+                table,
+            );
+        }
+
+        /// A `u16` element of the table, addressed the way the routine addresses one: an index of
+        /// **elements from the base**, scaled by two.
+        fn element(&mut self, index: u32, value: u16) {
+            self.put(TABLE + u64::from(index) * 2, &value.to_le_bytes());
+        }
+    }
+
+    /// An 8-4-4 trie that folds exactly one code unit, laid out by hand.
+    ///
+    /// **Every index here is a literal**, which is the point of it: the walk's whole contract is
+    /// that a level's value is an element index from the *base* rather than a byte offset or a
+    /// level-relative one, and a fixture that computed its indices the way [`Upcase::from_table`]
+    /// computes them could not tell those three apart. The layout is
+    ///
+    /// ```text
+    ///   0x000..0x0ff   level one, one entry per high byte
+    ///   0x100..0x10f   a level-two block whose every nibble reaches the zero leaves
+    ///   0x110..0x11f   sixteen zero leaves -- "this unit does not fold"
+    ///   0x120..0x12f   the level-two block for high byte 0x00
+    ///   0x130..0x13f   the leaves for U+00Ex
+    /// ```
+    ///
+    /// and the one unit that moves is `U+00E9`, by `delta`.
+    fn one_fold_table(delta: u16) -> Fake {
+        let mut fake = Fake::default();
+        fake.nls_pointer(TABLE);
+        // Level one: every high byte but 0x00 reaches the block that folds nothing.
+        for high in 0..=0xffu32 {
+            fake.element(high, 0x100);
+        }
+        fake.element(0x00, 0x120);
+        // The shared level-two block, and the leaves it reaches.
+        for nibble in 0..0x10u32 {
+            fake.element(0x100 + nibble, 0x110);
+            fake.element(0x110 + nibble, 0);
+            // High byte 0x00's own level two, which differs in one nibble.
+            fake.element(0x120 + nibble, 0x110);
+            fake.element(0x130 + nibble, 0);
+        }
+        fake.element(0x120 + 0xe, 0x130);
+        fake.element(0x130 + 0x9, delta);
+        fake
+    }
+
+    /// The trie is walked the way the routine walks it -- from the base, and as a delta.
+    ///
+    /// Three mistakes this pins, each of which reads the same on a table where the levels happen
+    /// to sit where a wrong rule would put them: a level-relative index, a byte offset in place of
+    /// an element index, and a leaf taken as the folded unit rather than added to it. The leaf
+    /// here is `0xffe0` and the answer is `U+00C9`, which is only true of the addition.
+    #[test]
+    fn the_trie_is_walked_from_the_base_and_its_leaf_is_a_delta() {
+        let fake = one_fold_table(0xffe0);
+        let upcase = Upcase::of_target(&fake, upcase_globals());
+
+        assert_eq!(upcase.source(), UpcaseFrom::Target(TABLE));
+        assert_eq!(
+            upcase.unit(0x00e9),
+            0x00c9,
+            "the leaf is added to the unit, not substituted for it"
+        );
+        assert_eq!(
+            upcase.unit(0x00ea),
+            0x00ea,
+            "a zero leaf is a unit that does not fold"
+        );
+        assert_eq!(
+            upcase.unit(0x01e9),
+            0x01e9,
+            "another high byte reaches the block that folds nothing"
+        );
+    }
+
+    /// **The target's table answers, and this host's does not.**
+    ///
+    /// The fixture folds `U+00E9` to `U+00EA` -- which no Windows table does, and this host's
+    /// certainly does not, where the two fold to `U+00C9` and `U+00CA` and are two names. So the
+    /// assertion below can only pass by reading the target, which is the whole of what item 77
+    /// was about: a fixture whose table *agrees* with the host cannot say which one answered.
+    #[test]
+    fn the_targets_own_table_answers_and_not_this_hosts() {
+        let fake = one_fold_table(0x0001);
+        let upcase = Upcase::of_target(&fake, upcase_globals());
+
+        assert_eq!(upcase.unit(0x00e9), 0x00ea);
+        assert!(
+            upcase.same_name("\u{00e9}", "\u{00ea}"),
+            "on this target's table they are one name"
+        );
+    }
+
+    /// And the walk itself folds through it, rather than through the host.
+    ///
+    /// The same discriminating table, reached the way a real walk reaches it -- through
+    /// [`Globals::upcase`] -- so this fails if the component match goes back to
+    /// [`same_object_name`], which is the edit it is here to catch.
+    #[test]
+    fn the_walk_matches_a_component_through_the_targets_table() {
+        let mut fake = namespace();
+        const ODD: u64 = 0xffff_a000_0060_0000;
+        // `\Device\<U+00E9>`, which this target's table folds to `<U+00EA>` and no other machine
+        // does.
+        fake.object(ODD, "\u{00e9}", obfuscated(4, ODD), 0);
+        fake.directory(DEVICE_DIR, &[DEVICE, ODD]);
+        for (index, value) in one_fold_table(0x0001).bytes {
+            fake.bytes.insert(index, value);
+        }
+        let globals = Globals {
+            upcase: Some(upcase_globals()),
+            ..globals()
+        };
+        let namespace = Namespace::new(&fake, layout(), globals)
+            .expect("the fixture layout is one this crate builds");
+
+        assert_eq!(
+            namespace.upcase().source(),
+            UpcaseFrom::Target(TABLE),
+            "the walk folds on the target's table"
+        );
+        assert_eq!(
+            namespace
+                .object_at("\\Device\\\u{00ea}")
+                .map(|found| found.address),
+            Ok(ODD),
+            "which is the only table that makes these one name"
+        );
+    }
+
+    /// A table pointer that reads as **null** folds the ASCII bands and nothing else.
+    ///
+    /// `RtlUpcaseUnicodeChar`'s own `test r9,r9` answer, and the one miss that is not a fallback:
+    /// a target with no table does not fold `U+00E9`, so neither does this. Standing the host's
+    /// table in would report two objects as one, which is the failure the whole fold exists to
+    /// avoid.
+    #[test]
+    fn a_null_table_pointer_folds_no_further_than_ascii() {
+        let mut fake = Fake::default();
+        fake.nls_pointer(0);
+        let upcase = Upcase::of_target(&fake, upcase_globals());
+
+        assert_eq!(upcase.source(), UpcaseFrom::Target(0));
+        assert_eq!(upcase.unit(0x00e9), 0x00e9, "no table, so no fold");
+        assert_eq!(upcase.unit(0x0061), 0x0041, "the ASCII band still folds");
+    }
+
+    /// A target that will not say where its table is falls back to the host, and **says so**.
+    ///
+    /// Two ways to fall short and one answer: no [`Globals::upcase`] at all, and coordinates whose
+    /// read does not come back. Neither is a fact about how the target folds, which is why both
+    /// stand the host's table in rather than passing the unit through.
+    #[cfg_attr(
+        miri,
+        ignore = "the fallback folds through ntdll; see `Upcase::on_host`"
+    )]
+    #[test]
+    fn a_table_that_cannot_be_reached_falls_back_to_the_host_and_reports_it() {
+        let empty = Fake::default();
+        let unreadable = Upcase::of_target(&empty, upcase_globals());
+        assert_eq!(unreadable.source(), UpcaseFrom::Host);
+        assert_eq!(
+            unreadable.unit(0x00e9),
+            Upcase::of_host().unit(0x00e9),
+            "the host's table stands in"
+        );
+
+        assert_eq!(Upcase::of_host().source(), UpcaseFrom::Host);
+    }
+
+    /// Counts what a fold reads, so a claim about its cost is measured rather than asserted.
+    struct Counting<'a> {
+        inner: &'a dyn Memory,
+        reads: RefCell<usize>,
+    }
+
+    impl Memory for Counting<'_> {
+        fn read(&self, address: u64, len: usize) -> Option<Vec<u8>> {
+            *self.reads.borrow_mut() += 1;
+            self.inner.read(address, len)
+        }
+    }
+
+    /// An ASCII name reads no target memory at all, and a folded unit is read once.
+    ///
+    /// The first half is what makes reading the table affordable: nearly every name in the
+    /// namespace is ASCII, and the two bands that answer those consult no table, so the ordinary
+    /// walk pays nothing for this. The second is the cache -- one component is compared against
+    /// every entry in a directory, so a unit re-read per comparison would turn a directory of tens
+    /// of entries into hundreds of round trips over a KD wire.
+    #[test]
+    fn an_ascii_name_costs_no_target_read_and_a_folded_unit_costs_one_walk() {
+        let table = one_fold_table(0xffe0);
+        let counting = Counting {
+            inner: &table,
+            reads: RefCell::new(0),
+        };
+        let upcase = Upcase::of_target(&counting, upcase_globals());
+
+        assert!(upcase.same_name("MountPointManager", "MOUNTPOINTMANAGER"));
+        assert_eq!(
+            *counting.reads.borrow(),
+            0,
+            "an ASCII name never asks where the table is"
+        );
+
+        assert!(upcase.same_name("\u{00e9}", "\u{00c9}"));
+        // One read finds the table, three walk the trie for `U+00E9`; `U+00C9` is a fourth level
+        // one, a fifth level two and a sixth leaf.
+        let first = *counting.reads.borrow();
+        assert_eq!(
+            first, 7,
+            "the pointer, then three levels for each of two units"
+        );
+
+        assert!(upcase.same_name("\u{00e9}", "\u{00c9}"));
+        assert_eq!(
+            *counting.reads.borrow(),
+            first,
+            "folding the same units again reads nothing"
+        );
+    }
+
+    /// Lays out an 8-4-4 trie that encodes `fold`, allocating blocks as it goes.
+    ///
+    /// **The inverse of [`Upcase::from_table`] and deliberately not a caller of it.** This decides
+    /// where a block goes and writes the index that reaches it; the walk reads an index and
+    /// follows it. Sharing so much as an arithmetic helper between the two would let them agree
+    /// about a wrong rule, which is the one thing a table fixture cannot afford.
+    fn trie_encoding(fold: impl Fn(u16) -> u16) -> Fake {
+        let mut elements: Vec<u16> = vec![0; 0x100];
+        let mut leaves: BTreeMap<Vec<u16>, u16> = BTreeMap::new();
+        let mut level_twos: BTreeMap<Vec<u16>, u16> = BTreeMap::new();
+
+        for high in 0..=0xffu32 {
+            let mut block = Vec::new();
+            for middle in 0..0x10u32 {
+                let deltas: Vec<u16> = (0..0x10u32)
+                    .map(|low| {
+                        let unit = ((high << 8) | (middle << 4) | low) as u16;
+                        fold(unit).wrapping_sub(unit)
+                    })
+                    .collect();
+                let at = match leaves.get(&deltas) {
+                    Some(at) => *at,
+                    None => {
+                        let at = elements.len() as u16;
+                        elements.extend_from_slice(&deltas);
+                        leaves.insert(deltas, at);
+                        at
+                    }
+                };
+                block.push(at);
+            }
+            let at = match level_twos.get(&block) {
+                Some(at) => *at,
+                None => {
+                    let at = elements.len() as u16;
+                    elements.extend_from_slice(&block);
+                    level_twos.insert(block, at);
+                    at
+                }
+            };
+            elements[high as usize] = at;
+        }
+
+        let mut fake = Fake::default();
+        fake.nls_pointer(TABLE);
+        for (index, value) in elements.iter().enumerate() {
+            fake.put(TABLE + (index as u64) * 2, &value.to_le_bytes());
+        }
+        fake
+    }
+
+    /// The walk reproduces `RtlUpcaseUnicodeChar` on **all 65,536 code units**.
+    ///
+    /// The strongest thing that can be said about the trie walk without a target in the room: a
+    /// table is built that encodes this host's own fold, laid out by the routine's rules and by an
+    /// encoder that shares no code with the walk, and the walk is asked for every code unit there
+    /// is. A rule the walk got wrong -- an index read as a byte offset, a level read relative to
+    /// itself, a leaf substituted rather than added -- cannot survive 65,536 units of a real
+    /// Windows table, where 973 of them move and the rest must not.
+    ///
+    /// **What it does not establish** is the *target* half: that `nt!PspHostSiloGlobals` plus
+    /// those two offsets is where a live kernel keeps this. That is a symbol and two type lookups,
+    /// and [`DebugEngine::object_upcase_table`] is where they are read.
+    #[cfg_attr(miri, ignore = "builds from ntdll's fold; see `Upcase::on_host`")]
+    #[test]
+    fn the_trie_walk_reproduces_the_routine_across_every_code_unit() {
+        let host = Upcase::of_host();
+        let fake = trie_encoding(|unit| host.unit(unit));
+        let upcase = Upcase::of_target(&fake, upcase_globals());
+
+        let moved = (0..=0xffffu32)
+            .filter(|unit| host.unit(*unit as u16) != *unit as u16)
+            .count();
+        assert_eq!(
+            moved, 973,
+            "this host's table moves 973 code units -- a fixture where none moved would pass \
+             whatever the walk did"
+        );
+
+        let wrong: Vec<u16> = (0..=0xffffu32)
+            .map(|unit| unit as u16)
+            .filter(|unit| upcase.unit(*unit) != host.unit(*unit))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "the walk disagrees with the routine on {} code units, first {:04x?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(8)]
+        );
+    }
+
     /// A name differing outside ASCII resolves, which is the defect this fold replaced.
     ///
     /// `eq_ignore_ascii_case` folds twenty-six letters and the object manager folds through its
     /// own table, so `K\u{e4}se` and `K\u{c4}SE` are one object there and were two here --
     /// reported as [`ObjectError::NotFound`], which is the answer a caller acts on.
-    #[cfg_attr(miri, ignore = "folds through ntdll; see `upcase_unit`'s Miri shim")]
+    #[cfg_attr(miri, ignore = "folds through ntdll; see `Upcase::on_host`")]
     #[test]
     fn a_name_is_matched_through_the_object_managers_fold_and_not_through_ascii() {
         let mut fake = namespace();
@@ -1480,7 +2105,7 @@ mod tests {
     /// The mirror of the test above, and the one that would have caught the 224: a reproduction
     /// that folds where the system does not resolves a lookup to an object the object manager
     /// would not have found, which is worse than failing to find one.
-    #[cfg_attr(miri, ignore = "folds through ntdll; see `upcase_unit`'s Miri shim")]
+    #[cfg_attr(miri, ignore = "folds through ntdll; see `Upcase::on_host`")]
     #[test]
     fn a_name_the_table_does_not_fold_together_is_two_objects() {
         let mut fake = namespace();
@@ -2290,6 +2915,7 @@ mod tests {
             info_mask_to_offset: None,
             header_cookie: None,
             type_index_table: None,
+            upcase: None,
         };
         let namespace = Namespace::new(&fake, layout(), nothing)
             .expect("the fixture layout is one this crate builds");
