@@ -230,8 +230,7 @@ impl Image {
         // on are the ones that would notice: `executable_ranges` builds `start..start + size`,
         // which panics in debug and wraps in release into a range that starts above where it ends.
         // Validating the end here and returning the start means no caller has to know that.
-        va(self.base, end)?;
-        va(self.base, u64::from(rva))
+        va(self.base, u64::from(rva), len)
     }
 }
 
@@ -327,10 +326,20 @@ fn declared_fits(
 /// caller's `u64`, and a base near the top of the address space turned a plain `base + offset` into
 /// a debug-build panic, in a parser whose whole contract is to answer with [`PeError`]. Every
 /// addition of an offset to a base in this module goes through here.
-fn va(base: u64, offset: u64) -> Result<u64, PeError> {
-    base.checked_add(offset).ok_or(PeError::Malformed {
+fn va(base: u64, offset: u64, len: usize) -> Result<u64, PeError> {
+    let start = base.checked_add(offset).ok_or(PeError::Malformed {
         reason: "an image address overflowed",
-    })
+    })?;
+    // **The length is a parameter so that no caller can check only the start.** It was not, and
+    // the result was this rule being applied to one of the two readers: `checked_va` validated its
+    // whole span while `read_image`'s header reader validated a start and then handed `read` a
+    // span running off the end of the address space. Taking `len` here is what makes that
+    // impossible to get half-right -- a caller that has an address to compute has a length in hand
+    // to give.
+    start.checked_add(len as u64).ok_or(PeError::Malformed {
+        reason: "an image address overflowed",
+    })?;
+    Ok(start)
 }
 
 /// Reads an image's headers and section table.
@@ -339,7 +348,7 @@ pub fn read_image(
     mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
 ) -> Result<Image, PeError> {
     let mut at = |offset: u64, len: usize| -> Result<Vec<u8>, PeError> {
-        let address = va(base, offset)?;
+        let address = va(base, offset, len)?;
         read(address, len).ok_or(PeError::Unreadable { at: address, len })
     };
 
@@ -1042,7 +1051,7 @@ mod tests {
     #[test]
     fn test_a_base_that_would_wrap_the_address_space_is_refused() {
         let read = |_address: u64, len: usize| -> Option<Vec<u8>> {
-            // Only the DOS header is ever reached; the read after it is what overflows.
+            // Never called now: the very first read's span is rejected before the reader sees it.
             let mut out = vec![0u8; len];
             out[0..2].copy_from_slice(b"MZ");
             if len > 0x3f {
@@ -1270,6 +1279,40 @@ mod tests {
             Err(PeError::Malformed {
                 reason: "an import descriptor has no import address table",
             })
+        );
+    }
+
+    /// A header read whose **span** leaves the address space is refused before the reader sees it.
+    ///
+    /// **The other half of the rule `checked_va` already followed, and the half that was missed.**
+    /// Round three made `checked_va` validate a whole span; the header reader kept checking only
+    /// where a read *starts*, so a base thirty-two bytes below the top of the address space passed
+    /// the check and then asked `read` for sixty-four bytes that do not exist. A reader computing
+    /// the end panics or wraps; the DbgEng adapter merely answers `Unreadable`, which reports a
+    /// malformed address as a memory that would not read.
+    ///
+    /// `va` takes the length now, so neither reader can check a start alone.
+    #[test]
+    fn test_a_header_read_running_off_the_address_space_is_refused() {
+        let mut asked = 0usize;
+        let outcome = {
+            let read = |_address: u64, len: usize| -> Option<Vec<u8>> {
+                asked += 1;
+                Some(vec![0u8; len])
+            };
+            // The first read is the DOS header: sixty-four bytes, from thirty-two below the top.
+            read_image(u64::MAX - 32, read)
+        };
+
+        assert_eq!(
+            outcome,
+            Err(PeError::Malformed {
+                reason: "an image address overflowed",
+            })
+        );
+        assert_eq!(
+            asked, 0,
+            "the reader is never asked for a span that cannot exist"
         );
     }
 
