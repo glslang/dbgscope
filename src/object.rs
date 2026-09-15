@@ -242,12 +242,22 @@ pub struct UpcaseTable {
 /// Which machine's table a fold answered from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpcaseFrom {
-    /// The target's own, at this address.
+    /// The target's own, at this address, for every code unit folded so far.
     Target(u64),
-    /// **This host's**, because the target's could not be reached -- no [`Globals::upcase`] to
-    /// reach it by, or a read that did not come back. The answer is then this machine's NLS data
-    /// standing in for the target's, which is right wherever the two agree and says nothing about
-    /// where they do not.
+    /// The target's table is at this address **and did not answer for every unit**: at least one
+    /// read into the trie did not come back, and that unit was folded on this host instead.
+    ///
+    /// **A fold of two machines' NLS data, which is the thing this type exists to make visible.**
+    /// A partial dump is the ordinary way to get here -- the pointer's page is present and a page
+    /// of the table is not -- and without this case that fold reported as [`Self::Target`], which
+    /// is the provenance claim being wrong in the one direction that matters. It is not an error:
+    /// every comparison still answers, because a table that will not *read* says nothing about how
+    /// the target folds. It is a caller's cue that some of the answer came from here.
+    Mixed { at: u64 },
+    /// **This host's**, because the target's could not be reached at all -- no [`Globals::upcase`]
+    /// to reach it by, or a table pointer whose read did not come back. The answer is then this
+    /// machine's NLS data standing in for the target's, which is right wherever the two agree and
+    /// says nothing about where they do not.
     Host,
 }
 
@@ -298,6 +308,10 @@ struct Known {
     /// is remembered so a target whose globals do not read is not re-read once per code unit.
     base: Option<Option<u64>>,
     units: BTreeMap<u16, u16>,
+    /// Whether any unit was folded on **this host** after the target's table was located -- the
+    /// one fallback [`UpcaseFrom`] could not otherwise be told about, because the base is
+    /// populated and every later `source()` would have claimed the target answered.
+    host_folded: bool,
 }
 
 impl<'a> Upcase<'a> {
@@ -327,10 +341,21 @@ impl<'a> Upcase<'a> {
     ///
     /// What lets a caller say which machine's NLS data an answer came from, rather than leaving a
     /// fallback to look like a measurement.
+    ///
+    /// **It describes the folds performed so far, not the target**, and it has to: the table is
+    /// read lazily, so whether a page of it answers is not known until a unit needs that page.
+    /// Before anything non-ASCII is folded this reports [`UpcaseFrom::Target`] as soon as the
+    /// pointer reads, and a later unit whose page is absent moves it to [`UpcaseFrom::Mixed`].
+    /// A caller reporting provenance should therefore ask **after** the comparisons it is
+    /// reporting on.
     pub fn source(&self) -> UpcaseFrom {
-        match self.base() {
-            Some(at) => UpcaseFrom::Target(at),
-            None => UpcaseFrom::Host,
+        // `base()` first and on its own: it may read and record, and holding a borrow across it
+        // would be a second one on the same `RefCell`.
+        let base = self.base();
+        match (base, self.known.borrow().host_folded) {
+            (Some(at), true) => UpcaseFrom::Mixed { at },
+            (Some(at), false) => UpcaseFrom::Target(at),
+            (None, _) => UpcaseFrom::Host,
         }
     }
 
@@ -385,9 +410,18 @@ impl<'a> Upcase<'a> {
             // **A table that would not read is not a target that does not fold.** The reads above
             // are of a structure this located by symbol, so a miss is a page that was out or an
             // offset that is not this build's -- neither of which says anything about how the
-            // target folds. The host's table is the same stand-in it was before any of this, and
-            // [`Self::source`] is how a caller finds out it is standing in.
-            None => Self::on_host(unit),
+            // target folds. The host's table is the same stand-in it was before any of this.
+            //
+            // **And it is recorded, because the base is already resolved and nothing else would
+            // say.** Without the flag, `source()` reads the populated base and answers
+            // [`UpcaseFrom::Target`] for a fold that was partly this host's -- a provenance claim
+            // that is wrong in exactly the direction this whole change exists to fix. It is not
+            // cleared: one unit folded on the wrong machine is enough to make the comparison this
+            // walk performs a comparison of two tables.
+            None => {
+                self.known.borrow_mut().host_folded = true;
+                Self::on_host(unit)
+            }
         }
     }
 
@@ -1930,6 +1964,52 @@ mod tests {
         );
 
         assert_eq!(Upcase::of_host().source(), UpcaseFrom::Host);
+    }
+
+    /// A table located but not readable is **not** reported as the target having answered.
+    ///
+    /// The partial-dump shape, and the ordinary way to reach it: the page holding the table
+    /// pointer is present, so the base resolves, and a page of the table itself is not. Every unit
+    /// still folds -- a table that will not read says nothing about how the target folds, so the
+    /// host stands in -- but the provenance has to say so, because a caller asking
+    /// [`Upcase::source`] would otherwise be told the target answered for a fold that was this
+    /// host's. That is the provenance claim wrong in the one direction this whole change exists
+    /// to fix, so it is pinned rather than argued.
+    #[cfg_attr(
+        miri,
+        ignore = "the fallback folds through ntdll; see `Upcase::on_host`"
+    )]
+    #[test]
+    fn a_table_located_but_unreadable_reports_a_fold_of_both_machines() {
+        let mut fake = Fake::default();
+        // The pointer reads; nothing it points at does.
+        fake.nls_pointer(TABLE);
+        let upcase = Upcase::of_target(&fake, upcase_globals());
+
+        assert_eq!(
+            upcase.source(),
+            UpcaseFrom::Target(TABLE),
+            "before anything needs a page of it, the table is simply where it says"
+        );
+
+        assert_eq!(
+            upcase.unit(0x00e9),
+            Upcase::of_host().unit(0x00e9),
+            "the unit still folds, on the host"
+        );
+        assert_eq!(
+            upcase.source(),
+            UpcaseFrom::Mixed { at: TABLE },
+            "and the answer now carries both machines, which is what a caller has to be able to see"
+        );
+
+        // An ASCII name reads no table, so it cannot move the provenance back.
+        assert!(upcase.same_name("Device", "DEVICE"));
+        assert_eq!(
+            upcase.source(),
+            UpcaseFrom::Mixed { at: TABLE },
+            "one unit folded on the wrong machine is not undone by a later one that needed no table"
+        );
     }
 
     /// Counts what a fold reads, so a claim about its cost is measured rather than asserted.
