@@ -6,6 +6,34 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A slot that names its VS context by displacement is decoded, so current Windows builds walk
+  again.** `_HEAP_VS_AFFINITY_SLOT::VsContext` — a back-pointer to the owning `_HEAP_VS_CONTEXT` —
+  is spelled `VsContextOffset` on 26100.33438 and 26200, and holds `slot - context` rather than an
+  address. Because the old name sat in a *required* field list, one rename took the whole type down
+  and the family's other fields with it, so every pool and heap query on such a build refused with
+  `unsupported allocator layout … no recognized VS structural family is complete`. Measured rather
+  than inferred: `RtlpHpVsSlotCreate` stores `sub rax,rdi` against the context the slot was created
+  for, and a live slot's `0xa80` was both `slot - context` and `SlotRef << 6`. The slot-map
+  arithmetic itself is unchanged — `RtlpHpVsContextGetSlotInfo` still reads `ctx + (word[ctx] << 6)`
+  over `byte[ctx+2] + 1` four-byte entries.
+- Both older shapes are **unchanged**, which is the point rather than a side effect: selection is by
+  the fields a target's own PDB carries and never by a build number, and their resolved schemas —
+  fingerprints included — are pinned against values recorded before this change.
+
+### Added
+
+- `VsSemanticFamily::AffinitySlotsSelfRelative` (`affinity_slot_vs_offset`), reported apart from
+  `AffinitySlots` because the two are *checked* differently — an address against the context, a
+  displacement against `slot - context` — and reading one as the other rejects every slot silently
+  rather than failing. A PDB carrying both spellings is refused as ambiguous rather than resolved by
+  precedence.
+- An unsupported layout now **names the fields each candidate family wanted and which were
+  missing**. The previous message said only that no family was complete, which reads as a symbol
+  problem: the first diagnosis of this rename went to `.reload /f nt` and a PDB check before anyone
+  compared a field name.
+
 ## [0.2.0] - 2026-09-13
 
 This release adds typed instruction analysis, kernel object namespace queries, breakpoint

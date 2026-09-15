@@ -14,7 +14,7 @@ use super::decode::{
 };
 use super::{
     HeapIdentity, PoolBackend, PoolKind, PoolSpan, PoolState,
-    layout::{LayoutError, PoolLayout},
+    layout::{LayoutError, PoolLayout, SlotBackReference, VsShape},
 };
 
 type SnapshotSource = Box<dyn std::error::Error + Send + Sync>;
@@ -614,47 +614,61 @@ struct VsRoot {
     delay_offset: Option<usize>,
 }
 
-/// Resolves where a VS context keeps its free-chunk state. Both shapes are supported,
-/// because a debugger host does not get to choose which build it is pointed at:
+/// Resolves where a VS context keeps its free-chunk state. Every shape is supported, because a
+/// debugger host does not get to choose which build it is pointed at:
 ///
 /// * **inline family** — `FreeChunkTree`/`DelayFreeContext` are in `_HEAP_VS_CONTEXT`,
 ///   so there is exactly one root: the context itself.
-/// * **affinity-slot family** — they live in `_HEAP_VS_AFFINITY_SLOT`s reached through a slot map.
-///   `SlotMapRef` and each `SlotRef` are offsets *from the context*, scaled by 64 bytes,
-///   and the map holds `AffinityMask + 1` entries. Entries routinely share a slot, so the
-///   result is deduplicated.
+/// * **affinity-slot families** — they live in `_HEAP_VS_AFFINITY_SLOT`s reached through a slot
+///   map. `SlotMapRef` and each `SlotRef` are offsets *from the context*, scaled by 64 bytes, and
+///   the map holds `AffinityMask + 1` entries. Entries routinely share a slot, so the result is
+///   deduplicated. The two differ only in how a slot proves it belongs to this context — see
+///   [`SlotBackReference`].
 ///
-/// An empty vector means neither shape resolved; the caller then walks no VS evidence
-/// rather than guessing at an address. An `Err` means the walk itself is over — the slot
-/// map is up to 256 entries plus an owner read per distinct slot, all over the wire, so it
-/// polls the deadline like every other read-issuing loop (see [`check_budget`]). It cannot
-/// lean on a later poll: invalid slot refs yield no roots, so nothing downstream reads at
-/// all and the next check is a whole segment context away.
+/// Which shape it is comes from [`PoolLayout::vs_shape`] rather than from a second reading of the
+/// field table here, so the walk and the provenance a caller is told about cannot disagree.
+///
+/// An empty vector means no shape resolved; the caller then walks no VS evidence rather than
+/// guessing at an address. An `Err` means the walk itself is over — the slot map is up to 256
+/// entries plus an owner read per distinct slot, all over the wire, so it polls the deadline like
+/// every other read-issuing loop (see [`check_budget`]). It cannot lean on a later poll: invalid
+/// slot refs yield no roots, so nothing downstream reads at all and the next check is a whole
+/// segment context away.
 fn vs_roots(
     memory: &impl PoolMemory,
     layout: &PoolLayout,
     context: u64,
     diagnostics: &mut Vec<String>,
 ) -> Result<Vec<VsRoot>, SnapshotError> {
-    // Legacy shape wins when present: a context that still carries the tree has no slots.
-    if let Ok(tree_offset) = layout.field("_HEAP_VS_CONTEXT", "FreeChunkTree") {
-        return Ok(vec![VsRoot {
-            base: context,
-            tree_offset,
-            delay_offset: layout.field("_HEAP_VS_CONTEXT", "DelayFreeContext").ok(),
-        }]);
-    }
-
-    let (Ok(tree_offset), Ok(back_offset), Ok(slot_map_ref_offset), Ok(affinity_offset)) = (
-        layout.field("_HEAP_VS_AFFINITY_SLOT", "FreeChunkTree"),
-        layout.field("_HEAP_VS_AFFINITY_SLOT", "VsContext"),
-        layout.field("_HEAP_VS_CONTEXT", "SlotMapRef"),
-        layout.field("_HEAP_VS_CONTEXT", "AffinityMask"),
-    ) else {
-        diagnostics
-            .push("VS free-chunk state is in neither the context nor an affinity slot".into());
-        return Ok(Vec::new());
+    let shape = match layout.vs_shape() {
+        Ok(shape) => shape,
+        Err(detail) => {
+            diagnostics.push(format!(
+                "VS free-chunk state is in neither the context nor an affinity slot: {detail}"
+            ));
+            return Ok(Vec::new());
+        }
     };
+
+    let (slot_map_ref_offset, affinity_offset, slot_ref_offset, tree_offset, delay_offset, back) =
+        match shape {
+            // A context that carries the tree has no slots.
+            VsShape::Inline { tree, delay } => {
+                return Ok(vec![VsRoot {
+                    base: context,
+                    tree_offset: tree,
+                    delay_offset: delay,
+                }]);
+            }
+            VsShape::AffinitySlots {
+                slot_map_ref,
+                affinity_mask,
+                slot_ref,
+                tree,
+                delay,
+                back,
+            } => (slot_map_ref, affinity_mask, slot_ref, tree, delay, back),
+        };
 
     let (Ok(slot_map_ref), Ok(affinity_mask)) = (
         scalar(memory, context + slot_map_ref_offset as u64, 2),
@@ -679,10 +693,6 @@ fn vs_roots(
     let entry_size = layout
         .type_layout("_HEAP_VS_SLOT_MAP")
         .map_or(4, |map| map.size as u64);
-    let slot_ref_offset = layout.field("_HEAP_VS_SLOT_MAP", "SlotRef").unwrap_or(0);
-    let delay_offset = layout
-        .field("_HEAP_VS_AFFINITY_SLOT", "DelayFreeContext")
-        .ok();
     let slot_map = context + (slot_map_ref << 6);
 
     let mut roots = Vec::new();
@@ -707,14 +717,32 @@ fn vs_roots(
         }
         // Require the slot to name the context we came from. A misdecoded SlotRef would
         // otherwise point the tree walk at unrelated memory that happens to be readable.
-        match scalar(memory, slot + back_offset as u64, 8) {
-            Ok(owner) if owner == context => roots.push(VsRoot {
+        //
+        // Both spellings are read as the same question — *which context does this slot claim* —
+        // so that a slot that disagrees produces one diagnostic shape rather than two. What the
+        // stored value means differs: an address is the answer, a displacement has to be
+        // subtracted from the slot to become one. `checked_sub` because a displacement larger
+        // than the slot's own address is not a context, it is a rejection.
+        let back_offset = match back {
+            SlotBackReference::Address(offset) | SlotBackReference::Displacement(offset) => offset,
+        };
+        let claimed = scalar(memory, slot + back_offset as u64, 8).map(|value| match back {
+            SlotBackReference::Address(_) => Some(value),
+            SlotBackReference::Displacement(_) => slot.checked_sub(value),
+        });
+        match claimed {
+            Ok(Some(owner)) if owner == context => roots.push(VsRoot {
                 base: slot,
                 tree_offset,
                 delay_offset,
             }),
-            Ok(owner) => diagnostics.push(format!(
+            Ok(Some(owner)) => diagnostics.push(format!(
                 "VS affinity slot {slot:#x} claims context {owner:#x}, not {context:#x}; skipped"
+            )),
+            // A displacement that runs off the bottom of the address space names no context at
+            // all; saying so as "claims none" keeps it in the same shape as any other disagreement.
+            Ok(None) => diagnostics.push(format!(
+                "VS affinity slot {slot:#x} claims context none, not {context:#x}; skipped"
             )),
             Err(error) => {
                 diagnostics.push(format!("cannot read VS affinity slot {slot:#x}: {error}"))
@@ -2923,7 +2951,7 @@ mod tests {
         // Slot 0 at 0x1f80 spans 0x1f80..0x2080 and crosses; slot 1 at 0x2080 does not.
         let region = lfh_region(0x1f80, 0x100);
         let memory = FlatMemory::new(0x1f80, 0x200);
-        let layout = vs_layout(false);
+        let layout = vs_layout(VsFixture::Inline);
         let walker = SnapshotWalker {
             memory: &memory,
             layout: &layout,
@@ -2971,7 +2999,7 @@ mod tests {
         region.known_tag = Some(u32::from_le_bytes(tag));
         region.states = vec![PoolState::Allocated; slots];
         let memory = FlatMemory::new(region.address, bytes.len());
-        let layout = vs_layout(false);
+        let layout = vs_layout(VsFixture::Inline);
         let walker = SnapshotWalker {
             memory: &memory,
             layout: &layout,
@@ -3056,7 +3084,7 @@ mod tests {
             tag: 0,
         };
         let memory = FlatMemory::new(0x1000, 0x1000);
-        let layout = vs_layout(false);
+        let layout = vs_layout(VsFixture::Inline);
         let walker = SnapshotWalker {
             memory: &memory,
             layout: &layout,
@@ -3155,26 +3183,43 @@ mod tests {
 
     const VS_CONTEXT: u64 = 0x1000;
 
-    /// A layout carrying only what `vs_roots` consults. `affinity` picks the shape: with
-    /// it, the affinity-slot types exist and `_HEAP_VS_CONTEXT` has no `FreeChunkTree`;
-    /// without it, the legacy in-context fields are present instead.
-    fn vs_layout(affinity: bool) -> PoolLayout {
+    /// Which shape a `vs_layout` fixture describes.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum VsFixture {
+        /// The free tree is in `_HEAP_VS_CONTEXT`.
+        Inline,
+        /// Affinity slots, each naming its context by address (`VsContext`).
+        SlotsByAddress,
+        /// Affinity slots, each naming its context by displacement (`VsContextOffset`).
+        SlotsByDisplacement,
+    }
+
+    /// A layout carrying only what `vs_roots` consults, in one of the three shapes a target's
+    /// PDB can present. The two slot shapes differ by **one field name**, which is the whole
+    /// substance of the change they cover: the same slot map, the same arithmetic, and a
+    /// back-reference that is an address in one and `slot - context` in the other.
+    fn vs_layout(shape: VsFixture) -> PoolLayout {
         let mut types = HashMap::new();
         types.insert(
             "_HEAP_VS_CONTEXT",
-            if affinity {
-                type_layout(0x60, &[("SlotMapRef", 0), ("AffinityMask", 2)])
-            } else {
-                type_layout(0x80, &[("FreeChunkTree", 0x10), ("DelayFreeContext", 0x30)])
+            match shape {
+                VsFixture::Inline => {
+                    type_layout(0x80, &[("FreeChunkTree", 0x10), ("DelayFreeContext", 0x30)])
+                }
+                _ => type_layout(0x60, &[("SlotMapRef", 0), ("AffinityMask", 2)]),
             },
         );
-        if affinity {
+        if shape != VsFixture::Inline {
+            let back = match shape {
+                VsFixture::SlotsByDisplacement => "VsContextOffset",
+                _ => "VsContext",
+            };
             types.insert(
                 "_HEAP_VS_AFFINITY_SLOT",
                 type_layout(
                     0x80,
                     &[
-                        ("VsContext", 0),
+                        (back, 0),
                         ("FreeChunkTree", 0x10),
                         ("DelayFreeContext", 0x40),
                     ],
@@ -3208,6 +3253,27 @@ mod tests {
         memory
     }
 
+    /// The same slots, the same map, the same arithmetic — with each slot naming its context by
+    /// displacement instead of by address, as `_HEAP_VS_AFFINITY_SLOT::VsContextOffset` does.
+    ///
+    /// Deliberately the same geometry as [`affinity_fixture`], so a test that swaps one for the
+    /// other is measuring the back-reference rule and nothing else. The third slot disagrees the
+    /// way a displacement can: `0x1234` is a real displacement to somewhere that is not this
+    /// context.
+    fn displacement_fixture() -> FlatMemory {
+        let mut memory = FlatMemory::new(VS_CONTEXT, 0x1200);
+        memory.put_u16(VS_CONTEXT, 0x10); // SlotMapRef -> map at ctx + 0x10*64
+        memory.put(VS_CONTEXT + 2, &[3]); // AffinityMask -> 4 entries
+        let map = VS_CONTEXT + 0x400;
+        for (index, slot_ref) in [0x20u16, 0x30, 0x20, 0x40].into_iter().enumerate() {
+            memory.put_u16(map + index as u64 * 4, slot_ref);
+        }
+        memory.put_u64(VS_CONTEXT + 0x800, 0x800); // 0x20 << 6, displacement agrees
+        memory.put_u64(VS_CONTEXT + 0xc00, 0xc00); // 0x30 << 6, displacement agrees
+        memory.put_u64(VS_CONTEXT + 0x1000, 0x1234); // 0x40 << 6, displacement disagrees
+        memory
+    }
+
     /// The slot map is up to 256 entries plus an owner read per distinct slot, all over the
     /// wire. It cannot lean on a later poll either: invalid slot refs produce no roots, so
     /// nothing downstream reads at all and the next check is a whole segment context away.
@@ -3216,7 +3282,12 @@ mod tests {
         // Two reads resolve the slot map itself; the loop below them gets nothing.
         let memory = Impatient::over(affinity_fixture(), 2);
 
-        let outcome = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut Vec::new());
+        let outcome = vs_roots(
+            &memory,
+            &vs_layout(VsFixture::SlotsByAddress),
+            VS_CONTEXT,
+            &mut Vec::new(),
+        );
 
         assert!(
             matches!(outcome, Err(SnapshotError::BudgetExpired)),
@@ -3231,7 +3302,13 @@ mod tests {
     fn test_vs_roots_reads_the_legacy_in_context_shape() {
         let memory = FlatMemory::new(VS_CONTEXT, 0x100);
         let mut diagnostics = Vec::new();
-        let roots = vs_roots(&memory, &vs_layout(false), VS_CONTEXT, &mut diagnostics).unwrap();
+        let roots = vs_roots(
+            &memory,
+            &vs_layout(VsFixture::Inline),
+            VS_CONTEXT,
+            &mut diagnostics,
+        )
+        .unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].base, VS_CONTEXT);
         assert_eq!(roots[0].tree_offset, 0x10);
@@ -3244,12 +3321,120 @@ mod tests {
     fn test_vs_roots_walks_the_affinity_slots_and_dedups_them() {
         let memory = affinity_fixture();
         let mut diagnostics = Vec::new();
-        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics).unwrap();
+        let roots = vs_roots(
+            &memory,
+            &vs_layout(VsFixture::SlotsByAddress),
+            VS_CONTEXT,
+            &mut diagnostics,
+        )
+        .unwrap();
         let bases: Vec<u64> = roots.iter().map(|root| root.base).collect();
         // Four entries, one repeat, one rejected -> two roots.
         assert_eq!(bases, vec![VS_CONTEXT + 0x800, VS_CONTEXT + 0xc00]);
         assert!(roots.iter().all(|root| root.tree_offset == 0x10));
         assert!(roots.iter().all(|root| root.delay_offset == Some(0x40)));
+    }
+
+    /// Self-relative family: a slot names its context as `slot - context`, so the same map and
+    /// the same arithmetic must produce the same roots as the address-bearing shape.
+    ///
+    /// The geometry is identical to [`affinity_fixture`] on purpose. What differs is one field
+    /// name in the layout and the value each slot stores, which is the whole substance of the
+    /// change (`windbg-mcp` FOLLOWUPS item 78).
+    #[test]
+    fn test_vs_roots_walks_affinity_slots_that_name_their_context_by_displacement() {
+        let memory = displacement_fixture();
+        let mut diagnostics = Vec::new();
+
+        let roots = vs_roots(
+            &memory,
+            &vs_layout(VsFixture::SlotsByDisplacement),
+            VS_CONTEXT,
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        let bases: Vec<u64> = roots.iter().map(|root| root.base).collect();
+        // The same four entries, one repeat and one rejected, as the address shape resolves.
+        assert_eq!(bases, vec![VS_CONTEXT + 0x800, VS_CONTEXT + 0xc00]);
+        assert!(roots.iter().all(|root| root.tree_offset == 0x10));
+        assert!(roots.iter().all(|root| root.delay_offset == Some(0x40)));
+    }
+
+    /// The two back-reference rules are not interchangeable, and getting them the wrong way round
+    /// does not fail loudly — it rejects every slot and walks no VS evidence at all.
+    ///
+    /// This is the measurement the fix rests on, as a test: the *same memory* read under the
+    /// other build's rule resolves nothing. It is also what says an alias would have been the
+    /// wrong fix. Confirmed live against `ntdll` on 26200, where the displacement `0xa80` read as
+    /// an address produced `claims context 0xa80`.
+    #[test]
+    fn test_the_two_affinity_back_reference_rules_do_not_substitute_for_each_other() {
+        for (fixture, wrong_shape, what) in [
+            (
+                displacement_fixture(),
+                VsFixture::SlotsByAddress,
+                "displacements read as addresses",
+            ),
+            (
+                affinity_fixture(),
+                VsFixture::SlotsByDisplacement,
+                "addresses read as displacements",
+            ),
+        ] {
+            let mut diagnostics = Vec::new();
+
+            let roots = vs_roots(
+                &fixture,
+                &vs_layout(wrong_shape),
+                VS_CONTEXT,
+                &mut diagnostics,
+            )
+            .unwrap();
+
+            assert!(
+                roots.is_empty(),
+                "{what}: {} slot(s) were accepted by the wrong rule, so the tree walk would read \
+                 unrelated memory",
+                roots.len()
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|line| line.contains("claims context")),
+                "{what}: every slot should be rejected for naming another context, not skipped \
+                 for some other reason: {diagnostics:?}"
+            );
+        }
+    }
+
+    /// A displacement larger than the slot's own address names no context at all. Wrapping would
+    /// hand the tree walk an address near the top of the space, which may well be readable.
+    #[test]
+    fn test_vs_roots_rejects_a_displacement_that_runs_off_the_bottom() {
+        let mut memory = displacement_fixture();
+        memory.put_u64(VS_CONTEXT + 0x800, u64::MAX);
+        let mut diagnostics = Vec::new();
+
+        let roots = vs_roots(
+            &memory,
+            &vs_layout(VsFixture::SlotsByDisplacement),
+            VS_CONTEXT,
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            roots.iter().map(|root| root.base).collect::<Vec<_>>(),
+            vec![VS_CONTEXT + 0xc00],
+            "the slot with the impossible displacement should be the only one dropped"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| line.contains("claims context none")),
+            "a displacement that cannot name a context should say so: {diagnostics:?}"
+        );
     }
 
     /// A slot whose back-pointer names a different context is not this context's slot.
@@ -3258,7 +3443,13 @@ mod tests {
     fn test_vs_roots_rejects_a_slot_whose_back_pointer_disagrees() {
         let memory = affinity_fixture();
         let mut diagnostics = Vec::new();
-        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics).unwrap();
+        let roots = vs_roots(
+            &memory,
+            &vs_layout(VsFixture::SlotsByAddress),
+            VS_CONTEXT,
+            &mut diagnostics,
+        )
+        .unwrap();
         assert!(roots.iter().all(|root| root.base != VS_CONTEXT + 0x1000));
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("claims context"));
@@ -3270,7 +3461,13 @@ mod tests {
         let mut memory = affinity_fixture();
         memory.put_u16(VS_CONTEXT, 0);
         let mut diagnostics = Vec::new();
-        let roots = vs_roots(&memory, &vs_layout(true), VS_CONTEXT, &mut diagnostics).unwrap();
+        let roots = vs_roots(
+            &memory,
+            &vs_layout(VsFixture::SlotsByAddress),
+            VS_CONTEXT,
+            &mut diagnostics,
+        )
+        .unwrap();
         assert!(roots.is_empty());
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].contains("implausible VS slot map"));
@@ -3548,7 +3745,7 @@ mod tests {
     fn walk_vs_extent(bytes: &[u8]) -> PoolSnapshot {
         let region = vs_region(bytes.len());
         let memory = FlatMemory::new(VS_BASE, bytes.len());
-        let layout = vs_layout(false);
+        let layout = vs_layout(VsFixture::Inline);
         let walker = SnapshotWalker {
             memory: &memory,
             layout: &layout,
@@ -3770,7 +3967,7 @@ mod tests {
     }
 
     fn walk_holey(memory: &HoleyMemory, region: &PoolRegion) -> PoolSnapshot {
-        let layout = vs_layout(false);
+        let layout = vs_layout(VsFixture::Inline);
         let walker = SnapshotWalker {
             memory,
             layout: &layout,
@@ -4129,7 +4326,7 @@ mod tests {
         bytes.extend_from_slice(&special_page(0x140, false));
         let region = special_region(SPECIAL_PAGE, 3);
         let memory = FlatMemory::new(SPECIAL_PAGE, bytes.len());
-        let layout = vs_layout(false);
+        let layout = vs_layout(VsFixture::Inline);
         let walker = SnapshotWalker {
             memory: &memory,
             layout: &layout,
@@ -5400,7 +5597,7 @@ mod tests {
             reads: Cell::new(0),
             allowance: ALLOWANCE,
         };
-        let layout = vs_layout(false);
+        let layout = vs_layout(VsFixture::Inline);
         let mut region = lfh_region(0x1000, 0x100);
         region.size = EXTENT_READ_CHUNK * 8;
         region.bitmap = vec![0xff; 64];
@@ -5454,7 +5651,7 @@ mod tests {
         let memory = ShortChunks {
             reads: Cell::new(0),
         };
-        let layout = vs_layout(false);
+        let layout = vs_layout(VsFixture::Inline);
         let mut region = lfh_region(0x1000, 0x100);
         region.size = EXTENT_READ_CHUNK * 3;
         region.bitmap = vec![0xff; 64];
@@ -5509,7 +5706,7 @@ mod tests {
             reads: Cell::new(0),
             allowance: usize::MAX,
         };
-        let layout = vs_layout(false);
+        let layout = vs_layout(VsFixture::Inline);
         let region = lfh_region(0x1000, 0x100);
         let walker = SnapshotWalker {
             memory: &memory,
@@ -5659,7 +5856,7 @@ mod tests {
             allowance: 3,
             extents_read: Cell::new(0),
         };
-        let layout = vs_layout(false);
+        let layout = vs_layout(VsFixture::Inline);
         let mut region = lfh_region(0x1000, 0x100);
         region.bitmap = vec![0xff; 16];
         let walker = SnapshotWalker {
