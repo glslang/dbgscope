@@ -173,17 +173,35 @@ impl Image {
     ///
     /// What an address recovered as code is checked against. The loader's extent is not that
     /// question: `.rdata`, `.data` and the headers are all inside it, so a jump-table entry that
-    /// lands there is data being reported as a case. Each span goes through [`Self::checked_va`],
-    /// so a section whose declared size runs past `SizeOfImage` contributes nothing rather than a
-    /// range reaching into whatever is mapped after this image.
+    /// lands there is data being reported as a case.
+    ///
+    /// **A section running past `SizeOfImage` is clipped to it, not dropped**, and the difference
+    /// is the one this module's rules are about. Dropping it was a silent truncation of exactly
+    /// the shape the import walk refuses: a caller gets a list that looks complete, an entire
+    /// executable section is missing from it, and an address inside that section answers "not
+    /// code" -- so a scan reports nothing dangerous in a region it never looked at. Clipping loses
+    /// nothing real, because what is past `SizeOfImage` is not this image's code whatever the
+    /// header says; it is whatever is mapped next, and a range reaching into that is the other
+    /// failure this guards.
+    ///
+    /// A section starting outside the image contributes no range, and that is not a truncation
+    /// either: none of it is inside the image to report.
+    ///
+    /// This matters more than the header alone suggests, because a caller may narrow
+    /// `size_of_image` *after* parsing -- `windbg-mcp` clamps it to the loader's extent, which is
+    /// the smaller and more trustworthy of the two on an untrusted driver -- so a section that was
+    /// in bounds at parse time can be out of them here.
     pub fn executable_ranges(&self) -> Vec<std::ops::Range<u64>> {
         self.code_sections()
             .filter_map(|section| {
-                let start = self
-                    .checked_va(section.rva, section.virtual_size as usize)
-                    .ok()?;
-                Some(start..start + u64::from(section.virtual_size))
+                // Clipped the way `read_imports` clips a read: the start must be inside, and the
+                // length is whatever room is left.
+                let room = self.size_of_image.saturating_sub(section.rva);
+                let len = section.virtual_size.min(room);
+                let start = self.checked_va(section.rva, len as usize).ok()?;
+                Some(start..start + u64::from(len))
             })
+            .filter(|range| range.start < range.end)
             .collect()
     }
 
@@ -630,20 +648,52 @@ pub fn imports_by_slot(imports: &[Import]) -> BTreeMap<u64, &Import> {
 }
 
 /// A NUL-terminated ASCII string at an RVA, read in one bounded go.
+/// A name, read **up to its terminator** rather than in one demand for [`MAX_NAME`] bytes.
+///
+/// **The single 512-byte read undid this module's reason for existing.** A hole in a loaded image
+/// is what the reader shape is for, and holes are page-granular -- so a perfectly readable
+/// fifteen-byte name sitting within 512 bytes of one had its read span the hole and fail, and the
+/// import came back [`PeError::Unreadable`] though every byte of it was there. That is not
+/// hypothetical for the natural adapter: [`crate::dbgeng::DebugEngine::read_memory`] answers
+/// `ShortRead` rather than a short buffer, so `|at, len| engine.read_memory(at, len).ok()` is
+/// `None` for any request that crosses into a gap.
+///
+/// So a read never spans a page. The chunk is whatever is left before the next page boundary,
+/// capped by the remaining name budget -- which is one read for a name that does not straddle one,
+/// and two for a name that does. An image's base is page-aligned by the loader, so an RVA boundary
+/// is an address boundary.
 fn read_c_string(
     rva: u32,
     at: &mut impl FnMut(u32, usize) -> Result<Vec<u8>, PeError>,
 ) -> Result<String, PeError> {
-    let raw = at(rva, MAX_NAME)?;
+    const PAGE: usize = 0x1000;
+    let mut raw: Vec<u8> = Vec::new();
+    while raw.len() < MAX_NAME {
+        let taken = u32::try_from(raw.len()).map_err(|_| PeError::Malformed {
+            reason: "an import or library name runs past the length a name may have",
+        })?;
+        let here = rva.checked_add(taken).ok_or(PeError::Malformed {
+            reason: "an import name runs past the end of a 32-bit image offset",
+        })?;
+        let want = (PAGE - (here as usize % PAGE)).min(MAX_NAME - raw.len());
+        let chunk = at(here, want)?;
+        // Clipped to nothing means the image ended before the name did, which is the same answer
+        // as no terminator: the loop below says so rather than returning a truncated name.
+        if chunk.is_empty() {
+            break;
+        }
+        if let Some(end) = chunk.iter().position(|&byte| byte == 0) {
+            raw.extend_from_slice(&chunk[..end]);
+            return Ok(String::from_utf8_lossy(&raw).into_owned());
+        }
+        raw.extend_from_slice(&chunk);
+    }
     // No terminator inside the bound means this is not a name that fits the bound — and taking
     // the buffer as one turns a hazardous import into a *different*, unmatched string, which a
     // sink list then fails to recognise. The truncation would be invisible in the result.
-    let Some(end) = raw.iter().position(|&byte| byte == 0) else {
-        return Err(PeError::Malformed {
-            reason: "an import or library name runs past the length a name may have",
-        });
-    };
-    Ok(String::from_utf8_lossy(&raw[..end]).into_owned())
+    Err(PeError::Malformed {
+        reason: "an import or library name runs past the length a name may have",
+    })
 }
 
 fn u16(bytes: &[u8], offset: usize) -> Result<u16, PeError> {
@@ -911,7 +961,7 @@ mod tests {
     /// entire contract is to answer with a `PeError` -- the one failure mode a caller cannot catch.
     #[test]
     fn test_a_base_that_would_wrap_the_address_space_is_refused() {
-        let read = |address: u64, len: usize| -> Option<Vec<u8>> {
+        let read = |_address: u64, len: usize| -> Option<Vec<u8>> {
             // Only the DOS header is ever reached; the read after it is what overflows.
             let mut out = vec![0u8; len];
             out[0..2].copy_from_slice(b"MZ");
@@ -963,6 +1013,84 @@ mod tests {
         );
         // So the range is dropped rather than built inverted, and nothing panics.
         assert!(image.executable_ranges().is_empty());
+    }
+
+    /// A name beside a hole is read, because a read never spans a page.
+    ///
+    /// **This is the module's own reason for existing, and the single 512-byte demand broke it.**
+    /// The library name sits sixteen bytes before an unreadable page -- which is what a kernel
+    /// minidump looks like, holes being page-granular -- and every byte of the name is there. Ask
+    /// for 512 bytes and the request crosses the hole and fails, so a fully readable import comes
+    /// back `Unreadable`. Ask only as far as the page ends and it reads.
+    ///
+    /// Not hypothetical for the natural adapter: `DebugEngine::read_memory` answers `ShortRead`
+    /// rather than a short buffer, so `|at, len| engine.read_memory(at, len).ok()` is `None` for
+    /// any request reaching into a gap.
+    #[test]
+    fn test_a_name_beside_an_unreadable_page_is_still_read() {
+        let mut fake = driver_image();
+        // Move the library name to the last sixteen bytes of the .rdata page.
+        put(&mut fake.bytes, 0x200c, &0x2ff0u32.to_le_bytes());
+        put(&mut fake.bytes, 0x2ff0, b"ntoskrnl.exe\0");
+        // The next page is gone, exactly as the import address table's page is on a minidump.
+        fake.unreadable.push((BASE + 0x3000, BASE + 0x4000));
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        let table = read_imports(&image, |at, len| fake.read(at, len), || false)
+            .expect("the name is beside the hole, not inside it");
+
+        assert_eq!(table.imports.len(), 3, "{table:#?}");
+        assert!(
+            table
+                .imports
+                .iter()
+                .all(|import| import.library == "ntoskrnl.exe"),
+            "{table:#?}"
+        );
+    }
+
+    /// An executable section running past the image is **clipped**, not dropped.
+    ///
+    /// Dropping it is a silent truncation of the shape this module refuses everywhere else: the
+    /// caller gets a list that looks complete, a whole executable section is missing from it, and
+    /// an address inside that section answers "not code" -- so a scan reports nothing dangerous in
+    /// a region it never examined. What is past `SizeOfImage` is not this image's code whatever
+    /// its header says, so clipping loses nothing and keeps the part that is real.
+    ///
+    /// Reachable without a malformed header at all: `windbg-mcp` narrows `size_of_image` to the
+    /// loader's extent after parsing, which is the smaller and more trustworthy figure on an
+    /// untrusted driver, so a section in bounds at parse time is out of them here.
+    #[test]
+    fn test_an_executable_section_past_the_image_is_clipped_rather_than_dropped() {
+        let image = Image {
+            base: BASE,
+            bitness: Bitness::Bits64,
+            machine: 0x8664,
+            size_of_image: 0x2000,
+            sections: vec![
+                Section {
+                    name: ".text".to_string(),
+                    rva: 0x1000,
+                    virtual_size: 0x2000, // runs 0x1000 past the end
+                    characteristics: 0x6000_0020,
+                },
+                Section {
+                    name: ".gone".to_string(),
+                    rva: 0x5000, // starts outside it entirely
+                    virtual_size: 0x1000,
+                    characteristics: 0x6000_0020,
+                },
+            ],
+            export_directory: (0, 0),
+            import_directory: (0, 0),
+        };
+
+        assert_eq!(
+            image.executable_ranges(),
+            vec![BASE + 0x1000..BASE + 0x2000],
+            "the overrunning section keeps the half that is inside the image, and the one that \
+             starts outside it contributes nothing because none of it is inside"
+        );
     }
 
     /// The rule this module exists for: an import is named without its slot ever being read.
