@@ -217,7 +217,16 @@ fn end_session_leaves_target_running(e: &DebugEngine, target: &Target) -> bool {
 
     println!("=== end_session (should resume + detach, leaving target RUNNING) ===");
     match e.end_session() {
-        Ok(()) => println!("end_session ok"),
+        // The disposition is the point of this example, so print it rather than "ok": a kernel the
+        // resume did not take on is detached all the same, and that used to be indistinguishable
+        // from one left running.
+        Ok(dbgscope::dbgeng::TargetLeft::KernelRunning) => {
+            println!("end_session ok -- kernel resumed and detached, it is RUNNING")
+        }
+        Ok(dbgscope::dbgeng::TargetLeft::KernelHalted) => println!(
+            "end_session ok BUT THE RESUME DID NOT TAKE -- the guest is probably still halted;              attach again and `qd`"
+        ),
+        Ok(other) => println!("end_session ok ({other:?})"),
         Err(err) => println!("end_session ERR: {err}"),
     }
 
