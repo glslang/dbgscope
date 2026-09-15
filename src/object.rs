@@ -1709,7 +1709,7 @@ mod tests {
     /// one is stored: taking the field as an address reads a security descriptor three bytes into
     /// its own header and reports a DACL that is not there.
     #[test]
-    fn a_path_resolves_to_the_object_filed_under_it() {
+    fn test_a_path_resolves_to_the_object_filed_under_it() {
         let fake = namespace();
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
@@ -1737,7 +1737,7 @@ mod tests {
 
     /// A name is matched without regard to ASCII case, as the object manager matches it.
     #[test]
-    fn a_name_is_matched_without_regard_to_case() {
+    fn test_a_name_is_matched_without_regard_to_case() {
         let fake = namespace();
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
@@ -1758,7 +1758,7 @@ mod tests {
     /// turns on, and the four below are where the two part company.
     #[cfg_attr(miri, ignore = "folds through ntdll; see `Upcase::on_host`")]
     #[test]
-    fn a_name_is_folded_by_the_object_managers_own_table_and_not_by_unicodes() {
+    fn test_a_name_is_folded_by_the_object_managers_own_table_and_not_by_unicodes() {
         // The two bands that read no table, which this crate still answers itself.
         assert!(same_object_name("MountPointManager", "MOUNTPOINTMANAGER"));
         // `U+00B5` is below the `U+00C0` floor, so no table is consulted and it stays put --
@@ -1894,7 +1894,7 @@ mod tests {
     /// an element index, and a leaf taken as the folded unit rather than added to it. The leaf
     /// here is `0xffe0` and the answer is `U+00C9`, which is only true of the addition.
     #[test]
-    fn the_trie_is_walked_from_the_base_and_its_leaf_is_a_delta() {
+    fn test_the_trie_is_walked_from_the_base_and_its_leaf_is_a_delta() {
         let fake = one_fold_table(0xffe0);
         let upcase = Upcase::of_target(&fake, upcase_globals(), layout().pointer);
 
@@ -1923,7 +1923,7 @@ mod tests {
     /// assertion below can only pass by reading the target, which is the whole of what item 77
     /// was about: a fixture whose table *agrees* with the host cannot say which one answered.
     #[test]
-    fn the_targets_own_table_answers_and_not_this_hosts() {
+    fn test_the_targets_own_table_answers_and_not_this_hosts() {
         let fake = one_fold_table(0x0001);
         let upcase = Upcase::of_target(&fake, upcase_globals(), layout().pointer);
 
@@ -1940,7 +1940,7 @@ mod tests {
     /// [`Globals::upcase`] -- so this fails if the component match goes back to
     /// [`same_object_name`], which is the edit it is here to catch.
     #[test]
-    fn the_walk_matches_a_component_through_the_targets_table() {
+    fn test_the_walk_matches_a_component_through_the_targets_table() {
         let mut fake = namespace();
         const ODD: u64 = 0xffff_a000_0060_0000;
         // `\Device\<U+00E9>`, which this target's table folds to `<U+00EA>` and no other machine
@@ -1978,7 +1978,7 @@ mod tests {
     /// table in would report two objects as one, which is the failure the whole fold exists to
     /// avoid.
     #[test]
-    fn a_null_table_pointer_folds_no_further_than_ascii() {
+    fn test_a_null_table_pointer_folds_no_further_than_ascii() {
         let mut fake = Fake::default();
         fake.nls_pointer(0);
         let upcase = Upcase::of_target(&fake, upcase_globals(), layout().pointer);
@@ -1998,7 +1998,7 @@ mod tests {
         ignore = "the fallback folds through ntdll; see `Upcase::on_host`"
     )]
     #[test]
-    fn a_table_that_cannot_be_reached_falls_back_to_the_host_and_reports_it() {
+    fn test_a_table_that_cannot_be_reached_falls_back_to_the_host_and_reports_it() {
         let empty = Fake::default();
         let unreadable = Upcase::of_target(&empty, upcase_globals(), layout().pointer);
         assert_eq!(unreadable.source(), UpcaseFrom::Host);
@@ -2025,7 +2025,7 @@ mod tests {
         ignore = "the fallback folds through ntdll; see `Upcase::on_host`"
     )]
     #[test]
-    fn a_table_located_but_unreadable_reports_a_fold_of_both_machines() {
+    fn test_a_table_located_but_unreadable_reports_a_fold_of_both_machines() {
         let mut fake = Fake::default();
         // The pointer reads; nothing it points at does.
         fake.nls_pointer(TABLE);
@@ -2069,7 +2069,7 @@ mod tests {
     ///
     /// Read at four, the base is the table, the fold is the target's, and `source()` says so.
     #[test]
-    fn a_32_bit_targets_table_pointer_is_read_at_its_own_width() {
+    fn test_a_32_bit_targets_table_pointer_is_read_at_its_own_width() {
         // A table where a 32-bit kernel would keep one, so a four-byte pointer can name it.
         const TABLE32: u64 = 0x8006_0000;
         let mut fake = one_fold_table_at(TABLE32, 0x0001);
@@ -2117,7 +2117,7 @@ mod tests {
     /// debugged from a 64-bit host is not read at the host's width; a fold that did not take it
     /// would undo that for the one pointer it reads.
     #[test]
-    fn the_walk_folds_at_the_pointer_width_its_layout_derived() {
+    fn test_the_walk_folds_at_the_pointer_width_its_layout_derived() {
         const TABLE32: u64 = 0x8006_0000;
         let mut fake = one_fold_table_at(TABLE32, 0x0001);
         let at = SILO_GLOBALS + u64::from(NLS_STATE) + u64::from(UPCASE_TABLE);
@@ -2163,7 +2163,7 @@ mod tests {
     /// every entry in a directory, so a unit re-read per comparison would turn a directory of tens
     /// of entries into hundreds of round trips over a KD wire.
     #[test]
-    fn an_ascii_name_costs_no_target_read_and_a_folded_unit_costs_one_walk() {
+    fn test_an_ascii_name_costs_no_target_read_and_a_folded_unit_costs_one_walk() {
         let table = one_fold_table(0xffe0);
         let counting = Counting {
             inner: &table,
@@ -2260,7 +2260,7 @@ mod tests {
     /// and [`DebugEngine::object_upcase_table`] is where they are read.
     #[cfg_attr(miri, ignore = "builds from ntdll's fold; see `Upcase::on_host`")]
     #[test]
-    fn the_trie_walk_reproduces_the_routine_across_every_code_unit() {
+    fn test_the_trie_walk_reproduces_the_routine_across_every_code_unit() {
         let host = Upcase::of_host();
         let fake = trie_encoding(|unit| host.unit(unit));
         let upcase = Upcase::of_target(&fake, upcase_globals(), layout().pointer);
@@ -2299,7 +2299,7 @@ mod tests {
     /// reported as [`ObjectError::NotFound`], which is the answer a caller acts on.
     #[cfg_attr(miri, ignore = "folds through ntdll; see `Upcase::on_host`")]
     #[test]
-    fn a_name_is_matched_through_the_object_managers_fold_and_not_through_ascii() {
+    fn test_a_name_is_matched_through_the_object_managers_fold_and_not_through_ascii() {
         let mut fake = namespace();
         const ACCENTED: u64 = 0xffff_a000_0070_0000;
         fake.object(ACCENTED, "K\u{e4}se", obfuscated(4, ACCENTED), 0);
@@ -2323,7 +2323,7 @@ mod tests {
     /// would not have found, which is worse than failing to find one.
     #[cfg_attr(miri, ignore = "folds through ntdll; see `Upcase::on_host`")]
     #[test]
-    fn a_name_the_table_does_not_fold_together_is_two_objects() {
+    fn test_a_name_the_table_does_not_fold_together_is_two_objects() {
         let mut fake = namespace();
         const DOTLESS: u64 = 0xffff_a000_0071_0000;
         fake.object(DOTLESS, "\u{0131}", obfuscated(4, DOTLESS), 0);
@@ -2351,7 +2351,7 @@ mod tests {
     /// A component that is not there is **not found**, naming what was being looked in — and not
     /// an empty answer, which reads as a namespace with nothing in it.
     #[test]
-    fn a_missing_component_names_the_directory_it_was_not_in() {
+    fn test_a_missing_component_names_the_directory_it_was_not_in() {
         let fake = namespace();
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
@@ -2369,7 +2369,7 @@ mod tests {
     /// A device's body is not a directory, and reading one as a directory reads 37 pointers out of
     /// a driver's own fields and follows whatever they hold.
     #[test]
-    fn a_leaf_is_not_walked_through() {
+    fn test_a_leaf_is_not_walked_through() {
         let fake = namespace();
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
@@ -2384,7 +2384,7 @@ mod tests {
 
     /// A directory lists what it holds, named.
     #[test]
-    fn a_directory_lists_what_it_holds() {
+    fn test_a_directory_lists_what_it_holds() {
         let fake = namespace();
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
@@ -2404,7 +2404,7 @@ mod tests {
     /// This is a kernel minidump, where `nt`'s data pages are not in the file at all: measured on
     /// `docs/samples/081226-2187-01.dmp`, `ObpRootDirectoryObject` itself reads `????????`.
     #[test]
-    fn a_target_with_no_namespace_says_so_rather_than_answering_empty() {
+    fn test_a_target_with_no_namespace_says_so_rather_than_answering_empty() {
         let fake = Fake::default();
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
@@ -2425,7 +2425,7 @@ mod tests {
     /// a live kernel that is a debugger that stops answering, which is the failure a bound exists
     /// to turn into a refusal.
     #[test]
-    fn a_chain_of_entries_that_name_nothing_is_bounded_as_well() {
+    fn test_a_chain_of_entries_that_name_nothing_is_bounded_as_well() {
         let mut fake = namespace();
         const EMPTY: u64 = DEVICE_DIR + 0x8000;
         fake.pointer(DEVICE_DIR, EMPTY);
@@ -2448,7 +2448,7 @@ mod tests {
     /// same guard at the end of a path. Without it a driver's own fields are read as thirty-seven
     /// bucket pointers and whatever they hold is followed as chains.
     #[test]
-    fn a_leaf_is_not_listed_as_a_directory() {
+    fn test_a_leaf_is_not_listed_as_a_directory() {
         let fake = namespace();
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
@@ -2466,7 +2466,7 @@ mod tests {
     /// Answered as an empty string it becomes a symbolic link whose target is `""`, which a
     /// caller publishes as a device reachable under no name at all.
     #[test]
-    fn a_length_with_no_buffer_is_malformed_rather_than_empty() {
+    fn test_a_length_with_no_buffer_is_malformed_rather_than_empty() {
         let mut fake = namespace();
         const LINK: u64 = 0xffff_a000_0042_0000;
         fake.flags(LINK, 0);
@@ -2485,7 +2485,7 @@ mod tests {
 
     /// A chain that points at itself is refused, rather than walked until the process dies.
     #[test]
-    fn a_looping_chain_is_refused_rather_than_walked() {
+    fn test_a_looping_chain_is_refused_rather_than_walked() {
         let mut fake = namespace();
         // The first bucket's entry chains to itself.
         let entry = DEVICE_DIR + 0x2000;
@@ -2507,7 +2507,7 @@ mod tests {
     /// The field shares storage with a callback pointer, so a link this walk cannot vouch for is
     /// an error rather than a string decoded out of a function address.
     #[test]
-    fn a_link_target_is_checked_before_it_is_decoded() {
+    fn test_a_link_target_is_checked_before_it_is_decoded() {
         let mut fake = namespace();
         const LINK: u64 = 0xffff_a000_0040_0000;
         fake.flags(LINK, 0);
@@ -2558,7 +2558,7 @@ mod tests {
     /// reads, and what it holds is a path. Only the flag the object manager itself branches on
     /// separates the two arms, which is why it is read first.
     #[test]
-    fn a_callback_link_has_no_target_to_read() {
+    fn test_a_callback_link_has_no_target_to_read() {
         let mut fake = namespace();
         const LINK: u64 = 0xffff_a000_0044_0000;
         // A target that would decode perfectly well, and a flag saying it is not the live arm.
@@ -2590,7 +2590,7 @@ mod tests {
     /// that passes when it cannot tell is not one. Here the type table slot is empty, which is
     /// every way that read can fail rolled into one.
     #[test]
-    fn an_object_of_unknown_type_is_not_treated_as_a_directory() {
+    fn test_an_object_of_unknown_type_is_not_treated_as_a_directory() {
         let mut fake = namespace();
         // The slot the Device directory's own type index selects, emptied.
         fake.pointer(TYPE_TABLE + 3 * 8, 0);
@@ -2626,7 +2626,7 @@ mod tests {
     /// about a target: a page that was out will be back, while a directory entry the object
     /// manager cannot have written is a finding.
     #[test]
-    fn a_name_longer_than_its_own_maximum_is_dropped_rather_than_taken_or_refused() {
+    fn test_a_name_longer_than_its_own_maximum_is_dropped_rather_than_taken_or_refused() {
         let mut fake = namespace();
         let header = DEVICE - 0x30;
         let name_info = header - 0x20;
@@ -2674,7 +2674,7 @@ mod tests {
     /// the walk an **empty** target, so it fails on the root pointer long before an entry is
     /// reached, and could not have caught it.
     #[test]
-    fn a_global_the_target_lacks_is_not_swallowed_by_the_skip() {
+    fn test_a_global_the_target_lacks_is_not_swallowed_by_the_skip() {
         let fake = namespace();
         let nameless = Globals {
             info_mask_to_offset: None,
@@ -2708,7 +2708,7 @@ mod tests {
     /// interrupt already spent. A multi-component path is what shows it: with one component the
     /// answer is merely returned early, with two the walk carries on reading.
     #[test]
-    fn a_lookup_stopped_after_naming_a_component_does_not_go_on_through_it() {
+    fn test_a_lookup_stopped_after_naming_a_component_does_not_go_on_through_it() {
         let mut two = namespace();
         const SECOND: u64 = ROOT + 0x4_0000;
         two.object(SECOND, "Second", obfuscated(3, SECOND), 0);
@@ -2760,7 +2760,7 @@ mod tests {
     /// this: `entries_of` returned `halted`, `named_in` asked again, the answer was false because
     /// the first ask had taken it, and the gathered entries were named anyway.
     #[test]
-    fn a_halt_the_walk_already_reported_is_not_polled_for_a_second_time() {
+    fn test_a_halt_the_walk_already_reported_is_not_polled_for_a_second_time() {
         let fake = namespace();
 
         // Fires exactly once, on the poll after the root's only entry has been gathered: bucket
@@ -2821,7 +2821,7 @@ mod tests {
     /// one left this green while the other still stopped the walk, so each is checked on a
     /// construction the other cannot reach.
     #[test]
-    fn a_walk_stops_where_its_caller_asks_and_keeps_what_it_read() {
+    fn test_a_walk_stops_where_its_caller_asks_and_keeps_what_it_read() {
         let fake = namespace();
 
         // One: a stopped enumeration is an **answer**, not a failure. What it reached comes back
@@ -2975,7 +2975,7 @@ mod tests {
     /// lookup whose path crossed that directory. A tool asking "what reaches this device" got
     /// "this directory cannot be listed", which reads as a device nothing reaches.
     #[test]
-    fn a_directory_survives_an_entry_whose_name_will_not_read() {
+    fn test_a_directory_survives_an_entry_whose_name_will_not_read() {
         let mut fake = namespace();
         let header = DEVICE - 0x30;
         let name_info = header - 0x20;
@@ -3029,7 +3029,7 @@ mod tests {
     /// for the replacement character reach an object whose name has no such character in it. For a
     /// device that is answering under a name that is not its own.
     #[test]
-    fn a_name_that_is_not_text_lists_but_does_not_resolve() {
+    fn test_a_name_that_is_not_text_lists_but_does_not_resolve() {
         let mut fake = namespace();
         const ODD: u64 = 0xffff_a000_0060_0000;
         const OTHER: u64 = 0xffff_a000_0061_0000;
@@ -3081,7 +3081,7 @@ mod tests {
     /// one-component path, listing the root, and reading a link target all need no type at all. The
     /// guards still fail closed -- they just say [`ObjectError::Untyped`] when they cannot tell.
     #[test]
-    fn a_target_that_cannot_name_types_still_answers_what_needs_none() {
+    fn test_a_target_that_cannot_name_types_still_answers_what_needs_none() {
         let fake = namespace();
         let untyped = Globals {
             header_cookie: None,
@@ -3121,7 +3121,7 @@ mod tests {
     /// target can give away because of a symbol it never reads -- which is the third round of
     /// findings this seam produced, and why the globals are now asked for one at a time.
     #[test]
-    fn a_link_is_read_with_none_of_the_namespaces_globals() {
+    fn test_a_link_is_read_with_none_of_the_namespaces_globals() {
         let mut fake = namespace();
         const LINK: u64 = 0xffff_a000_0045_0000;
         fake.flags(LINK, 0);
@@ -3155,7 +3155,7 @@ mod tests {
     /// A name is one component and a target is a whole path, so holding the second to the first's
     /// bound refuses an ordinary link -- with a message about object names, which is the tell.
     #[test]
-    fn a_link_target_is_bounded_as_a_path_rather_than_as_a_name() {
+    fn test_a_link_target_is_bounded_as_a_path_rather_than_as_a_name() {
         let mut fake = namespace();
         const LINK: u64 = 0xffff_a000_0046_0000;
         // Longer than a name may be, and far inside what a path may be.
@@ -3179,7 +3179,7 @@ mod tests {
     /// another route. Both are a panic inside calls whose whole contract is that they return an
     /// error, so both are errors.
     #[test]
-    fn a_layout_this_crate_did_not_build_is_refused_rather_than_panicked_on() {
+    fn test_a_layout_this_crate_did_not_build_is_refused_rather_than_panicked_on() {
         let fake = namespace();
         let refused = |layout: Layout| match Namespace::new(&fake, layout, globals()) {
             Err(ObjectError::Malformed { reason }) => reason,
@@ -3259,7 +3259,7 @@ mod tests {
     /// nobody asked about -- and `object_at` had always refused it, so one question had two
     /// answers.
     #[test]
-    fn listing_with_no_path_is_refused_rather_than_answered_about_the_root() {
+    fn test_listing_with_no_path_is_refused_rather_than_answered_about_the_root() {
         let fake = namespace();
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
@@ -3312,7 +3312,7 @@ mod tests {
 
     /// A path that is not a path is refused before anything is read.
     #[test]
-    fn a_path_that_is_not_one_is_refused() {
+    fn test_a_path_that_is_not_one_is_refused() {
         let fake = namespace();
         let namespace = Namespace::new(&fake, layout(), globals())
             .expect("the fixture layout is one this crate builds");
