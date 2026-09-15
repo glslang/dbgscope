@@ -292,6 +292,32 @@ const MAX_IMPORTS_PER_LIBRARY: usize = 8192;
 const MAX_IMPORTS_TOTAL: usize = 16 * 1024;
 const MAX_NAME: usize = 512;
 
+/// A span the **image itself declares**, checked against the image whole rather than clipped to
+/// it.
+///
+/// **The distinction the readers here do not make, and could not.** `at` clips a read to the image
+/// because that is right for the reads this module chooses the length of: a name is variable and
+/// [`MAX_NAME`] is our bound, not the image's, so a name near the end is legitimately shorter than
+/// the ask. It is exactly wrong for a length the *image* states. A declared span that does not fit
+/// is an image contradicting itself, and clipping it answers the question anyway out of the part
+/// that fits -- an import directory at `SizeOfImage - 20` declaring forty bytes is read as one
+/// descriptor, and if those twenty bytes are zero the answer is a confident "this driver imports
+/// nothing". Half the directory was outside the image and nothing said so.
+///
+/// So every span the image declares comes through here, and every span this module chose the
+/// length of goes through the clipping reader. Two rules, told apart by whose number the length is.
+fn declared_fits(
+    rva: u32,
+    len: u32,
+    size_of_image: u32,
+    reason: &'static str,
+) -> Result<(), PeError> {
+    match u64::from(rva).saturating_add(u64::from(len)) <= u64::from(size_of_image) {
+        true => Ok(()),
+        false => Err(PeError::Malformed { reason }),
+    }
+}
+
 /// An offset from a base, refused rather than wrapped.
 ///
 /// **The header phase's half of [`Image::checked_va`]'s job, and the reason that one is described
@@ -405,12 +431,15 @@ pub fn read_image(
     // a scan by a neighbour's layout, with nothing in the result to say so. This is the same rule
     // `checked_va` applies to every RVA; it is here as well because the section table is read
     // before there is an `Image` to ask.
-    let span = (section_count * 40) as u64;
-    if table.saturating_add(span) > u64::from(size_of_image) {
-        return Err(PeError::Malformed {
-            reason: "the section table runs past the end of the image",
-        });
-    }
+    let table_rva = u32::try_from(table).map_err(|_| PeError::Malformed {
+        reason: "the section table lies outside a 32-bit image offset",
+    })?;
+    declared_fits(
+        table_rva,
+        (section_count * 40) as u32,
+        size_of_image,
+        "the section table runs past the end of the image",
+    )?;
     let raw = at(table, section_count * 40)?;
     let mut sections = Vec::with_capacity(section_count);
     for index in 0..section_count {
@@ -503,6 +532,14 @@ pub fn read_imports(
             reason: "the import directory names more libraries than an image plausibly has",
         });
     }
+    // The directory's length is `NumberOfRvaAndSizes`' business, not this module's, so it is
+    // validated rather than clipped -- see `declared_fits` for what clipping it answered instead.
+    declared_fits(
+        directory,
+        size,
+        image.size_of_image,
+        "the import directory runs past the end of the image",
+    )?;
     let descriptors = at(directory, size as usize)?;
     let mut table = ImportTable::default();
     // **A slot belongs to one import.** It holds one function pointer, so two names claiming it is
@@ -1090,6 +1127,33 @@ mod tests {
             vec![BASE + 0x1000..BASE + 0x2000],
             "the overrunning section keeps the half that is inside the image, and the one that \
              starts outside it contributes nothing because none of it is inside"
+        );
+    }
+
+    /// A declared import directory that does not fit the image is refused, not clipped.
+    ///
+    /// **The silent wrong answer this module is written to avoid, reached without a single read
+    /// failing.** The directory starts inside the image and its declared size runs past the end,
+    /// so the clipping reader answered out of the part that fit -- twenty bytes, one descriptor,
+    /// and if those bytes are zero that is a terminator and the answer is a confident "this driver
+    /// imports nothing". Half the directory was outside the image and nothing in the result said
+    /// so; a hazard scan over it reports no dangerous imports.
+    ///
+    /// The length here is the *image's* number, not this module's, which is what separates it from
+    /// a name read: `MAX_NAME` is our bound, so a short answer there is legitimate.
+    #[test]
+    fn test_an_import_directory_running_past_the_image_is_refused_not_clipped() {
+        let mut fake = driver_image();
+        // Twenty bytes short of the end, declaring forty.
+        put(&mut fake.bytes, 0x170, &0x3fecu32.to_le_bytes());
+        put(&mut fake.bytes, 0x174, &40u32.to_le_bytes());
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_imports(&image, |at, len| fake.read(at, len), || false),
+            Err(PeError::Malformed {
+                reason: "the import directory runs past the end of the image",
+            })
         );
     }
 
