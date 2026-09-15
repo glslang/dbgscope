@@ -2055,13 +2055,19 @@ mod tests {
         let fake = trie_encoding(|unit| host.unit(unit));
         let upcase = Upcase::of_target(&fake, upcase_globals());
 
+        // **A floor rather than the figure, and the difference is what the figure is a property
+        // of.** A fixture whose table moved nothing would pass whatever the walk did, so the count
+        // has to be checked -- but what it counts is what *this machine's* NLS data does, which is
+        // the very thing this change exists because it varies. It is 973 on 26200 x64 and on both
+        // CI runner images today; pinning that would fail on the first runner whose Windows adopts
+        // another `U+A7xx` block, and would fail saying nothing about the walk.
         let moved = (0..=0xffffu32)
             .filter(|unit| host.unit(*unit as u16) != *unit as u16)
             .count();
-        assert_eq!(
-            moved, 973,
-            "this host's table moves 973 code units -- a fixture where none moved would pass \
-             whatever the walk did"
+        assert!(
+            moved > 900,
+            "this host's table moves {moved} code units, too few to be a real upcase table -- and \
+             a fixture where none moved would pass whatever the walk did"
         );
 
         let wrong: Vec<u16> = (0..=0xffffu32)
