@@ -62,32 +62,32 @@
 
 use std::collections::BTreeMap;
 
+use thiserror::Error;
+
 /// What went wrong, in terms a caller can render as an outcome rather than a message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **A [`std::error::Error`], not only a [`Display`](std::fmt::Display).** This was a hand-written
+/// `Display` while the module lived behind one binary's module tree, where nothing ever asked it to
+/// be a source. It is public API of a library now, so a caller propagating it into `anyhow` or
+/// naming it as a `source()` is an ordinary thing to want -- and the other public errors here
+/// ([`crate::object::ObjectError`], [`crate::dbgeng::DbgEngError`]) are `thiserror` enums, which
+/// `AGENTS.md` asks for. The messages are the ones the hand-written impl produced.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PeError {
     /// A read the parse needed did not come back. On a dump this is the ordinary answer for
     /// anything outside the read-only sections an image file can supply.
+    #[error("{len} bytes at {at:#x} could not be read")]
     Unreadable { at: u64, len: usize },
     /// The bytes are readable and are not a PE image.
+    #[error("not a PE image: {reason}")]
     NotAnImage { reason: &'static str },
     /// A PE image whose structures do not hold together — a directory pointing outside the
     /// image, a count past its bound.
+    #[error("malformed PE image: {reason}")]
     Malformed { reason: &'static str },
     /// The caller's halt closure asked for a stop.
+    #[error("interrupted")]
     Interrupted,
-}
-
-impl std::fmt::Display for PeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unreadable { at, len } => {
-                write!(f, "{len} bytes at {at:#x} could not be read")
-            }
-            Self::NotAnImage { reason } => write!(f, "not a PE image: {reason}"),
-            Self::Malformed { reason } => write!(f, "malformed PE image: {reason}"),
-            Self::Interrupted => write!(f, "interrupted"),
-        }
-    }
 }
 
 /// Whether the image is PE32 or PE32+, which is the pointer width its thunks are in.
@@ -500,13 +500,30 @@ pub fn read_imports(
             // Never dereferenced, and still bounded: a caller attributes this address to *this*
             // image, so a `FirstThunk` outside it would have an indirect call into a neighbour
             // reported as this driver's import.
-            let slot_rva = u32::try_from(iat as usize + slot_index * pointer).map_err(|_| {
-                PeError::Malformed {
-                    reason: "an import address table entry lies outside a 32-bit image offset",
-                }
-            })?;
+            // **Both of these are computed in `u64` and narrowed once**, and neither is a
+            // `u32 + u32`. The lookup side used to be exactly that, which a malformed image with
+            // an RVA near `u32::MAX` turns into a debug-build panic -- unacceptable in a library
+            // whose contract is to return `Malformed` -- and, in release, a *wrap* to a low RVA
+            // that `checked_va` then passes, because a wrapped offset is inside the image. The
+            // answer is imports read out of the image's own header, with nothing having failed.
+            //
+            // The IAT side above it was already narrowed, but through `usize`, which is only wide
+            // enough on a 64-bit host: this crate builds a 32-bit worker too, and there
+            // `iat as usize + slot_index * pointer` is the same overflow by another route. `u64`
+            // is the width that does not depend on who is running.
+            let offset = (slot_index * pointer) as u64;
+            let narrow = |rva: u64, reason: &'static str| -> Result<u32, PeError> {
+                u32::try_from(rva).map_err(|_| PeError::Malformed { reason })
+            };
+            let slot_rva = narrow(
+                u64::from(iat) + offset,
+                "an import address table entry lies outside a 32-bit image offset",
+            )?;
             let slot = image.checked_va(slot_rva, pointer)?;
-            let entry_rva = lookup + (slot_index * pointer) as u32;
+            let entry_rva = narrow(
+                u64::from(lookup) + offset,
+                "an import lookup table entry lies outside a 32-bit image offset",
+            )?;
             let entry = at(entry_rva, pointer)?;
             let value = match image.bitness {
                 Bitness::Bits32 => u32(&entry, 0)? as u64,
@@ -524,7 +541,20 @@ pub fn read_imports(
                 ImportName::Ordinal((value & 0xffff) as u16)
             } else {
                 // IMAGE_IMPORT_BY_NAME: a two-byte hint, then the name.
-                ImportName::Named(read_c_string((value as u32) + 2, &mut at)?)
+                //
+                // **Converted rather than truncated, and added rather than wrapped.** A PE32+
+                // thunk is 64 bits and its name RVA lives in the low 31, so `value as u32` was
+                // silently discarding whatever a malformed image put above them -- and then `+ 2`
+                // on a low word of `0xffff_fffe` wrapped to RVA 0, where `read_c_string` reads the
+                // MZ header and returns it as an import name. Two refusals instead: a thunk that
+                // is not an image offset, and a hint that runs off the end of one.
+                let hint = u32::try_from(value).map_err(|_| PeError::Malformed {
+                    reason: "an import name table entry is not a 32-bit image offset",
+                })?;
+                let name_rva = hint.checked_add(2).ok_or(PeError::Malformed {
+                    reason: "an import name's hint runs past the end of a 32-bit image offset",
+                })?;
+                ImportName::Named(read_c_string(name_rva, &mut at)?)
             };
             // Checked as the table grows rather than after it, which is the whole point: a limit
             // enforced on a finished list is a limit enforced after the memory was spent.
@@ -708,6 +738,118 @@ mod tests {
             bytes,
             unreadable: Vec::new(),
         }
+    }
+
+    /// A name thunk whose hint would run off the end of the RVA space is refused, not wrapped.
+    ///
+    /// `IMAGE_IMPORT_BY_NAME` is a two-byte hint and then the string, so the name starts at
+    /// `thunk + 2`. A malformed PE32+ thunk of `0xffff_fffe` made that addition wrap to RVA 0 --
+    /// where `read_c_string` reads the `MZ` header and hands back whatever is there as an import
+    /// name, with nothing having failed. This is reachable straight from target bytes: the thunk
+    /// is read out of the lookup table and used, so nothing upstream constrains it.
+    #[test]
+    fn test_a_name_thunk_whose_hint_overflows_is_refused() {
+        let mut fake = driver_image();
+        // The first lookup entry, with the ordinal flag clear so it is read as a name.
+        put(
+            &mut fake.bytes,
+            0x2040,
+            &0x0000_0000_ffff_fffeu64.to_le_bytes(),
+        );
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_imports(&image, |at, len| fake.read(at, len), || false),
+            Err(PeError::Malformed {
+                reason: "an import name's hint runs past the end of a 32-bit image offset",
+            })
+        );
+    }
+
+    /// And a thunk that is not a 32-bit offset at all is refused rather than truncated.
+    ///
+    /// A PE32+ thunk is eight bytes and its name RVA lives in the low 31. `value as u32` discarded
+    /// whatever a malformed image put above them, so a thunk of `0x1_0000_1000` was read as RVA
+    /// `0x1000` -- a real offset in this image, answered with a real name, and wrong.
+    #[test]
+    fn test_a_name_thunk_above_the_32_bit_offset_space_is_refused() {
+        let mut fake = driver_image();
+        put(
+            &mut fake.bytes,
+            0x2040,
+            &0x0000_0001_0000_1000u64.to_le_bytes(),
+        );
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_imports(&image, |at, len| fake.read(at, len), || false),
+            Err(PeError::Malformed {
+                reason: "an import name table entry is not a 32-bit image offset",
+            })
+        );
+    }
+
+    /// **The table-walk arithmetic cannot be driven off the end of the RVA space, and this is the
+    /// measurement rather than the argument.**
+    ///
+    /// Review on #164 asked for checked arithmetic on `lookup + slot_index * pointer`, on the
+    /// reading that an image declaring nearly 4 GiB and a table near the top of it would wrap.
+    /// The checked form is in place -- it costs nothing and does not depend on a non-local
+    /// invariant holding -- but the scenario turns out to be **unreachable**, and it is worth
+    /// pinning why so that a later edit which makes it reachable fails here.
+    ///
+    /// The reason is that each iteration's own bounded read constrains the next iteration's
+    /// arithmetic. An entry is eight bytes; `at` clips a read to the image and a short slice fails
+    /// its own field parse, so an iteration only *completes* when its entry sat at least eight
+    /// bytes below `SizeOfImage` -- which leaves the next RVA no higher than `SizeOfImage`, and
+    /// that is a `u32`. The walk therefore stops at the bound before the addition can reach it.
+    ///
+    /// So the assertion is about **which** refusal arrives. It is the image bound, not the
+    /// narrowing -- and if a future change lets the narrowing fire first, this says so.
+    #[test]
+    fn test_the_import_walk_stops_at_the_image_bound_before_its_arithmetic_could_wrap() {
+        // Declared, not allocated: nothing is materialised, the reader answers from arithmetic.
+        let image = Image {
+            base: BASE,
+            bitness: Bitness::Bits64,
+            machine: 0x8664,
+            size_of_image: 0xffff_ffff,
+            sections: Vec::new(),
+            export_directory: (0, 0),
+            import_directory: (0x1000, 40),
+        };
+        // One descriptor whose lookup and address tables both sit at the very top of the image,
+        // then a terminator. Every thunk read comes back as an ordinal, so the walk never stops
+        // for a name and runs until something bounds it.
+        let read = |address: u64, len: usize| -> Option<Vec<u8>> {
+            let rva = address.checked_sub(BASE)? as u32;
+            let mut out = vec![0u8; len];
+            if rva == 0x1000 {
+                // OriginalFirstThunk, then Name at +12, then FirstThunk at +16.
+                out[0..4].copy_from_slice(&0xffff_f000u32.to_le_bytes());
+                out[12..16].copy_from_slice(&0x2000u32.to_le_bytes());
+                out[16..20].copy_from_slice(&0xffff_f000u32.to_le_bytes());
+                return Some(out);
+            }
+            if rva == 0x2000 {
+                out[..8].copy_from_slice(b"drv.sys\0");
+                return Some(out);
+            }
+            // Anything in the tables reads as an ordinal thunk, so the walk keeps going.
+            out[..len.min(8)]
+                .copy_from_slice(&0x8000_0000_0000_0007u64.to_le_bytes()[..len.min(8)]);
+            Some(out)
+        };
+
+        let outcome = read_imports(&image, read, || false);
+        assert_eq!(
+            outcome,
+            Err(PeError::Malformed {
+                reason: "an image offset points outside the image",
+            }),
+            "the walk is stopped by the image bound, not by the narrowing -- if this becomes an \
+             arithmetic refusal, the reachability argument in this test has stopped holding"
+        );
     }
 
     /// The rule this module exists for: an import is named without its slot ever being read.
