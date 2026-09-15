@@ -116,5 +116,6 @@ pub mod allocator;
 pub mod dbgeng;
 pub mod heap;
 pub mod object;
+pub mod pe;
 pub mod pool;
 mod pool_extension;
