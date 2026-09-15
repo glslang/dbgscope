@@ -589,6 +589,25 @@ pub fn read_imports(
             terminated = true;
             break;
         }
+        // **A descriptor that is not the terminator has a name and an address table.** Zero is
+        // not an RVA a real one carries, and neither field is optional -- but both were read as
+        // offsets, so a zero answered rather than refused. A zero `Name` reads RVA 0, which is the
+        // `MZ` header, and the library comes back called `MZ`; a zero `FirstThunk` puts every slot
+        // of that library at the image base, which a call-site scanner matches against nothing.
+        // Either way the walk returns `Ok` and the driver's real imports are not in it.
+        //
+        // `OriginalFirstThunk` is different and is checked below rather than here: zero there is a
+        // bound import, which is a real shape with an answer of its own.
+        if name_rva == 0 {
+            return Err(PeError::Malformed {
+                reason: "an import descriptor names no library",
+            });
+        }
+        if iat == 0 {
+            return Err(PeError::Malformed {
+                reason: "an import descriptor has no import address table",
+            });
+        }
         let library = read_c_string(name_rva, &mut at)?;
         // Bound imports leave no lookup table; the IAT is then the only array there is, and its
         // entries are addresses rather than name RVAs.
@@ -1219,6 +1238,39 @@ mod tests {
             .expect("an unknown machine is not a contradiction");
         assert_eq!(image.machine, 0x5032);
         assert_eq!(image.bitness, Bitness::Bits64);
+    }
+
+    /// A descriptor with no name, or no address table, is refused rather than read as RVA zero.
+    ///
+    /// **Zero is not an RVA a real descriptor carries, and both fields were read as offsets.** A
+    /// zero `Name` reads RVA 0 -- the `MZ` header -- so the library comes back called `MZ`. A zero
+    /// `FirstThunk` puts every one of that library's slots at the image base, which a call-site
+    /// scanner matches against nothing. Both return `Ok`, and the driver's real imports are simply
+    /// not in the answer.
+    ///
+    /// A zero `OriginalFirstThunk` is deliberately not in this rule: that is a bound import, which
+    /// has an answer of its own -- see the `unnamed_libraries` test.
+    #[test]
+    fn test_a_descriptor_missing_its_name_or_its_address_table_is_refused() {
+        let mut without_name = driver_image();
+        put(&mut without_name.bytes, 0x200c, &0u32.to_le_bytes());
+        let image = read_image(BASE, |at, len| without_name.read(at, len)).expect("headers read");
+        assert_eq!(
+            read_imports(&image, |at, len| without_name.read(at, len), || false),
+            Err(PeError::Malformed {
+                reason: "an import descriptor names no library",
+            })
+        );
+
+        let mut without_iat = driver_image();
+        put(&mut without_iat.bytes, 0x2010, &0u32.to_le_bytes());
+        let image = read_image(BASE, |at, len| without_iat.read(at, len)).expect("headers read");
+        assert_eq!(
+            read_imports(&image, |at, len| without_iat.read(at, len), || false),
+            Err(PeError::Malformed {
+                reason: "an import descriptor has no import address table",
+            })
+        );
     }
 
     /// The rule this module exists for: an import is named without its slot ever being read.
