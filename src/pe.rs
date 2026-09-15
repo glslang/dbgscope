@@ -143,6 +143,13 @@ pub struct Image {
     /// `IMAGE_FILE_MACHINE_*`.
     pub machine: u16,
     pub size_of_image: u32,
+    /// `SectionAlignment` -- the unit the loader maps and protects a section in.
+    ///
+    /// Carried because a section's `VirtualSize` is its exact byte count and the loader does not
+    /// map exact byte counts: see [`Self::executable_ranges`], which is the one thing that reads
+    /// it. Zero, or anything that is not a power of two, is not an alignment a loader used and is
+    /// treated as absent rather than trusted.
+    pub section_alignment: u32,
     pub sections: Vec<Section>,
     /// `(rva, size)` of the export directory; both zero when the image has none, which is the
     /// ordinary case for a driver.
@@ -194,10 +201,31 @@ impl Image {
     pub fn executable_ranges(&self) -> Vec<std::ops::Range<u64>> {
         self.code_sections()
             .filter_map(|section| {
+                // **The loader's unit, not the header's byte count.** `VirtualSize` is exact and
+                // sections are mapped and protected in `SectionAlignment` units, so a `.text` of
+                // 0x1234 bytes occupies 0x2000 of executable address space. Stopping at 0x1234
+                // puts the tail outside every range -- and the one thing that reads these is a
+                // containment test for jump-table targets, which would then call an address in
+                // mapped, executable memory "not code" and drop the case.
+                //
+                // Only the alignment, not `SizeOfRawData`. That is a *file* size, trimmed or
+                // padded by `FileAlignment`, and it is not what the loader gives a section in
+                // memory: where it exceeds the rounded virtual size the excess is not separately
+                // mapped, and treating it as extent would run this section into the next one's.
+                let extent = self
+                    .section_alignment
+                    .is_power_of_two()
+                    .then(|| {
+                        section
+                            .virtual_size
+                            .checked_next_multiple_of(self.section_alignment)
+                    })
+                    .flatten()
+                    .unwrap_or(section.virtual_size);
                 // Clipped the way `read_imports` clips a read: the start must be inside, and the
                 // length is whatever room is left.
                 let room = self.size_of_image.saturating_sub(section.rva);
-                let len = section.virtual_size.min(room);
+                let len = extent.min(room);
                 let start = self.checked_va(section.rva, len as usize).ok()?;
                 Some(start..start + u64::from(len))
             })
@@ -430,6 +458,9 @@ pub fn read_image(
         });
     }
     let size_of_image = u32(&headers, size_of_image_at)?;
+    // `SectionAlignment` sits at the same offset in both shapes, as `SizeOfImage` does: the five
+    // fields PE32+ widens are all after it.
+    let section_alignment = u32(&headers, optional + 32)?;
 
     // **The data directories are declared, not assumed.** `NumberOfRvaAndSizes` says how many the
     // image carries and `SizeOfOptionalHeader` says how much room there is for them; an entry is
@@ -499,6 +530,7 @@ pub fn read_image(
         bitness,
         machine,
         size_of_image,
+        section_alignment,
         sections,
         export_directory,
         import_directory,
@@ -867,6 +899,7 @@ mod tests {
 
         // Optional header at 0xf8 (0xe0 + 24), PE32+.
         put(&mut bytes, 0xf8, &0x20bu16.to_le_bytes()); // Magic
+        put(&mut bytes, 0xf8 + 32, &0x1000u32.to_le_bytes()); // SectionAlignment
         put(&mut bytes, 0xf8 + 56, &0x4000u32.to_le_bytes()); // SizeOfImage
         // NumberOfRvaAndSizes at 0xf8 + 108 = 0x164. Sixteen is what every real image writes, and
         // a directory is only read when this says it is there.
@@ -983,6 +1016,7 @@ mod tests {
             bitness: Bitness::Bits64,
             machine: 0x8664,
             size_of_image: 0xffff_ffff,
+            section_alignment: 0x1000,
             sections: Vec::new(),
             export_directory: (0, 0),
             import_directory: (0x1000, 40),
@@ -1083,6 +1117,7 @@ mod tests {
             bitness: Bitness::Bits64,
             machine: 0x8664,
             size_of_image: 0x2000,
+            section_alignment: 0x1000,
             sections: vec![Section {
                 name: ".text".to_string(),
                 rva: 0x1000,
@@ -1156,6 +1191,7 @@ mod tests {
             bitness: Bitness::Bits64,
             machine: 0x8664,
             size_of_image: 0x2000,
+            section_alignment: 0x1000,
             sections: vec![
                 Section {
                     name: ".text".to_string(),
@@ -1313,6 +1349,66 @@ mod tests {
         assert_eq!(
             asked, 0,
             "the reader is never asked for a span that cannot exist"
+        );
+    }
+
+    /// An executable section covers what the **loader** maps, not its exact byte count.
+    ///
+    /// `VirtualSize` is the section's exact size and the loader maps and protects in
+    /// `SectionAlignment` units, so a `.text` of `0x1234` bytes occupies `0x2000` of executable
+    /// address space. Stopping at `0x1234` leaves that tail in no range at all -- and the one
+    /// thing that reads these ranges is a containment test for jump-table targets, so an address
+    /// in mapped, executable memory would answer "not code" and the case would be dropped.
+    ///
+    /// **`SizeOfRawData` is deliberately not part of this.** It is a file size, padded or trimmed
+    /// by `FileAlignment`; where it exceeds the rounded virtual size the excess is not separately
+    /// mapped, and taking it as extent would run one section into the next one's address space.
+    #[test]
+    fn test_an_executable_section_covers_the_extent_the_loader_maps() {
+        let image = |alignment: u32, virtual_size: u32| Image {
+            base: BASE,
+            bitness: Bitness::Bits64,
+            machine: 0x8664,
+            size_of_image: 0x8000,
+            section_alignment: alignment,
+            sections: vec![Section {
+                name: ".text".to_string(),
+                rva: 0x1000,
+                virtual_size,
+                characteristics: 0x6000_0020,
+            }],
+            export_directory: (0, 0),
+            import_directory: (0, 0),
+        };
+
+        assert_eq!(
+            image(0x1000, 0x1234).executable_ranges(),
+            vec![BASE + 0x1000..BASE + 0x3000],
+            "0x1234 bytes occupy two aligned pages"
+        );
+        assert_eq!(
+            image(0x1000, 0x1000).executable_ranges(),
+            vec![BASE + 0x1000..BASE + 0x2000],
+            "an already-aligned size is not rounded up a page"
+        );
+
+        // A malformed alignment is not an alignment the loader used, so nothing is rounded to it
+        // -- and nothing divides by it either.
+        for bad in [0, 3, 0x1001] {
+            assert_eq!(
+                image(bad, 0x1234).executable_ranges(),
+                vec![BASE + 0x1000..BASE + 0x2234],
+                "alignment {bad:#x} is not one to round to"
+            );
+        }
+
+        // And the rounded extent is still the image's to bound.
+        let mut narrow = image(0x1000, 0x1234);
+        narrow.size_of_image = 0x2800;
+        assert_eq!(
+            narrow.executable_ranges(),
+            vec![BASE + 0x1000..BASE + 0x2800],
+            "rounding up does not escape SizeOfImage"
         );
     }
 
