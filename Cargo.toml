@@ -41,6 +41,20 @@ crate-type = ["rlib", "cdylib"]
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 hex = "0.4.3"
 thiserror = "2.0.18"
+# **Needed, and not upgradable on its own.** Nothing in this crate writes `windows_core::`: every
+# use is `windows::core::`, so a grep says this dependency is dead. It is not. The
+# `#[windows::core::implement(..)]` macro on the two callback objects in `src/dbgeng.rs` expands to
+# absolute `::windows_core::` paths, which resolve against *extern crates* only -- removing the
+# dependency fails with "could not find `windows_core` in the list of imported crates", and a
+# `use windows::core as windows_core;` alias does not satisfy it, because an alias is a module item
+# and `::name` is not.
+#
+# The version tracks `windows`, which requires `windows-core ^0.62.2`. crates.io has 0.100.0, and a
+# dependency check will call this outdated; taking it is not an upgrade but a **second** copy in the
+# graph. Measured 2026-09-15: the macro then emits paths into 0.100 while the interfaces come from
+# `windows`'s 0.62.2, and the build fails with `the trait bound IDebugOutputCallbacks:
+# windows_core::Interface is not satisfied`. 0.100 also wants Rust 1.95 against this crate's 1.88
+# floor. Move this only when the umbrella `windows` crate moves, and keep the two in step.
 windows-core = "0.62.2"
 
 [dependencies.windows]
