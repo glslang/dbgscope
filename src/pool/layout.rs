@@ -253,10 +253,16 @@ const TYPES: &[TypeSpec] = &[
 const OPTIONAL_TYPES: &[TypeSpec] = &[
     // Affinity-slot family: the VS free-chunk tree, subsegment list and delay-free list live
     // outside _HEAP_VS_CONTEXT in one of these per-affinity slots. Absent in the inline family.
+    //
+    // The back-reference a slot uses to name its context is deliberately *not* required here, and
+    // is resolved among the optional fields instead. It has been spelled two ways — `VsContext`
+    // and `VsContextOffset` — and a required field that a build renames takes the whole type down
+    // with it: `resolve_type` wants every field it lists, so one rename cost `FreeChunkTree` and
+    // `DelayFreeContext` too and refused the build outright (`windbg-mcp` FOLLOWUPS item 78).
+    // These two survive both spellings, so they are what the type is required to have.
     TypeSpec {
         name: "_HEAP_VS_AFFINITY_SLOT",
         fields: &[
-            ("VsContext", &["VsContext"]),
             ("FreeChunkTree", &["FreeChunkTree"]),
             ("DelayFreeContext", &["DelayFreeContext"]),
         ],
@@ -318,6 +324,18 @@ const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
     // scaled by 64 bytes; the slot map holds AffinityMask + 1 entries.
     ("_HEAP_VS_CONTEXT", "SlotMapRef", &["SlotMapRef"]),
     ("_HEAP_VS_CONTEXT", "AffinityMask", &["AffinityMask"]),
+    // How an affinity slot names the context it belongs to. Two canonical names rather than two
+    // aliases of one, because they are not two spellings of the same fact: `VsContext` holds the
+    // context's address and `VsContextOffset` holds `slot - context`. Aliased, the newer build
+    // would be decoded by the older rule — comparing a displacement against an address, matching
+    // no context, and rejecting every slot. Separate names also make a PDB carrying both an
+    // ambiguity to refuse rather than a coin toss.
+    ("_HEAP_VS_AFFINITY_SLOT", "VsContext", &["VsContext"]),
+    (
+        "_HEAP_VS_AFFINITY_SLOT",
+        "VsContextOffset",
+        &["VsContextOffset"],
+    ),
     ("_HEAP_LARGE_ALLOC_DATA", "UnusedBytes", &["UnusedBytes"]),
 ];
 
@@ -393,6 +411,77 @@ fn apply_optional_fields(
     }
     Ok(())
 }
+
+/// How an affinity slot names the VS context it belongs to, and where that field sits.
+///
+/// The two are checked differently, which is the whole reason they are separate values: an
+/// address is compared against the context, a displacement against `slot - context`. Getting
+/// that backwards does not fail loudly — it rejects every slot and walks no VS evidence at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotBackReference {
+    /// `_HEAP_VS_AFFINITY_SLOT::VsContext`: the context's own address.
+    Address(usize),
+    /// `_HEAP_VS_AFFINITY_SLOT::VsContextOffset`: `slot - context`, unscaled bytes.
+    Displacement(usize),
+}
+
+/// Where a resolved schema keeps its VS free-chunk state, with the offsets that decided it.
+///
+/// Produced once, by [`AllocatorSchema::vs_shape`]. Both the provenance a caller is told about
+/// and the walk that reads the target derive from this single judgement: they used to reach the
+/// same conclusion independently, from two copies of the field list, which is two places for the
+/// next rename to be handled in and one of them to be missed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VsShape {
+    /// The context owns the tree, so there is exactly one root: the context itself.
+    Inline { tree: usize, delay: Option<usize> },
+    /// The tree lives in per-affinity slots reached through the context's slot map.
+    AffinitySlots {
+        slot_map_ref: usize,
+        affinity_mask: usize,
+        slot_ref: usize,
+        tree: usize,
+        delay: Option<usize>,
+        back: SlotBackReference,
+    },
+}
+
+impl VsShape {
+    pub(crate) fn family(self) -> VsSemanticFamily {
+        match self {
+            Self::Inline { .. } => VsSemanticFamily::Inline,
+            Self::AffinitySlots {
+                back: SlotBackReference::Address(_),
+                ..
+            } => VsSemanticFamily::AffinitySlots,
+            Self::AffinitySlots {
+                back: SlotBackReference::Displacement(_),
+                ..
+            } => VsSemanticFamily::AffinitySlotsSelfRelative,
+        }
+    }
+}
+
+/// What the inline family needs, in the order a reader wants them named.
+const INLINE_VS_FIELDS: &[(&str, &str)] = &[
+    ("_HEAP_VS_CONTEXT", "FreeChunkTree"),
+    ("_HEAP_VS_CONTEXT", "DelayFreeContext"),
+];
+
+/// What both affinity-slot families need. They differ only in how a slot names its context,
+/// which is resolved separately because a missing back-reference and a renamed one are the
+/// same absence here and different answers there.
+const AFFINITY_VS_FIELDS: &[(&str, &str)] = &[
+    ("_HEAP_VS_CONTEXT", "SlotMapRef"),
+    ("_HEAP_VS_CONTEXT", "AffinityMask"),
+    ("_HEAP_VS_AFFINITY_SLOT", "FreeChunkTree"),
+    ("_HEAP_VS_AFFINITY_SLOT", "DelayFreeContext"),
+    ("_HEAP_VS_SLOT_MAP", "SlotRef"),
+];
+
+/// The back-reference spellings, newest first. Order is presentation only — resolving more than
+/// one is refused rather than resolved by precedence.
+const SLOT_BACK_REFERENCES: &[&str] = &["VsContextOffset", "VsContext"];
 
 impl AllocatorSchema {
     pub(crate) fn is_user(&self) -> bool {
@@ -532,6 +621,108 @@ impl AllocatorSchema {
         })
     }
 
+    /// Names the fields of `wanted` this schema does not carry, as `Type.Field`.
+    fn absent(&self, wanted: &[(&str, &str)]) -> Vec<String> {
+        wanted
+            .iter()
+            .filter(|(type_name, field)| self.field(type_name, field).is_err())
+            .map(|(type_name, field)| format!("{type_name}.{field}"))
+            .collect()
+    }
+
+    /// Which VS representation this schema describes, decided by the fields it carries.
+    ///
+    /// An `Err` is the `detail` of a [`LayoutError::Unsupported`], phrased for whoever reads it
+    /// next. That reader is the point: the previous message said only that no family was
+    /// complete, which reads as a symbol problem, and the first diagnosis of one renamed field
+    /// went to `.reload /f nt` and a PDB check before anyone compared a field name. Naming what
+    /// each family wanted and what was missing puts the rename in the message itself.
+    pub(crate) fn vs_shape(&self) -> Result<VsShape, String> {
+        let inline_absent = self.absent(INLINE_VS_FIELDS);
+        let affinity_absent = self.absent(AFFINITY_VS_FIELDS);
+
+        let backs: Vec<(&str, usize)> = SLOT_BACK_REFERENCES
+            .iter()
+            .filter_map(|field| {
+                self.field("_HEAP_VS_AFFINITY_SLOT", field)
+                    .ok()
+                    .map(|offset| (*field, offset))
+            })
+            .collect();
+
+        match (inline_absent.is_empty(), affinity_absent.is_empty()) {
+            (true, true) => Err(format!(
+                "both VS structural families are present and the layout is ambiguous \
+                 (inline: {}; affinity slots: {})",
+                INLINE_VS_FIELDS
+                    .iter()
+                    .map(|(ty, field)| format!("{ty}.{field}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                AFFINITY_VS_FIELDS
+                    .iter()
+                    .map(|(ty, field)| format!("{ty}.{field}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )),
+            (true, false) => Ok(VsShape::Inline {
+                tree: self
+                    .field("_HEAP_VS_CONTEXT", "FreeChunkTree")
+                    .map_err(|error| error.to_string())?,
+                delay: self.field("_HEAP_VS_CONTEXT", "DelayFreeContext").ok(),
+            }),
+            (false, true) => {
+                let back = match backs.as_slice() {
+                    [("VsContext", offset)] => SlotBackReference::Address(*offset),
+                    [("VsContextOffset", offset)] => SlotBackReference::Displacement(*offset),
+                    [] => {
+                        return Err(format!(
+                            "no recognized VS structural family is complete: the affinity-slot \
+                             shape resolved except for how a slot names its context — \
+                             _HEAP_VS_AFFINITY_SLOT carries none of {}",
+                            SLOT_BACK_REFERENCES.join(", "),
+                        ));
+                    }
+                    several => {
+                        return Err(format!(
+                            "_HEAP_VS_AFFINITY_SLOT carries {}, so which one names the context is \
+                             ambiguous and the layout is ambiguous with it",
+                            several
+                                .iter()
+                                .map(|(field, _)| *field)
+                                .collect::<Vec<_>>()
+                                .join(" and "),
+                        ));
+                    }
+                };
+                Ok(VsShape::AffinitySlots {
+                    slot_map_ref: self
+                        .field("_HEAP_VS_CONTEXT", "SlotMapRef")
+                        .map_err(|error| error.to_string())?,
+                    affinity_mask: self
+                        .field("_HEAP_VS_CONTEXT", "AffinityMask")
+                        .map_err(|error| error.to_string())?,
+                    slot_ref: self
+                        .field("_HEAP_VS_SLOT_MAP", "SlotRef")
+                        .map_err(|error| error.to_string())?,
+                    tree: self
+                        .field("_HEAP_VS_AFFINITY_SLOT", "FreeChunkTree")
+                        .map_err(|error| error.to_string())?,
+                    delay: self
+                        .field("_HEAP_VS_AFFINITY_SLOT", "DelayFreeContext")
+                        .ok(),
+                    back,
+                })
+            }
+            (false, false) => Err(format!(
+                "no recognized VS structural family is complete: inline wants {}, affinity slots \
+                 want {}",
+                inline_absent.join(", "),
+                affinity_absent.join(", "),
+            )),
+        }
+    }
+
     pub(crate) fn provenance(
         &self,
         module: ModuleIdentity,
@@ -545,36 +736,12 @@ impl AllocatorSchema {
         }
         facts.sort_unstable();
         let fingerprint = fingerprint(facts.iter().map(String::as_str));
-        let inline = [
-            ("_HEAP_VS_CONTEXT", "FreeChunkTree"),
-            ("_HEAP_VS_CONTEXT", "DelayFreeContext"),
-        ]
-        .into_iter()
-        .all(|(ty, field)| self.field(ty, field).is_ok());
-        let affinity = [
-            ("_HEAP_VS_CONTEXT", "SlotMapRef"),
-            ("_HEAP_VS_CONTEXT", "AffinityMask"),
-            ("_HEAP_VS_AFFINITY_SLOT", "VsContext"),
-            ("_HEAP_VS_AFFINITY_SLOT", "FreeChunkTree"),
-            ("_HEAP_VS_AFFINITY_SLOT", "DelayFreeContext"),
-            ("_HEAP_VS_SLOT_MAP", "SlotRef"),
-        ]
-        .into_iter()
-        .all(|(ty, field)| self.field(ty, field).is_ok());
-        let semantic_family = match (inline, affinity) {
-            (true, false) => VsSemanticFamily::Inline,
-            (false, true) => VsSemanticFamily::AffinitySlots,
-            (false, false) => {
+        let semantic_family = match self.vs_shape() {
+            Ok(shape) => shape.family(),
+            Err(detail) => {
                 return Err(LayoutError::Unsupported {
                     fingerprint,
-                    detail: "no recognized VS structural family is complete".into(),
-                });
-            }
-            (true, true) => {
-                return Err(LayoutError::Unsupported {
-                    fingerprint,
-                    detail: "both VS structural families are present and the layout is ambiguous"
-                        .into(),
+                    detail,
                 });
             }
         };
@@ -665,11 +832,24 @@ mod tests {
         missing_global: Option<&'static str>,
         missing_type: Option<&'static str>,
         missing_field: Option<(&'static str, &'static str)>,
+        /// Fields this PDB does not carry, for a double that has to withhold more than one.
+        ///
+        /// `missing_field` withholds exactly one, which is all a test about a single tolerated
+        /// field needs. Modelling a *build* takes several at once: this double answers every name
+        /// in the tables, so left alone it completes two VS families and the layout is ambiguous —
+        /// which no shipped PDB is. Naming the fields a build lacks is what makes a double one
+        /// build rather than the union of all of them.
+        missing_fields: &'static [(&'static str, &'static str)],
     }
 
     impl FakeSymbols {
         fn error<T>() -> Result<T, DbgEngError> {
             Err(DbgEngError::InvalidCommand)
+        }
+
+        fn withholds(&self, type_name: &str, canonical: &str) -> bool {
+            self.missing_field == Some((type_name, canonical))
+                || self.missing_fields.contains(&(type_name, canonical))
         }
 
         fn field_value(name: &str) -> u32 {
@@ -692,7 +872,7 @@ mod tests {
                 .iter()
                 .find(|(_, aliases)| aliases.contains(&name))
             {
-                if self.missing_field == Some((spec.name, canonical))
+                if self.withholds(spec.name, canonical)
                     || (self.fallback_aliases && aliases.len() > 1 && name == aliases[0])
                 {
                     return Self::error();
@@ -706,7 +886,7 @@ mod tests {
                         *type_name == spec.name && aliases.contains(&name)
                     })
             {
-                if self.missing_field == Some((spec.name, canonical))
+                if self.withholds(spec.name, canonical)
                     || (self.fallback_aliases && aliases.len() > 1 && name == aliases[0])
                 {
                     return Self::error();
@@ -1295,6 +1475,174 @@ mod tests {
         map.size = 4;
         map.fields.insert("SlotRef", 0);
         layout
+    }
+
+    /// The same affinity-slot family as [`affinity_vs_fixture`], on a build that names the
+    /// back-reference `VsContextOffset` and stores `slot - context` in it.
+    fn self_relative_vs_fixture() -> PoolLayout {
+        let mut layout = affinity_vs_fixture();
+        let slot = layout.types.get_mut("_HEAP_VS_AFFINITY_SLOT").unwrap();
+        slot.fields.remove("VsContext");
+        slot.fields.insert("VsContextOffset", 0);
+        layout
+    }
+
+    /// What one shipped build's PDB does not carry: a type it predates, and fields it spells
+    /// differently or does not have.
+    ///
+    /// Needed because this double otherwise answers every name in the tables at once, which is no
+    /// build at all: it completes two VS families and is refused as ambiguous.
+    struct Build {
+        absent_type: Option<&'static str>,
+        absent_fields: &'static [(&'static str, &'static str)],
+    }
+
+    /// Pre-26100 and early 26100: the tree is in the context, and `_HEAP_VS_AFFINITY_SLOT` does
+    /// not exist yet — which is the fact that distinguishes this build, rather than any field.
+    const INLINE_BUILD: Build = Build {
+        absent_type: Some("_HEAP_VS_AFFINITY_SLOT"),
+        absent_fields: &[],
+    };
+
+    /// 26100 from the affinity-slot move to mid-2026: a slot names its context by address.
+    const ADDRESS_SLOT_BUILD: Build = Build {
+        absent_type: None,
+        absent_fields: &[
+            ("_HEAP_VS_CONTEXT", "FreeChunkTree"),
+            ("_HEAP_VS_CONTEXT", "DelayFreeContext"),
+            ("_HEAP_VS_AFFINITY_SLOT", "VsContextOffset"),
+        ],
+    };
+
+    /// 26100.33438 and 26200: the same slot map, the back-reference a displacement.
+    const DISPLACEMENT_SLOT_BUILD: Build = Build {
+        absent_type: None,
+        absent_fields: &[
+            ("_HEAP_VS_CONTEXT", "FreeChunkTree"),
+            ("_HEAP_VS_CONTEXT", "DelayFreeContext"),
+            ("_HEAP_VS_AFFINITY_SLOT", "VsContext"),
+        ],
+    };
+
+    fn build_symbols(build: &Build) -> FakeSymbols {
+        FakeSymbols {
+            optional_fields: true,
+            missing_type: build.absent_type,
+            missing_fields: build.absent_fields,
+            ..FakeSymbols::default()
+        }
+    }
+
+    /// Every shipped shape resolves, and each is decoded by its own rule.
+    ///
+    /// Three at once is the requirement, not a transition: a debugger host is pointed at whatever
+    /// build it is pointed at, and support for one shape is never withdrawn because another
+    /// appeared.
+    #[test]
+    fn test_every_shipped_vs_shape_resolves_from_the_fields_its_build_carries() {
+        for (build, expected) in [
+            (&INLINE_BUILD, VsSemanticFamily::Inline),
+            (&ADDRESS_SLOT_BUILD, VsSemanticFamily::AffinitySlots),
+            (
+                &DISPLACEMENT_SLOT_BUILD,
+                VsSemanticFamily::AffinitySlotsSelfRelative,
+            ),
+        ] {
+            let layout = PoolLayout::resolve(&build_symbols(build), key()).unwrap();
+
+            let provenance = layout.provenance(pdb_module(0x1111_2222)).unwrap();
+
+            assert_eq!(
+                provenance.semantic_family,
+                expected,
+                "the {} build should decode as {expected:?}",
+                expected.as_str()
+            );
+        }
+    }
+
+    /// The fields an older build carries resolve to exactly what they resolved to before the
+    /// self-relative shape existed — the same offsets, and therefore the same fingerprint.
+    ///
+    /// Pinned as literals recorded from the code *before* that shape was added, which is the only
+    /// thing that makes this a back-compat check rather than a restatement of what the code now
+    /// does. A digest that moves means an older target is being described differently, and a
+    /// caller comparing two runs across this change would read the difference as the target's.
+    ///
+    /// Not pinned on `FakeSymbols::default()`: the default double answers no optional field, so
+    /// an inline layout built on it used to pick up a stray `_HEAP_VS_AFFINITY_SLOT.VsContext`
+    /// through the *required* table and no longer does. That moves the synthetic digest while no
+    /// real build's moves, which is an artefact of the double rather than a regression.
+    #[test]
+    fn test_an_older_builds_schema_is_unchanged_by_the_self_relative_shape() {
+        for (build, recorded) in [
+            (&INLINE_BUILD, "fnv1a64:235676a22d0ccd01"),
+            (&ADDRESS_SLOT_BUILD, "fnv1a64:0084246676dae038"),
+        ] {
+            let layout = PoolLayout::resolve(&build_symbols(build), key()).unwrap();
+
+            let provenance = layout.provenance(pdb_module(0x1111_2222)).unwrap();
+
+            assert_eq!(
+                provenance.fingerprint,
+                recorded,
+                "the schema resolved for the {} build has changed",
+                provenance.semantic_family.as_str()
+            );
+        }
+    }
+
+    /// A PDB carrying both spellings is refused rather than decoded by precedence.
+    ///
+    /// No shipped build does this, which is the point: if one ever does, the two fields cannot
+    /// both be the back-reference and picking one would be a guess. Refusing says so.
+    #[test]
+    fn test_a_slot_carrying_both_back_references_is_ambiguous() {
+        let mut both = self_relative_vs_fixture();
+        both.types
+            .get_mut("_HEAP_VS_AFFINITY_SLOT")
+            .unwrap()
+            .fields
+            .insert("VsContext", 0);
+
+        let error = both
+            .provenance(pdb_module(0xdead_beef))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("layout is ambiguous"), "{error}");
+        assert!(error.contains("VsContextOffset"), "{error}");
+    }
+
+    /// The refusal names the fields that were missing, because the message is the diagnosis.
+    ///
+    /// One renamed field refused a whole build, and the message said only that no family was
+    /// complete — which reads as a symbol problem. The first diagnosis of it went to
+    /// `.reload /f nt` and a PDB check before anyone compared a field name (`windbg-mcp`
+    /// FOLLOWUPS item 78). A message that names what it wanted ends that at the first read.
+    #[test]
+    fn test_an_unsupported_layout_names_the_fields_it_wanted() {
+        let mut renamed = self_relative_vs_fixture();
+        renamed
+            .types
+            .get_mut("_HEAP_VS_AFFINITY_SLOT")
+            .unwrap()
+            .fields
+            .remove("VsContextOffset");
+
+        let error = renamed
+            .provenance(pdb_module(0xdead_beef))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("no recognized VS structural family is complete"),
+            "{error}"
+        );
+        assert!(
+            error.contains("VsContextOffset") && error.contains("VsContext"),
+            "the refusal should name the back-references it looked for: {error}"
+        );
     }
 
     #[test]

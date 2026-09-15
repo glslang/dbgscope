@@ -3,13 +3,28 @@
 use crate::dbgeng::ModuleIdentity;
 
 /// Which structurally validated VS representation a schema contains.
+///
+/// Three shapes are in the world at once and a debugger host does not choose which build it is
+/// pointed at, so all three stay live: selection is by the fields a target's own PDB carries, and
+/// never by a build number. `10.0.26100.1742` is still [`Inline`](Self::Inline) while later 26100s
+/// are not, so a build threshold would decode the wrong shape — confidently.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum VsSemanticFamily {
     /// The VS context owns its free tree and delay-free state directly.
     #[default]
     Inline,
-    /// VS state is reached through the context's affinity-slot map.
+    /// VS state is reached through the context's affinity-slot map, and a slot names the context
+    /// it belongs to by its **address**, in `_HEAP_VS_AFFINITY_SLOT::VsContext`.
     AffinitySlots,
+    /// The same slot map, but a slot names its context by **displacement** — `slot - context`, in
+    /// `_HEAP_VS_AFFINITY_SLOT::VsContextOffset`. Measured on `ntdll!RtlpHpVsSlotCreate`, which
+    /// stores exactly that (`sub rax,rdi` against the context the slot was created for), and
+    /// confirmed against a live slot whose stored `0xa80` was both `slot - context` and
+    /// `SlotRef << 6`.
+    ///
+    /// Not an alias of [`AffinitySlots`](Self::AffinitySlots): read as an address, a displacement
+    /// matches no context and every slot is rejected.
+    AffinitySlotsSelfRelative,
 }
 
 impl VsSemanticFamily {
@@ -17,6 +32,7 @@ impl VsSemanticFamily {
         match self {
             Self::Inline => "inline_vs",
             Self::AffinitySlots => "affinity_slot_vs",
+            Self::AffinitySlotsSelfRelative => "affinity_slot_vs_offset",
         }
     }
 }
