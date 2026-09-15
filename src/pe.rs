@@ -212,6 +212,11 @@ impl Image {
                 // padded by `FileAlignment`, and it is not what the loader gives a section in
                 // memory: where it exceeds the rounded virtual size the excess is not separately
                 // mapped, and treating it as extent would run this section into the next one's.
+                //
+                // The power-of-two guard is not the fallback it looks like: `read_image` refuses
+                // an image whose alignment is not one, so this is reachable only for an `Image` a
+                // caller built by hand out of these public fields. It is here so that does not
+                // panic, not as an answer for a corrupt header.
                 let extent = self
                     .section_alignment
                     .is_power_of_two()
@@ -458,9 +463,21 @@ pub fn read_image(
         });
     }
     let size_of_image = u32(&headers, size_of_image_at)?;
+
     // `SectionAlignment` sits at the same offset in both shapes, as `SizeOfImage` does: the five
     // fields PE32+ widens are all after it.
     let section_alignment = u32(&headers, optional + 32)?;
+    // **Refused rather than fallen back from.** A loader maps in powers of two and will not load
+    // an image whose alignment is not one, so this is a header that cannot be what it says. The
+    // fallback that was here -- treat it as absent and use each section's exact `VirtualSize` --
+    // reproduced the very under-reporting the alignment is read for: an executable tail in no
+    // range, and a scan that looks complete without it. There is no figure to answer with when
+    // the unit is unknown, so this answers with none.
+    if !section_alignment.is_power_of_two() {
+        return Err(PeError::Malformed {
+            reason: "the section alignment is not a unit a loader maps in",
+        });
+    }
 
     // **The data directories are declared, not assumed.** `NumberOfRvaAndSizes` says how many the
     // image carries and `SizeOfOptionalHeader` says how much room there is for them; an entry is
@@ -655,11 +672,18 @@ pub fn read_imports(
         // A bound import: real slots, no lookup table, names only in the IAT. Recorded by name
         // rather than skipped, so a caller can say "this library's imports are not nameable here"
         // instead of reporting a driver that imports less than it does.
+        let pointer = image.bitness.pointer();
         if lookup == 0 {
+            // **Bounded before it is believed, though nothing here reads it.** This branch used to
+            // return with only the zero check behind it, so a bound import whose `FirstThunk`
+            // points past the image was reported as a library this could not name rather than as
+            // an image that does not hold together. That is the same rule the named path follows
+            // one loop below, where a slot is checked *because a caller attributes the address to
+            // this image* -- and it is no less true of a descriptor whose slots are never listed.
+            image.checked_va(iat, pointer)?;
             table.unnamed_libraries.push(library);
             continue;
         }
-        let pointer = image.bitness.pointer();
 
         let mut library_terminated = false;
         for slot_index in 0..MAX_IMPORTS_PER_LIBRARY {
@@ -1410,6 +1434,50 @@ mod tests {
             vec![BASE + 0x1000..BASE + 0x2800],
             "rounding up does not escape SizeOfImage"
         );
+    }
+
+    /// A bound import's address table is bounded too, though its slots are never listed.
+    ///
+    /// A descriptor with no lookup table is a bound import, and this records the library by name
+    /// rather than skipping it. It used to record it with nothing having checked `FirstThunk`
+    /// beyond its being non-zero, so an image pointing that table past its own end came back as
+    /// one this merely could not name every import of. The named path one loop below bounds a slot
+    /// *because a caller attributes the address to this image*, which is no less true of a
+    /// descriptor whose slots are never listed.
+    #[test]
+    fn test_a_bound_imports_address_table_is_bounded_as_well() {
+        let mut fake = driver_image();
+        put(&mut fake.bytes, 0x2000, &0u32.to_le_bytes()); // no lookup table: a bound import
+        put(&mut fake.bytes, 0x2010, &0x9000u32.to_le_bytes()); // an IAT past SizeOfImage
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_imports(&image, |at, len| fake.read(at, len), || false),
+            Err(PeError::Malformed {
+                reason: "an image offset points outside the image",
+            })
+        );
+    }
+
+    /// A section alignment that is not a unit a loader maps in refuses the image.
+    ///
+    /// **Not a fallback to `VirtualSize`, which is what this did first.** Falling back reproduced
+    /// the under-reporting the alignment is read for: the mapped executable tail in no range, and
+    /// a scan that looks complete without it. There is no figure to answer with when the unit is
+    /// unknown, so the answer is none.
+    #[test]
+    fn test_a_section_alignment_that_is_not_a_power_of_two_is_refused() {
+        for bad in [0u32, 3, 0x1001] {
+            let mut fake = driver_image();
+            put(&mut fake.bytes, 0xf8 + 32, &bad.to_le_bytes());
+            assert_eq!(
+                read_image(BASE, |at, len| fake.read(at, len)),
+                Err(PeError::Malformed {
+                    reason: "the section alignment is not a unit a loader maps in",
+                }),
+                "alignment {bad:#x}"
+            );
+        }
     }
 
     /// The rule this module exists for: an import is named without its slot ever being read.
