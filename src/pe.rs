@@ -378,6 +378,30 @@ pub fn read_image(
             });
         }
     };
+    // **`Machine` and `Magic` have to agree, where this knows what the machine implies.** They are
+    // two independent declarations of one fact, and everything below is keyed on the second alone:
+    // the directory count, the directories themselves and the width of a thunk. So flipping the
+    // magic of an x64 image to PE32 -- one byte, in a header an untrusted driver's own code can
+    // reach -- sends the directory count to `optional + 92`, which in a PE32+ header is part of a
+    // field that is zero there, and the image is then reported as importing nothing. Confidently,
+    // with no read having failed: the same silent wrong answer the import directory's own bound is
+    // for.
+    //
+    // An unrecognised machine is **not** refused. This list is the machines whose width is known,
+    // not the machines that exist, and refusing everything absent from it would turn a future
+    // architecture into a corrupt image.
+    let implied = match machine {
+        0x014c | 0x01c4 => Some(Bitness::Bits32), // I386, ARMNT
+        0x8664 | 0xaa64 | 0x0200 => Some(Bitness::Bits64), // AMD64, ARM64, IA64
+        _ => None,
+    };
+
+    if implied.is_some_and(|width| width != bitness) {
+        return Err(PeError::Malformed {
+            reason: "the machine and the optional header disagree about the image's width",
+        });
+    }
+
     // `SizeOfImage`, the directory count and the directories themselves sit at different offsets
     // in the two shapes, because PE32+ widens five fields between them.
     let (size_of_image_at, count_at, directories_at) = match bitness {
@@ -1155,6 +1179,46 @@ mod tests {
                 reason: "the import directory runs past the end of the image",
             })
         );
+    }
+
+    /// A header whose machine and magic disagree is refused, not read as the magic says.
+    ///
+    /// **One byte, and the driver imports nothing.** `Machine` and `Magic` declare the same fact
+    /// twice, and everything downstream is keyed on the second alone -- the directory count, the
+    /// directories, the width of a thunk. Flip an x64 image's magic to PE32 and the count is read
+    /// from `optional + 92`, which in a PE32+ header is inside a field that is zero there, so the
+    /// image reports no data directories and therefore no imports. Nothing fails; a hazard scan
+    /// sees a driver that imports nothing.
+    ///
+    /// An unrecognised machine is deliberately *not* refused -- see the list in `read_image`,
+    /// which is the machines whose width is known rather than the machines that exist.
+    #[test]
+    fn test_a_machine_and_magic_that_disagree_are_refused() {
+        let mut fake = driver_image();
+        // The fixture is AMD64; say PE32 in the optional header and leave the machine alone.
+        put(&mut fake.bytes, 0xf8, &0x10bu16.to_le_bytes());
+
+        assert_eq!(
+            read_image(BASE, |at, len| fake.read(at, len)),
+            Err(PeError::Malformed {
+                reason: "the machine and the optional header disagree about the image's width",
+            })
+        );
+    }
+
+    /// And a machine this does not recognise is still parsed, on the magic's word.
+    ///
+    /// The pair above is a contradiction between two things this knows; an unknown machine is not
+    /// a contradiction, and refusing it would make a future architecture a corrupt image.
+    #[test]
+    fn test_an_unrecognised_machine_is_read_rather_than_refused() {
+        let mut fake = driver_image();
+        put(&mut fake.bytes, 0xe4, &0x5032u16.to_le_bytes());
+
+        let image = read_image(BASE, |at, len| fake.read(at, len))
+            .expect("an unknown machine is not a contradiction");
+        assert_eq!(image.machine, 0x5032);
+        assert_eq!(image.bitness, Bitness::Bits64);
     }
 
     /// The rule this module exists for: an import is named without its slot ever being read.
