@@ -294,11 +294,26 @@ pub enum UpcaseFrom {
 /// and a directory holds tens of them. A name that is entirely ASCII -- which is nearly every name
 /// in the namespace -- reads nothing and remembers nothing.
 pub struct Upcase<'a> {
-    /// The target's table and the memory to reach it through, or [`None`] for the host's fold.
-    target: Option<(&'a dyn Memory, UpcaseTable)>,
+    /// The target's table and what it takes to read it, or [`None`] for the host's fold.
+    target: Option<TargetTable<'a>>,
     /// What has been resolved so far. Behind a [`RefCell`] because folding happens through `&self`
     /// -- the walk holds one of these and compares names from inside an iterator.
     known: RefCell<Known>,
+}
+
+/// A target's table: where it is, how to read it, and how wide a pointer is on the way.
+#[derive(Clone, Copy)]
+struct TargetTable<'a> {
+    memory: &'a dyn Memory,
+    table: UpcaseTable,
+    /// A pointer's width on **this target**, which is [`Layout::pointer`]'s figure and is derived
+    /// from the target's own structures rather than assumed from the host.
+    ///
+    /// Carried here because the table is reached through a pointer, and a 32-bit kernel debugged
+    /// from a 64-bit host keeps its pointers at four. Reading eight there takes four bytes of
+    /// table pointer and four of whatever follows it -- see [`Upcase::base`] for what that
+    /// produced before this field existed.
+    pointer: usize,
 }
 
 /// The table's address once it has been asked for, and the units folded through it.
@@ -316,9 +331,16 @@ struct Known {
 
 impl<'a> Upcase<'a> {
     /// The fold performed against **the target's** table, falling back to this host's.
-    pub fn of_target(memory: &'a dyn Memory, table: UpcaseTable) -> Self {
+    /// `pointer` is a pointer's width on the target, in bytes -- [`Layout::pointer`], which
+    /// derives it from the target's own structures. Any width but 4 or 8 folds on the host, since
+    /// a table this cannot read a pointer to is a table it cannot reach.
+    pub fn of_target(memory: &'a dyn Memory, table: UpcaseTable, pointer: usize) -> Self {
         Self {
-            target: Some((memory, table)),
+            target: Some(TargetTable {
+                memory,
+                table,
+                pointer,
+            }),
             known: RefCell::default(),
         }
     }
@@ -393,7 +415,7 @@ impl<'a> Upcase<'a> {
 
     /// One code unit at or above `U+00C0`, from whichever table answers.
     fn uncached(&self, unit: u16) -> u16 {
-        let (Some((memory, _)), Some(base)) = (self.target, self.base()) else {
+        let (Some(target), Some(base)) = (self.target, self.base()) else {
             return Self::on_host(unit);
         };
         // **The routine's own null check, and the one place a miss is not a fallback.**
@@ -405,7 +427,7 @@ impl<'a> Upcase<'a> {
         if base == 0 {
             return unit;
         }
-        match Self::from_table(memory, base, unit) {
+        match Self::from_table(target.memory, base, unit) {
             Some(folded) => folded,
             // **A table that would not read is not a target that does not fold.** The reads above
             // are of a structure this located by symbol, so a miss is a page that was out or an
@@ -435,21 +457,38 @@ impl<'a> Upcase<'a> {
         if let Some(asked) = self.known.borrow().base {
             return asked;
         }
-        let (memory, table) = self.target?;
-        let at = table
+        let target = self.target?;
+        let at = target
+            .table
             .silo_globals
-            .wrapping_add(u64::from(table.nls_state))
-            .wrapping_add(u64::from(table.upcase_table));
-        // Eight bytes, because a target with an object namespace to walk is a kernel and this
-        // reads a kernel pointer. A 32-bit kernel read from a 64-bit debugger keeps its pointers
-        // at four, which `Layout::pointer` knows and this does not -- so on one of those this
-        // takes four bytes of table pointer and four of whatever follows, the address does not
-        // read, and the fold falls back to the host with `source()` saying so.
-        let base = memory.read(at, 8).and_then(|bytes| {
-            bytes
-                .first_chunk::<8>()
-                .map(|eight| u64::from_le_bytes(*eight))
-        });
+            .wrapping_add(u64::from(target.table.nls_state))
+            .wrapping_add(u64::from(target.table.upcase_table));
+        // **At the target's pointer width, not this host's**, and it is the one read here that
+        // could not be got right by degrading. This used to take eight bytes unconditionally, on
+        // the reasoning that a 32-bit kernel would then yield an address that does not read and
+        // fall back to the host -- which was a guess about the four bytes that follow the pointer,
+        // written as though it were a fact. When they happen to read, the eight-byte value is a
+        // plausible address assembled from two unrelated halves; the trie walk then succeeds
+        // against whatever is there and returns folds that are simply wrong, with nothing having
+        // failed and `source()` reporting `Target`. A silently wrong fold presented as the
+        // target's own answer is the exact failure this whole change exists to prevent, so the
+        // width is carried rather than assumed.
+        let base = match target.pointer {
+            4 => target.memory.read(at, 4).and_then(|bytes| {
+                bytes
+                    .first_chunk::<4>()
+                    .map(|four| u64::from(u32::from_le_bytes(*four)))
+            }),
+            8 => target.memory.read(at, 8).and_then(|bytes| {
+                bytes
+                    .first_chunk::<8>()
+                    .map(|eight| u64::from_le_bytes(*eight))
+            }),
+            // [`Layout::check`] refuses any other width before a [`Namespace`] is built, so this
+            // is reachable only through [`Self::of_target`] directly. A width this cannot read a
+            // pointer at is a table it cannot reach, which is what [`UpcaseFrom::Host`] says.
+            _ => None,
+        };
         self.known.borrow_mut().base = Some(base);
         base
     }
@@ -759,7 +798,7 @@ impl<'a> Namespace<'a> {
         // this target resolved. That is the same rule `needs` states for the other globals: an
         // operation pays for what it reads.
         let upcase = match globals.upcase {
-            Some(table) => Upcase::of_target(memory, table),
+            Some(table) => Upcase::of_target(memory, table, layout.pointer),
             None => Upcase::of_host(),
         };
         Ok(Self {
@@ -1798,10 +1837,10 @@ mod tests {
             );
         }
 
-        /// A `u16` element of the table, addressed the way the routine addresses one: an index of
-        /// **elements from the base**, scaled by two.
-        fn element(&mut self, index: u32, value: u16) {
-            self.put(TABLE + u64::from(index) * 2, &value.to_le_bytes());
+        /// A `u16` element of a table at `base`, addressed the way the routine addresses one: an
+        /// index of **elements from the base**, scaled by two.
+        fn element(&mut self, base: u64, index: u32, value: u16) {
+            self.put(base + u64::from(index) * 2, &value.to_le_bytes());
         }
     }
 
@@ -1822,23 +1861,29 @@ mod tests {
     ///
     /// and the one unit that moves is `U+00E9`, by `delta`.
     fn one_fold_table(delta: u16) -> Fake {
+        one_fold_table_at(TABLE, delta)
+    }
+
+    /// The same table, laid out at an arbitrary base -- which is what a 32-bit target needs, its
+    /// table living at an address a four-byte pointer can hold.
+    fn one_fold_table_at(base: u64, delta: u16) -> Fake {
         let mut fake = Fake::default();
-        fake.nls_pointer(TABLE);
+        fake.nls_pointer(base);
         // Level one: every high byte but 0x00 reaches the block that folds nothing.
         for high in 0..=0xffu32 {
-            fake.element(high, 0x100);
+            fake.element(base, high, 0x100);
         }
-        fake.element(0x00, 0x120);
+        fake.element(base, 0x00, 0x120);
         // The shared level-two block, and the leaves it reaches.
         for nibble in 0..0x10u32 {
-            fake.element(0x100 + nibble, 0x110);
-            fake.element(0x110 + nibble, 0);
+            fake.element(base, 0x100 + nibble, 0x110);
+            fake.element(base, 0x110 + nibble, 0);
             // High byte 0x00's own level two, which differs in one nibble.
-            fake.element(0x120 + nibble, 0x110);
-            fake.element(0x130 + nibble, 0);
+            fake.element(base, 0x120 + nibble, 0x110);
+            fake.element(base, 0x130 + nibble, 0);
         }
-        fake.element(0x120 + 0xe, 0x130);
-        fake.element(0x130 + 0x9, delta);
+        fake.element(base, 0x120 + 0xe, 0x130);
+        fake.element(base, 0x130 + 0x9, delta);
         fake
     }
 
@@ -1851,7 +1896,7 @@ mod tests {
     #[test]
     fn the_trie_is_walked_from_the_base_and_its_leaf_is_a_delta() {
         let fake = one_fold_table(0xffe0);
-        let upcase = Upcase::of_target(&fake, upcase_globals());
+        let upcase = Upcase::of_target(&fake, upcase_globals(), layout().pointer);
 
         assert_eq!(upcase.source(), UpcaseFrom::Target(TABLE));
         assert_eq!(
@@ -1880,7 +1925,7 @@ mod tests {
     #[test]
     fn the_targets_own_table_answers_and_not_this_hosts() {
         let fake = one_fold_table(0x0001);
-        let upcase = Upcase::of_target(&fake, upcase_globals());
+        let upcase = Upcase::of_target(&fake, upcase_globals(), layout().pointer);
 
         assert_eq!(upcase.unit(0x00e9), 0x00ea);
         assert!(
@@ -1936,7 +1981,7 @@ mod tests {
     fn a_null_table_pointer_folds_no_further_than_ascii() {
         let mut fake = Fake::default();
         fake.nls_pointer(0);
-        let upcase = Upcase::of_target(&fake, upcase_globals());
+        let upcase = Upcase::of_target(&fake, upcase_globals(), layout().pointer);
 
         assert_eq!(upcase.source(), UpcaseFrom::Target(0));
         assert_eq!(upcase.unit(0x00e9), 0x00e9, "no table, so no fold");
@@ -1955,7 +2000,7 @@ mod tests {
     #[test]
     fn a_table_that_cannot_be_reached_falls_back_to_the_host_and_reports_it() {
         let empty = Fake::default();
-        let unreadable = Upcase::of_target(&empty, upcase_globals());
+        let unreadable = Upcase::of_target(&empty, upcase_globals(), layout().pointer);
         assert_eq!(unreadable.source(), UpcaseFrom::Host);
         assert_eq!(
             unreadable.unit(0x00e9),
@@ -1984,7 +2029,7 @@ mod tests {
         let mut fake = Fake::default();
         // The pointer reads; nothing it points at does.
         fake.nls_pointer(TABLE);
-        let upcase = Upcase::of_target(&fake, upcase_globals());
+        let upcase = Upcase::of_target(&fake, upcase_globals(), layout().pointer);
 
         assert_eq!(
             upcase.source(),
@@ -2009,6 +2054,91 @@ mod tests {
             upcase.source(),
             UpcaseFrom::Mixed { at: TABLE },
             "one unit folded on the wrong machine is not undone by a later one that needed no table"
+        );
+    }
+
+    /// A 32-bit target's table pointer is read at **four** bytes, not eight.
+    ///
+    /// **The construction is the whole point, and it is the one an eight-byte read survives.** A
+    /// fixture that left the four bytes after the pointer unmapped would pass either way: the
+    /// eight-byte read would fail, the fold would fall back to the host, and the test could not
+    /// tell a width bug from a missing page. So those four bytes are present and non-zero here,
+    /// which is what a real 32-bit kernel has -- the pointer is followed by the next field, not by
+    /// a hole. An eight-byte read then *succeeds* and yields an address assembled from two
+    /// unrelated halves, and nothing about that failure announces itself.
+    ///
+    /// Read at four, the base is the table, the fold is the target's, and `source()` says so.
+    #[test]
+    fn a_32_bit_targets_table_pointer_is_read_at_its_own_width() {
+        // A table where a 32-bit kernel would keep one, so a four-byte pointer can name it.
+        const TABLE32: u64 = 0x8006_0000;
+        let mut fake = one_fold_table_at(TABLE32, 0x0001);
+        let at = SILO_GLOBALS + u64::from(NLS_STATE) + u64::from(UPCASE_TABLE);
+        // Four bytes of pointer, then four bytes of the field that follows it -- `nls_pointer`
+        // wrote eight, and on a 32-bit target only the first four are the pointer.
+        fake.put(at, &(TABLE32 as u32).to_le_bytes());
+        fake.put(at + 4, &0xdead_beefu32.to_le_bytes());
+
+        let upcase = Upcase::of_target(&fake, upcase_globals(), 4);
+        assert_eq!(
+            upcase.source(),
+            UpcaseFrom::Target(TABLE32),
+            "the pointer is four bytes wide on this target"
+        );
+        assert_eq!(
+            upcase.unit(0x00e9),
+            0x00ea,
+            "and the fold is the one this target's table performs"
+        );
+
+        // The same bytes read at eight: a plausible address out of two unrelated halves, reached
+        // without anything failing. That is what carrying the width prevents.
+        let eight = Upcase::of_target(&fake, upcase_globals(), 8);
+        assert_eq!(
+            eight.source(),
+            UpcaseFrom::Target(0xdead_beef_8006_0000),
+            "which is not where any table is"
+        );
+
+        // And a width this cannot read a pointer at reaches no table at all.
+        let odd = Upcase::of_target(&fake, upcase_globals(), 2);
+        assert_eq!(odd.source(), UpcaseFrom::Host);
+    }
+
+    /// And the **walk** hands the fold the width it derived, rather than a constant.
+    ///
+    /// **A separate test from the one above, because they pin different lines.** That one drives
+    /// [`Upcase::of_target`] with explicit widths, which pins the callee and is silent about every
+    /// caller -- mutating [`Namespace::new`] to pass a literal `8` leaves it green, because it
+    /// never calls it. The width reaching the fold from [`Layout::pointer`] is a property of that
+    /// one line, and this is the test that fails when it is wrong.
+    ///
+    /// `Layout::pointer` is derived from the target's own structures precisely so a 32-bit kernel
+    /// debugged from a 64-bit host is not read at the host's width; a fold that did not take it
+    /// would undo that for the one pointer it reads.
+    #[test]
+    fn the_walk_folds_at_the_pointer_width_its_layout_derived() {
+        const TABLE32: u64 = 0x8006_0000;
+        let mut fake = one_fold_table_at(TABLE32, 0x0001);
+        let at = SILO_GLOBALS + u64::from(NLS_STATE) + u64::from(UPCASE_TABLE);
+        fake.put(at, &(TABLE32 as u32).to_le_bytes());
+        fake.put(at + 4, &0xdead_beefu32.to_le_bytes());
+
+        let narrow = Layout {
+            pointer: 4,
+            ..layout()
+        };
+        let globals = Globals {
+            upcase: Some(upcase_globals()),
+            ..globals()
+        };
+        let namespace = Namespace::new(&fake, narrow, globals)
+            .expect("a four-byte pointer is a width this crate builds");
+
+        assert_eq!(
+            namespace.upcase().source(),
+            UpcaseFrom::Target(TABLE32),
+            "the walk read the table pointer at its own target's width"
         );
     }
 
@@ -2039,7 +2169,7 @@ mod tests {
             inner: &table,
             reads: RefCell::new(0),
         };
-        let upcase = Upcase::of_target(&counting, upcase_globals());
+        let upcase = Upcase::of_target(&counting, upcase_globals(), layout().pointer);
 
         assert!(upcase.same_name("MountPointManager", "MOUNTPOINTMANAGER"));
         assert_eq!(
@@ -2133,7 +2263,7 @@ mod tests {
     fn the_trie_walk_reproduces_the_routine_across_every_code_unit() {
         let host = Upcase::of_host();
         let fake = trie_encoding(|unit| host.unit(unit));
-        let upcase = Upcase::of_target(&fake, upcase_globals());
+        let upcase = Upcase::of_target(&fake, upcase_globals(), layout().pointer);
 
         // **A floor rather than the figure, and the difference is what the figure is a property
         // of.** A fixture whose table moved nothing would pass whatever the walk did, so the count
