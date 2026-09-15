@@ -206,11 +206,14 @@ impl Image {
                 reason: "an image offset points outside the image",
             });
         }
-        self.base
-            .checked_add(u64::from(rva))
-            .ok_or(PeError::Malformed {
-                reason: "an image address overflowed",
-            })
+        // **The whole span is checked, and the start is what comes back.** Checking only
+        // `base + rva` left the length out of it, so a base near the top of the address space
+        // returned `Ok` for a range whose *end* wraps -- and the callers that add the length back
+        // on are the ones that would notice: `executable_ranges` builds `start..start + size`,
+        // which panics in debug and wraps in release into a range that starts above where it ends.
+        // Validating the end here and returning the start means no caller has to know that.
+        va(self.base, end)?;
+        va(self.base, u64::from(rva))
     }
 }
 
@@ -271,16 +274,29 @@ const MAX_IMPORTS_PER_LIBRARY: usize = 8192;
 const MAX_IMPORTS_TOTAL: usize = 16 * 1024;
 const MAX_NAME: usize = 512;
 
+/// An offset from a base, refused rather than wrapped.
+///
+/// **The header phase's half of [`Image::checked_va`]'s job, and the reason that one is described
+/// as the only door with a qualifier now.** It cannot be the only one: a header read happens before
+/// there is an [`Image`] to bound anything against, so [`read_image`] necessarily does its own
+/// address arithmetic. What it does not have to do is that arithmetic *unchecked* -- `base` is the
+/// caller's `u64`, and a base near the top of the address space turned a plain `base + offset` into
+/// a debug-build panic, in a parser whose whole contract is to answer with [`PeError`]. Every
+/// addition of an offset to a base in this module goes through here.
+fn va(base: u64, offset: u64) -> Result<u64, PeError> {
+    base.checked_add(offset).ok_or(PeError::Malformed {
+        reason: "an image address overflowed",
+    })
+}
+
 /// Reads an image's headers and section table.
 pub fn read_image(
     base: u64,
     mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
 ) -> Result<Image, PeError> {
     let mut at = |offset: u64, len: usize| -> Result<Vec<u8>, PeError> {
-        read(base + offset, len).ok_or(PeError::Unreadable {
-            at: base + offset,
-            len,
-        })
+        let address = va(base, offset)?;
+        read(address, len).ok_or(PeError::Unreadable { at: address, len })
     };
 
     let dos = at(0, 0x40)?;
@@ -363,6 +379,20 @@ pub fn read_image(
         });
     }
     let table = lfanew + 24 + optional_size as u64;
+    // **Bounded by `SizeOfImage`, because past it is the next module.** `SizeOfOptionalHeader` is
+    // a `u16` the image declares and `table` is derived from it, so a header claiming 64 KiB of
+    // optional header inside an image that declares 4 KiB puts the section table beyond the image
+    // -- where, on a live target, the read succeeds against whatever is mapped next and its bytes
+    // come back as this image's sections. `code_sections` and `executable_ranges` would then bound
+    // a scan by a neighbour's layout, with nothing in the result to say so. This is the same rule
+    // `checked_va` applies to every RVA; it is here as well because the section table is read
+    // before there is an `Image` to ask.
+    let span = (section_count * 40) as u64;
+    if table.saturating_add(span) > u64::from(size_of_image) {
+        return Err(PeError::Malformed {
+            reason: "the section table runs past the end of the image",
+        });
+    }
     let raw = at(table, section_count * 40)?;
     let mut sections = Vec::with_capacity(section_count);
     for index in 0..section_count {
@@ -850,6 +880,89 @@ mod tests {
             "the walk is stopped by the image bound, not by the narrowing -- if this becomes an \
              arithmetic refusal, the reachability argument in this test has stopped holding"
         );
+    }
+
+    /// A section table reaching past `SizeOfImage` is refused, not read out of the next module.
+    ///
+    /// `SizeOfOptionalHeader` is a `u16` the image declares and the table's offset is derived from
+    /// it, so a header can put its own section table beyond the image it describes. On a live
+    /// target that read *succeeds* -- what is mapped after a driver is another module -- and its
+    /// bytes come back as this image's sections, which is then what `code_sections` and
+    /// `executable_ranges` bound a scan by. Nothing in the result would say so.
+    #[test]
+    fn test_a_section_table_past_the_end_of_the_image_is_refused() {
+        let mut fake = driver_image();
+        // The table sits at 0x1e8 and runs 120 bytes for three sections; declare an image that
+        // ends before it does.
+        put(&mut fake.bytes, 0xf8 + 56, &0x200u32.to_le_bytes());
+
+        assert_eq!(
+            read_image(BASE, |at, len| fake.read(at, len)),
+            Err(PeError::Malformed {
+                reason: "the section table runs past the end of the image",
+            })
+        );
+    }
+
+    /// A base near the top of the address space is an error, not a panic.
+    ///
+    /// `read_image` takes the base as a `u64` from its caller, and the header offsets it adds are
+    /// the image's own. A plain `base + offset` there is a debug-build panic inside a parser whose
+    /// entire contract is to answer with a `PeError` -- the one failure mode a caller cannot catch.
+    #[test]
+    fn test_a_base_that_would_wrap_the_address_space_is_refused() {
+        let read = |address: u64, len: usize| -> Option<Vec<u8>> {
+            // Only the DOS header is ever reached; the read after it is what overflows.
+            let mut out = vec![0u8; len];
+            out[0..2].copy_from_slice(b"MZ");
+            if len > 0x3f {
+                out[0x3c..0x40].copy_from_slice(&0xe0u32.to_le_bytes());
+            }
+            Some(out)
+        };
+
+        assert_eq!(
+            read_image(u64::MAX - 0x10, read),
+            Err(PeError::Malformed {
+                reason: "an image address overflowed",
+            })
+        );
+    }
+
+    /// An RVA whose **span** wraps the address space is refused, though its start does not.
+    ///
+    /// `checked_va` bounds an RVA against `SizeOfImage` and then turns it into an address. Checking
+    /// only `base + rva` left the length out: the start is fine and the end is not, and the
+    /// callers that add the length back on are exactly the ones that would meet it.
+    /// `executable_ranges` builds `start..start + virtual_size`, which panics in debug and in
+    /// release yields a range starting above where it ends -- a range every `contains` answers
+    /// `false` for, so a code scan silently covers nothing.
+    #[test]
+    fn test_an_rva_whose_span_wraps_the_address_space_is_refused() {
+        let image = Image {
+            base: u64::MAX - 0x1000,
+            bitness: Bitness::Bits64,
+            machine: 0x8664,
+            size_of_image: 0x2000,
+            sections: vec![Section {
+                name: ".text".to_string(),
+                rva: 0x1000,
+                virtual_size: 0x1000,
+                characteristics: 0x6000_0020,
+            }],
+            export_directory: (0, 0),
+            import_directory: (0, 0),
+        };
+
+        // The start is inside the image and inside the address space; the end is not.
+        assert_eq!(
+            image.checked_va(0x1000, 0x1000),
+            Err(PeError::Malformed {
+                reason: "an image address overflowed",
+            })
+        );
+        // So the range is dropped rather than built inverted, and nothing panics.
+        assert!(image.executable_ranges().is_empty());
     }
 
     /// The rule this module exists for: an import is named without its slot ever being read.
