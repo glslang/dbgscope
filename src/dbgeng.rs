@@ -3464,6 +3464,28 @@ impl Default for DebugEngine {
 // `the_engine_does_not_cross_threads_and_the_handle_does` is what stops an `unsafe impl` coming
 // back without one.
 
+/// What became of the **target** when its session ended.
+///
+/// Separate from whether the teardown succeeded, which is the `Result` this rides in: a session can
+/// end cleanly and still leave its target in a state the caller has to do something about. That is
+/// not hypothetical for a live kernel and is the case this type exists for -- a kernel detached
+/// while halted stays halted, one CPU stopped and the rest spinning, and nothing downstream could
+/// previously tell that from a kernel left running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetLeft {
+    /// A live kernel that was told to run and then actively detached. It is running.
+    KernelRunning,
+    /// A live kernel the resume did not take on, detached anyway so that nothing holds it.
+    ///
+    /// **It is probably still halted**, and the remedy is another attach and a `qd`. Reported
+    /// rather than raised because the session itself ended: a caller told only "that failed" would
+    /// have no reason to go and look at the guest, which is the one thing worth doing here.
+    KernelHalted,
+    /// Nothing this can speak for: a dump, a trace, or user-mode processes, whose disposition is
+    /// [`DebugEngine::attached_to_a_live_process`] read before the teardown clears it.
+    Unspoken,
+}
+
 impl DebugEngine {
     /// Creates a new instance of the Debug Engine client
     pub fn new() -> Self {
@@ -7423,7 +7445,7 @@ impl DebugEngine {
     /// The first two are **per process**, not per session: DbgEng holds several user-mode targets
     /// at once (`|` lists them), so an engine can hold a service somebody else is running beside a
     /// program it launched itself, and each is let go of on its own terms.
-    pub fn end_session(&self) -> Result<(), DbgEngError> {
+    pub fn end_session(&self) -> Result<TargetLeft, DbgEngError> {
         // The target is going away, so anything cached against it must not be reused for
         // whatever this engine holds next — nor by any other wrapper around this same client,
         // which is why the identity is recorded against the client rather than in this engine.
@@ -7431,9 +7453,18 @@ impl DebugEngine {
         // A live kernel left halted (at a break) and detached *passively* stays FROZEN —
         // one CPU halted, the rest spinning — because a passive detach never tells the
         // target to run. Resume it and actively detach instead, leaving it running.
-        let (session_ended, ended) = if self.is_live_kernel() {
-            let ended = self.resume_and_detach_live_kernel();
-            (ended.is_ok(), ended)
+        let (left, session_ended, ended) = if self.is_live_kernel() {
+            let (resumed, detached) = self.resume_and_detach_live_kernel();
+            // **A failed resume is a disposition, not an error.** The session ended either way, so
+            // returning `Err` here would tell a caller the teardown failed and leave it no way to
+            // learn the one fact it has to act on. `TargetLeft::KernelHalted` is that fact, and the
+            // caller can name the remedy -- attach again and `qd`. `Err` stays for a detach that
+            // did not happen, which is a session still holding its target.
+            let left = match resumed {
+                Ok(()) => TargetLeft::KernelRunning,
+                Err(_) => TargetLeft::KernelHalted,
+            };
+            (left, detached.is_ok(), detached)
         } else {
             // Detached one by one *before* the session ends, which is what makes a mixed session
             // come apart correctly: `EndSession` takes one flag for the whole session, so no
@@ -7442,7 +7473,7 @@ impl DebugEngine {
             let detached = self.detach_attached_processes();
             let ended = unsafe { self.client.EndSession(DEBUG_END_PASSIVE) }
                 .map_err(DbgEngError::OperationFailed);
-            (ended.is_ok(), ended.and(detached))
+            (TargetLeft::Unspoken, ended.is_ok(), ended.and(detached))
         };
         // Both of these are the session's, and both are let go of once it is *confirmed* gone.
         //
@@ -7471,20 +7502,28 @@ impl DebugEngine {
             self.release_deferred_inputs();
             self.forget_pending_opens();
         }
-        ended
+        ended.map(|()| left)
     }
 
     /// Detaches from a live kernel leaving it **running**, not frozen at the last break.
     /// Clears breakpoints (restoring their patched `int3` bytes), sets the target to run,
     /// then does an *active* detach — which, unlike a passive one, communicates with the
     /// target to resume it before disconnecting.
-    fn resume_and_detach_live_kernel(&self) -> Result<(), DbgEngError> {
+    /// Returns the resume's answer and the detach's, separately, because they mean different
+    /// things to a caller and only one of them is about the *target*.
+    ///
+    /// **The resume used to be `let _ =`**, so a kernel that was never told to run was reported as
+    /// released: the detach succeeds whether or not the resume did, and its answer was the only one
+    /// kept. A kernel detached while still halted stays halted -- one CPU stopped, the rest
+    /// spinning -- which is the state this whole function exists to avoid, and it was the one state
+    /// the result could not express.
+    fn resume_and_detach_live_kernel(&self) -> (Result<(), DbgEngError>, Result<(), DbgEngError>) {
         let _ = self.execute_command("bc *");
-        unsafe {
-            let _ = self.control.SetExecutionStatus(DEBUG_STATUS_GO);
-            self.client.EndSession(DEBUG_END_ACTIVE_DETACH)
-        }
-        .map_err(DbgEngError::OperationFailed)
+        let resumed = unsafe { self.control.SetExecutionStatus(DEBUG_STATUS_GO) }
+            .map_err(DbgEngError::OperationFailed);
+        let detached = unsafe { self.client.EndSession(DEBUG_END_ACTIVE_DETACH) }
+            .map_err(DbgEngError::OperationFailed);
+        (resumed, detached)
     }
 
     /// Detaches from every user-mode process this engine **attached** to, leaving each running,
@@ -7603,7 +7642,11 @@ impl Drop for DebugEngine {
         // Don't leave a live kernel frozen at a break if we're torn down without an
         // explicit end_session (e.g. the process exits): resume + actively detach.
         if self.is_live_kernel() {
-            if self.resume_and_detach_live_kernel().is_ok() {
+            // The *detach*'s answer, matching what `end_session` gates on: a resume that did not
+            // take leaves the guest halted, which is a thing to report and not a session still
+            // holding its target -- and there is nobody to report it to on this path anyway.
+            let (_, detached) = self.resume_and_detach_live_kernel();
+            if detached.is_ok() {
                 self.forget_pending_opens();
             }
             return;
