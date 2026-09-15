@@ -50,6 +50,32 @@
 //! whether it is read or merely *reported*, since a slot this never dereferences is still an
 //! address a caller will attribute to this image.
 //!
+//! # What is trusted, and what is not
+//!
+//! Every field below is the *image's* claim about itself, and an image is data this crate did not
+//! write -- on an untrusted driver, data that driver's own code can reach. So each one is either
+//! constrained before it is used or deliberately not, and this is the list rather than a habit,
+//! because eleven review rounds on this module were eleven fields found one at a time.
+//!
+//! **Constrained:** `e_magic` and the PE signature are exact; `e_lfanew` is inside the header
+//! page; `Machine` must agree with `Magic` where the machine's width is known; `NumberOfSections`
+//! is bounded and its table must fit `SizeOfImage`; `SizeOfOptionalHeader` must cover the fields
+//! read out of it; `SectionAlignment` must be a power of two; `NumberOfRvaAndSizes` is bounded by
+//! the optional header's own length; the import directory's declared span must fit the image; a
+//! descriptor's `Name` and `FirstThunk` must be non-zero and in the image; a thunk is an ordinal
+//! with no other bit set, or a name RVA whose hint fits; and a name is text or an error.
+//!
+//! **Not constrained, on purpose:**
+//!
+//! - **`SizeOfImage` itself**, which is the bound every other offset is checked against and is
+//!   therefore the one figure with nothing above it to check. A driver declaring four gigabytes
+//!   makes its own bounds permissive; that is why `windbg-mcp` narrows it to the loader's extent,
+//!   which is the smaller and more trustworthy of the two. A caller that cares should do the same.
+//! - **The export directory**, which is carried as `(rva, size)` and parsed by nothing here. It is
+//!   not bounded because bounding a span this never reads would refuse images over a field with no
+//!   consequence -- a caller that starts parsing it owns that check, the way [`read_imports`] owns
+//!   the import directory's.
+//!
 //! # Where it came from
 //!
 //! Written in `windbg-mcp` ([#296](https://github.com/glslang/windbg-mcp/pull/296)) and lifted here
@@ -731,6 +757,17 @@ pub fn read_imports(
                 Bitness::Bits64 => 1u64 << 63,
             };
             let name = if value & ordinal_flag != 0 {
+                // **Everything between the flag and the ordinal has to be zero.** Masking to the
+                // low sixteen bits answered for any thunk with the flag set, so flipping that one
+                // bit on a *named* thunk of `0x2110` produced ordinal `#8464` -- a number no
+                // import has, returned as one, with the name that was really there lost. An
+                // exact-name scan then misses that API and nothing says why.
+                if value & !(ordinal_flag | 0xffff) != 0 {
+                    return Err(PeError::Malformed {
+                        reason: "an ordinal import sets bits that are neither its flag nor its \
+                                 ordinal",
+                    });
+                }
                 ImportName::Ordinal((value & 0xffff) as u16)
             } else {
                 // IMAGE_IMPORT_BY_NAME: a two-byte hint, then the name.
@@ -829,7 +866,16 @@ fn read_c_string(
         }
         if let Some(end) = chunk.iter().position(|&byte| byte == 0) {
             raw.extend_from_slice(&chunk[..end]);
-            return Ok(String::from_utf8_lossy(&raw).into_owned());
+            // **A name that is not text is an error, not a name with the bad bytes rewritten.**
+            // `from_utf8_lossy` was here, and what it produces is a *rendering*: one corrupt byte
+            // in `ExAllocatePool2` came back as a different string, returned as the name with
+            // nothing saying it had been altered. The one consumer matches these against a sink
+            // list by exact name, so the rendering silently fails to match and a hazardous import
+            // reads as absent -- a lossy form standing in as a key, which is the failure this
+            // crate has already fixed once for pool tags and once for object names.
+            return String::from_utf8(raw).map_err(|_| PeError::Malformed {
+                reason: "an import or library name is not text",
+            });
         }
         raw.extend_from_slice(&chunk);
     }
@@ -1477,6 +1523,72 @@ mod tests {
                 }),
                 "alignment {bad:#x}"
             );
+        }
+    }
+
+    /// A name that is not text is an error, not a name with the bad bytes rewritten.
+    ///
+    /// **A lossy rendering standing in as a key**, which this crate has now got wrong three times
+    /// in three places -- pool tags, object names, and here. `from_utf8_lossy` turns one corrupt
+    /// byte in `ExAllocatePool2` into a *different* string and returns it as the name, with
+    /// nothing marking it altered. The only consumer matches these against a sink list by exact
+    /// name, so the rewritten form fails to match and a hazardous import reads as absent.
+    #[test]
+    fn test_a_name_that_is_not_text_is_refused_rather_than_rewritten() {
+        let mut fake = driver_image();
+        // One byte of `ExAllocatePool2`, replaced by a lone continuation byte.
+        put(&mut fake.bytes, 0x2112 + 2, &[0x80]);
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_imports(&image, |at, len| fake.read(at, len), || false),
+            Err(PeError::Malformed {
+                reason: "an import or library name is not text",
+            })
+        );
+    }
+
+    /// An ordinal thunk carries its flag and its ordinal, and nothing in between.
+    ///
+    /// Masking to the low sixteen bits answered for *any* thunk with the flag set, so a thunk
+    /// carrying a name RVA above `0xffff` -- which is every real one -- came back as a fabricated
+    /// ordinal made of its low half, and the name that was really there was lost. An exact-name
+    /// scan then misses that API with nothing to say why.
+    ///
+    /// **The review that found this proposed `0x2110` with the flag set, and that is not the
+    /// case**: `0x2110` fits the low sixteen bits, so flag-plus-`0x2110` is an ordinary ordinal
+    /// thunk for ordinal 8464 and has to keep reading as one. The rule is about the bits *between*
+    /// the flag and the ordinal, so the fixture sets one -- and the reviewer's own value is pinned
+    /// below as a thunk that must still read, since a fix that refused it would be a new defect.
+    #[test]
+    fn test_an_ordinal_thunk_with_reserved_bits_set_is_refused() {
+        let mut fake = driver_image();
+        // Ordinal flag, a reserved bit at 32, and a low half that would pass for an ordinal.
+        put(
+            &mut fake.bytes,
+            0x2040,
+            &0x8000_0001_0000_2110u64.to_le_bytes(),
+        );
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
+        assert_eq!(
+            read_imports(&image, |at, len| fake.read(at, len), || false),
+            Err(PeError::Malformed {
+                reason: "an ordinal import sets bits that are neither its flag nor its ordinal",
+            })
+        );
+
+        // Flag and low bits only still reads, including the value the review took for malformed.
+        for (thunk, ordinal) in [
+            (0x8000_0000_0000_0007u64, 7u16),
+            (0x8000_0000_0000_2110u64, 0x2110),
+        ] {
+            let mut good = driver_image();
+            put(&mut good.bytes, 0x2040, &thunk.to_le_bytes());
+            let image = read_image(BASE, |at, len| good.read(at, len)).expect("the headers read");
+            let table =
+                read_imports(&image, |at, len| good.read(at, len), || false).expect("reads");
+            assert_eq!(table.imports[0].name, ImportName::Ordinal(ordinal));
         }
     }
 
