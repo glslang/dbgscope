@@ -650,8 +650,38 @@ impl AllocatorSchema {
             })
             .collect();
 
-        match (inline_absent.is_empty(), affinity_absent.is_empty()) {
-            (true, true) => Err(format!(
+        // A PDB spelling the back-reference both ways cannot say which one names the context, and
+        // picking by precedence would be a guess. Asked only once the rest of the shape is there:
+        // two back-references on a slot type whose other fields are missing is an affinity family
+        // that is incomplete anyway, and refusing it would take an inline target down with it.
+        if affinity_absent.is_empty() && backs.len() > 1 {
+            return Err(format!(
+                "_HEAP_VS_AFFINITY_SLOT carries {}, so which one names the context is \
+                 ambiguous and the layout is ambiguous with it",
+                backs
+                    .iter()
+                    .map(|(field, _)| *field)
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+            ));
+        }
+
+        // **The back-reference is part of the affinity family's completeness, not a detail read
+        // after choosing it.** A slot that cannot name the context it was reached from is not a
+        // slot this walk can use, so a schema carrying the slot map and tree without one is not an
+        // affinity layout — and deciding the two families before consulting it made a *valid
+        // inline* layout that also carried those fields read as ambiguous, where it had previously
+        // selected `Inline`. Withdrawing support for a shape that still works is the one direction
+        // this module must not fail in.
+        let affinity = match backs.as_slice() {
+            [("VsContext", offset)] => Some(SlotBackReference::Address(*offset)),
+            [("VsContextOffset", offset)] => Some(SlotBackReference::Displacement(*offset)),
+            _ => None,
+        }
+        .filter(|_| affinity_absent.is_empty());
+
+        match (inline_absent.is_empty(), affinity) {
+            (true, Some(_)) => Err(format!(
                 "both VS structural families are present and the layout is ambiguous \
                  (inline: {}; affinity slots: {})",
                 INLINE_VS_FIELDS
@@ -665,61 +695,49 @@ impl AllocatorSchema {
                     .collect::<Vec<_>>()
                     .join(", "),
             )),
-            (true, false) => Ok(VsShape::Inline {
+            (true, None) => Ok(VsShape::Inline {
                 tree: self
                     .field("_HEAP_VS_CONTEXT", "FreeChunkTree")
                     .map_err(|error| error.to_string())?,
                 delay: self.field("_HEAP_VS_CONTEXT", "DelayFreeContext").ok(),
             }),
-            (false, true) => {
-                let back = match backs.as_slice() {
-                    [("VsContext", offset)] => SlotBackReference::Address(*offset),
-                    [("VsContextOffset", offset)] => SlotBackReference::Displacement(*offset),
-                    [] => {
-                        return Err(format!(
-                            "no recognized VS structural family is complete: the affinity-slot \
-                             shape resolved except for how a slot names its context — \
-                             _HEAP_VS_AFFINITY_SLOT carries none of {}",
-                            SLOT_BACK_REFERENCES.join(", "),
-                        ));
-                    }
-                    several => {
-                        return Err(format!(
-                            "_HEAP_VS_AFFINITY_SLOT carries {}, so which one names the context is \
-                             ambiguous and the layout is ambiguous with it",
-                            several
-                                .iter()
-                                .map(|(field, _)| *field)
-                                .collect::<Vec<_>>()
-                                .join(" and "),
-                        ));
-                    }
-                };
-                Ok(VsShape::AffinitySlots {
-                    slot_map_ref: self
-                        .field("_HEAP_VS_CONTEXT", "SlotMapRef")
-                        .map_err(|error| error.to_string())?,
-                    affinity_mask: self
-                        .field("_HEAP_VS_CONTEXT", "AffinityMask")
-                        .map_err(|error| error.to_string())?,
-                    slot_ref: self
-                        .field("_HEAP_VS_SLOT_MAP", "SlotRef")
-                        .map_err(|error| error.to_string())?,
-                    tree: self
-                        .field("_HEAP_VS_AFFINITY_SLOT", "FreeChunkTree")
-                        .map_err(|error| error.to_string())?,
-                    delay: self
-                        .field("_HEAP_VS_AFFINITY_SLOT", "DelayFreeContext")
-                        .ok(),
-                    back,
-                })
-            }
-            (false, false) => Err(format!(
-                "no recognized VS structural family is complete: inline wants {}, affinity slots \
-                 want {}",
-                inline_absent.join(", "),
-                affinity_absent.join(", "),
-            )),
+            (false, Some(back)) => Ok(VsShape::AffinitySlots {
+                slot_map_ref: self
+                    .field("_HEAP_VS_CONTEXT", "SlotMapRef")
+                    .map_err(|error| error.to_string())?,
+                affinity_mask: self
+                    .field("_HEAP_VS_CONTEXT", "AffinityMask")
+                    .map_err(|error| error.to_string())?,
+                slot_ref: self
+                    .field("_HEAP_VS_SLOT_MAP", "SlotRef")
+                    .map_err(|error| error.to_string())?,
+                tree: self
+                    .field("_HEAP_VS_AFFINITY_SLOT", "FreeChunkTree")
+                    .map_err(|error| error.to_string())?,
+                delay: self
+                    .field("_HEAP_VS_AFFINITY_SLOT", "DelayFreeContext")
+                    .ok(),
+                back,
+            }),
+            // The affinity half of this message distinguishes the two ways it falls short, because
+            // they are different diagnoses: fields missing is a shape this build does not have,
+            // while every field but the back-reference is the shape having been *renamed* again —
+            // which is the case that cost a day the first time it happened.
+            (false, None) => Err(if affinity_absent.is_empty() {
+                format!(
+                    "no recognized VS structural family is complete: the affinity-slot shape \
+                     resolved except for how a slot names its context — _HEAP_VS_AFFINITY_SLOT \
+                     carries none of {}",
+                    SLOT_BACK_REFERENCES.join(", "),
+                )
+            } else {
+                format!(
+                    "no recognized VS structural family is complete: inline wants {}, affinity \
+                     slots want {}",
+                    inline_absent.join(", "),
+                    affinity_absent.join(", "),
+                )
+            }),
         }
     }
 
@@ -1590,6 +1608,33 @@ mod tests {
                 provenance.semantic_family.as_str()
             );
         }
+    }
+
+    /// An inline layout that *also* carries the slot map and tree, with no back-reference on the
+    /// slot, is **inline** — not an ambiguity.
+    ///
+    /// The affinity shape is not complete without exactly one way for a slot to name its context,
+    /// so a schema like this offers one complete family and one incomplete one. Deciding the two
+    /// families from their field lists *before* consulting the back-reference made it read as two
+    /// complete families, which refused a target the previous code decoded — the one direction
+    /// this module must not fail in. Raised on dbgscope#167 and true: `VsContext` used to sit in
+    /// the affinity completeness list, so the same schema selected `Inline` before the rename.
+    #[test]
+    fn test_an_inline_layout_carrying_slot_fields_without_a_back_reference_is_inline() {
+        let mut layout = affinity_vs_fixture();
+        let context = layout.types.get_mut("_HEAP_VS_CONTEXT").unwrap();
+        context.fields.insert("FreeChunkTree", 0x10);
+        context.fields.insert("DelayFreeContext", 0x40);
+        layout
+            .types
+            .get_mut("_HEAP_VS_AFFINITY_SLOT")
+            .unwrap()
+            .fields
+            .remove("VsContext");
+
+        let provenance = layout.provenance(pdb_module(0x1111_2222)).unwrap();
+
+        assert_eq!(provenance.semantic_family, VsSemanticFamily::Inline);
     }
 
     /// A PDB carrying both spellings is refused rather than decoded by precedence.
