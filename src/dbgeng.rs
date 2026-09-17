@@ -135,6 +135,25 @@ pub enum DbgEngError {
     #[error("requested debugger buffer is too large: {0} bytes")]
     BufferTooLarge(usize),
 
+    /// The **host** ran out of room for the answer, rather than the target running out of bytes.
+    ///
+    /// Distinct from [`Self::BufferTooLarge`], which is a size this crate refuses at the door
+    /// because it cannot express it; this is one it accepted and could not hold. Reported rather
+    /// than left to abort because Rust's default reaction to a failed allocation is to take the
+    /// process down, and a host that asked a debugger to read a range is owed an error — the same
+    /// rule that makes every call here answer `Result` instead of panicking. It carries how far
+    /// the read had got, because that is the difference between a request that was never
+    /// affordable and one whose target had more to give than this machine can hold.
+    #[error(
+        "ran out of memory reading {requested} bytes at {address:#x}: {read} bytes were read \
+         before the host could not hold any more"
+    )]
+    OutOfMemory {
+        address: u64,
+        requested: usize,
+        read: usize,
+    },
+
     /// A decode was asked for on an instruction set this build does not decode. Its own error
     /// rather than a COM one, because no call failed: the question cannot be answered here.
     #[error("this build does not decode instructions for machine {machine:#x}")]
@@ -1387,6 +1406,24 @@ fn read_chunk_len(address: u64, done: usize, size: usize) -> usize {
 /// could not is a `ReadVirtual` that fails outright part-way through a range whose start was
 /// readable; it is reported as the short read rather than as its `HRESULT`, which loses the
 /// engine's own text and keeps the two paths answering in one shape.
+/// A zeroed buffer of `len` bytes for a read of `requested` bytes at `address` — or
+/// [`DbgEngError::OutOfMemory`] rather than the abort a plain `vec![0; len]` would be.
+///
+/// `address` and `requested` are carried only so the error can name the read it was for; a bare
+/// "out of memory" is the same sentence whichever call produced it.
+fn try_buffer(len: usize, address: u64, requested: usize) -> Result<Vec<u8>, DbgEngError> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(len)
+        .map_err(|_| DbgEngError::OutOfMemory {
+            address,
+            requested,
+            read: 0,
+        })?;
+    buffer.resize(len, 0);
+    Ok(buffer)
+}
+
 fn read_chunked(
     address: u64,
     size: usize,
@@ -1400,8 +1437,15 @@ fn read_chunked(
     // allocator where a caller is owed a `Result`. A read cut short after one page now holds one
     // page rather than a truncated megabyte. What it costs is the reallocation of a doubling
     // `Vec`, against a read whose every chunk is a debugger round trip.
+    //
+    // **And each growth is asked for fallibly.** A geometric `Vec` reaching for twice what it
+    // holds is the largest allocation this function makes, it is made *after* a caller's request
+    // was accepted, and Rust's default reaction to a failed one is to take the process down.
+    // Growing incrementally moves that hazard rather than removing it — raised in review on
+    // dbgscope#168, on the change that introduced the growth — so the reservation is where a host
+    // running out of room becomes [`DbgEngError::OutOfMemory`] instead of an abort.
     let mut bytes = Vec::new();
-    let mut chunk = vec![0u8; READ_CHUNK_BYTES.min(size)];
+    let mut chunk = try_buffer(READ_CHUNK_BYTES.min(size), address, size)?;
     let short = |done: usize| DbgEngError::ShortRead {
         address,
         requested: size,
@@ -1430,6 +1474,13 @@ fn read_chunked(
             Err(_) if done > 0 => return Err(short(done)),
             Err(source) => return Err(source),
         };
+        bytes
+            .try_reserve(read)
+            .map_err(|_| DbgEngError::OutOfMemory {
+                address,
+                requested: size,
+                read: done,
+            })?;
         bytes.extend_from_slice(&chunk[..read]);
         if read < len {
             return Err(short(bytes.len()));
@@ -3881,7 +3932,10 @@ impl DebugEngine {
     /// [`Self::read_memory_bounded`], which is the same read in pieces.
     pub fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>, DbgEngError> {
         u32::try_from(size).map_err(|_| DbgEngError::BufferTooLarge(size))?;
-        let mut buffer = vec![0; size];
+        // Fallibly, for the reason [`Self::read_memory_bounded`]'s growth is: `size` is a caller's
+        // number and a `vec![0; size]` it cannot hold takes the process down rather than failing
+        // the call. Half a class fix is the one that gets found later.
+        let mut buffer = try_buffer(size, address, size)?;
         let read = self.read_virtual_into(address, &mut buffer)?;
         if read != size {
             return Err(DbgEngError::ShortRead {
@@ -3917,10 +3971,10 @@ impl DebugEngine {
     /// same move `pool::snapshot`'s `read_extent` makes for the same reason, and the extra calls
     /// and the assembling cost little enough to be free at the scale this is for: 1 MiB of `ntdll`
     /// out of a local user-mode target — the fastest reads there are, so the worst ratio — took
-    /// 404–423µs as one `ReadVirtual` and 911–923µs as 256 of them, three runs of
-    /// `test_a_bounded_read_costs_little_against_an_unbounded_one` on dbgeng 10.0.26100.1. Half a
-    /// millisecond, against the link where that same megabyte is the tens of seconds dbgscope#95
-    /// is about.
+    /// 486–581µs as one `ReadVirtual` and 735–768µs as 256 of them, three **release** runs of
+    /// `test_a_bounded_read_costs_little_against_an_unbounded_one` on dbgeng 10.0.26100.1. A
+    /// quarter of a millisecond, against the link where that same megabyte is the tens of seconds
+    /// dbgscope#95 is about.
     ///
     /// **What the bound does not reach is one chunk.** A read of at most [`READ_CHUNK_BYTES`]
     /// within a page is a single `ReadVirtual` with nothing between its start and its return, so a
@@ -9025,6 +9079,11 @@ mod tests {
     /// property. A regression that made chunking *expensive* — a sleep, a lock per chunk — shows up
     /// in the printed figure, which is what it is printed for.
     ///
+    /// **Run it `--release` when quoting it**, which the doc comments that quote it say. A debug
+    /// `Vec::resize` fills a buffer an element at a time, so the unbounded read's own allocation
+    /// measures at five times its optimised cost and the comparison becomes one between profiles
+    /// rather than between designs.
+    ///
     /// Ignored: needs a live target; see the note by the other live-debuggee tests.
     /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_a_bounded_read_costs_little`
     #[cfg(not(miri))]
@@ -9195,6 +9254,44 @@ mod tests {
             read.bytes.len(),
             read.bytes.capacity()
         );
+    }
+
+    /// **A buffer the host cannot give is an error, not an abort**, and it names the read it was
+    /// for.
+    ///
+    /// Rust's default reaction to a failed allocation is to take the process down, which on a path
+    /// whose whole contract is `Result<_, DbgEngError>` turns a caller's bad number into a dead
+    /// host. Raised in review on dbgscope#168, twice: once for the buffer sized from the request
+    /// and once for the growth that replaced it.
+    ///
+    /// **What this can drive is the reservation refusing, not the allocator failing.** A length
+    /// past what a `Vec` can even index is turned away by `try_reserve_exact` without asking the
+    /// allocator anything, so what is asserted is that the refusal becomes this error rather than
+    /// a panic — the mechanism, at the one point a test can reach it. A genuine out-of-memory needs
+    /// a host that is out of memory, and nothing here stages one.
+    #[test]
+    fn test_a_buffer_the_host_cannot_give_is_an_error_not_an_abort() {
+        let error = try_buffer(usize::MAX, 0x7_0000, 1024)
+            .expect_err("a buffer larger than the address space was handed back as a buffer");
+
+        match error {
+            DbgEngError::OutOfMemory {
+                address,
+                requested,
+                read,
+            } => {
+                assert_eq!(
+                    address, 0x7_0000,
+                    "the error did not name the read it was for"
+                );
+                assert_eq!(requested, 1024);
+                assert_eq!(
+                    read, 0,
+                    "nothing had been read when the buffer was asked for"
+                );
+            }
+            other => panic!("a buffer that could not be reserved was reported as {other:?}"),
+        }
     }
 
     /// **A read that finished is never reported cut short**, however close to the bound it ran.
