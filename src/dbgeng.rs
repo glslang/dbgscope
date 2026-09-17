@@ -1393,21 +1393,28 @@ fn read_chunked(
     mut halt: impl FnMut() -> Option<Interruption>,
     mut read_chunk: impl FnMut(u64, &mut [u8]) -> Result<usize, DbgEngError>,
 ) -> Result<MemoryRead, DbgEngError> {
-    let mut bytes = vec![0u8; size];
-    let mut done = 0usize;
+    // **The answer grows with the read, and the only buffer sized up front is one chunk.** A
+    // `vec![0; size]` here would be an allocation and a zeroing of the *request* before the first
+    // deadline check — time outside the one-chunk residual this whole design is a promise about,
+    // and, for a `size` near the `u32` ceiling this is called behind, an abort inside the
+    // allocator where a caller is owed a `Result`. A read cut short after one page now holds one
+    // page rather than a truncated megabyte. What it costs is the reallocation of a doubling
+    // `Vec`, against a read whose every chunk is a debugger round trip.
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0u8; READ_CHUNK_BYTES.min(size)];
     let short = |done: usize| DbgEngError::ShortRead {
         address,
         requested: size,
         actual: done,
     };
-    while done < size {
+    while bytes.len() < size {
         if let Some(cut_short) = halt() {
-            bytes.truncate(done);
             return Ok(MemoryRead {
                 bytes,
                 cut_short: Some(cut_short),
             });
         }
+        let done = bytes.len();
         // A range whose end wraps past the top of the address space is one no target can answer
         // for. It stops here as a short read rather than being refused at the door, because that
         // is what it is — the bytes below the wrap were read — and `done` is necessarily non-zero
@@ -1416,16 +1423,16 @@ fn read_chunked(
             return Err(short(done));
         };
         let len = read_chunk_len(address, done, size);
-        let read = match read_chunk(at, &mut bytes[done..done + len]) {
-            // Clamped, because a reader claiming more than the slice it was handed would walk
-            // `done` past `size` and slice out of range on the next turn.
+        let read = match read_chunk(at, &mut chunk[..len]) {
+            // Clamped, because a reader claiming more than the slice it was handed would have the
+            // bytes past `len` taken from whatever the *previous* chunk left in this buffer.
             Ok(read) => read.min(len),
             Err(_) if done > 0 => return Err(short(done)),
             Err(source) => return Err(source),
         };
-        done += read;
+        bytes.extend_from_slice(&chunk[..read]);
         if read < len {
-            return Err(short(done));
+            return Err(short(bytes.len()));
         }
     }
     Ok(MemoryRead {
@@ -3908,12 +3915,12 @@ impl DebugEngine {
     ///
     /// So the bound here is one this crate can keep without that answer. Splitting the range is the
     /// same move `pool::snapshot`'s `read_extent` makes for the same reason, and the extra calls
-    /// cost little enough to be free at the scale this is for: 1 MiB of `ntdll` out of a local
-    /// user-mode target — the fastest reads there are, so the worst ratio — took 410–450µs as one
-    /// `ReadVirtual` and 630–680µs as 256 of them, three runs of
-    /// `test_a_bounded_read_costs_little_against_an_unbounded_one` on dbgeng 10.0.26100.1. A
-    /// quarter of a millisecond, against the link where that same megabyte is the tens of seconds
-    /// dbgscope#95 is about.
+    /// and the assembling cost little enough to be free at the scale this is for: 1 MiB of `ntdll`
+    /// out of a local user-mode target — the fastest reads there are, so the worst ratio — took
+    /// 404–423µs as one `ReadVirtual` and 911–923µs as 256 of them, three runs of
+    /// `test_a_bounded_read_costs_little_against_an_unbounded_one` on dbgeng 10.0.26100.1. Half a
+    /// millisecond, against the link where that same megabyte is the tens of seconds dbgscope#95
+    /// is about.
     ///
     /// **What the bound does not reach is one chunk.** A read of at most [`READ_CHUNK_BYTES`]
     /// within a page is a single `ReadVirtual` with nothing between its start and its return, so a
@@ -9148,6 +9155,45 @@ mod tests {
                 (BASE + READ_CHUNK_BYTES as u64, READ_CHUNK_BYTES)
             ],
             "the stop did not land between two chunks"
+        );
+    }
+
+    /// **A read cut short holds what it read, not what it asked for.**
+    ///
+    /// The buffer follows the read rather than the request, which is two facts and only one of
+    /// them is memory. The other is *time*: allocating and zeroing the request up front happens
+    /// before the first deadline check, so a large `size` spends time outside the one-chunk
+    /// residual [`DebugEngine::read_memory_bounded`] promises — and near the `u32` ceiling it is an
+    /// abort inside the allocator on a path whose contract is a `Result`. Raised in review on
+    /// dbgscope#168.
+    ///
+    /// Asserted on capacity, which is the only observable a `Vec` offers here. It is deliberately
+    /// a wide margin rather than an exact figure: a growing `Vec` is entitled to over-allocate,
+    /// and what this is about is 64 MiB against a few pages.
+    #[test]
+    fn test_a_read_cut_short_holds_what_it_read_not_what_it_asked_for() {
+        const HUGE: usize = 64 * 1024 * 1024;
+        let calls = RefCell::new(Vec::new());
+        let polls = RefCell::new(0usize);
+        let read = read_chunked(
+            0x6_0000,
+            HUGE,
+            || {
+                let mut polls = polls.borrow_mut();
+                *polls += 1;
+                (*polls == 3).then_some(Interruption::Deadline { after_ms: 1 })
+            },
+            recording_reader(&calls),
+        )
+        .expect("read failed");
+
+        assert_eq!(read.bytes.len(), 2 * READ_CHUNK_BYTES);
+        assert!(
+            read.bytes.capacity() < HUGE / 8,
+            "a read cut short after {} bytes is holding a buffer of {} — sized from the request, \
+             which is also an allocation made before the first deadline check",
+            read.bytes.len(),
+            read.bytes.capacity()
         );
     }
 
