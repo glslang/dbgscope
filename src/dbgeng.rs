@@ -1315,6 +1315,125 @@ impl CommandRun {
     }
 }
 
+/// What a bounded read produced, and whether it got all of it — the same shape as [`CommandRun`],
+/// and for the same reason.
+///
+/// A `Vec<u8>` alone cannot answer "is this the range I asked for?", and a read cut short is
+/// exactly the case where the bytes look like an answer and are not: a caller decoding a structure
+/// out of them would read its tail from zeroes that were never filled. So the bytes are truncated
+/// to what was actually read, and `cut_short` says why there are no more.
+///
+/// Not an `Err`, for the reason [`CommandRun`] is not: the bytes up to the stop are real, and on a
+/// read that spent a caller's whole budget getting them they are the only copy.
+#[derive(Debug, Clone)]
+pub struct MemoryRead {
+    /// The bytes read, contiguous from the address asked for. Shorter than the request exactly
+    /// when [`Self::cut_short`] is `Some` — a range the *target* could not answer for is a
+    /// [`DbgEngError::ShortRead`] instead, as it is for [`DebugEngine::read_memory`].
+    pub bytes: Vec<u8>,
+    /// `None` when the whole range was read.
+    pub cut_short: Option<Interruption>,
+}
+
+/// How much of a bounded read to ask the engine for per `ReadVirtual`.
+///
+/// **This sets the residual overshoot, and that is the whole guarantee.** A bounded read is not
+/// bounded the way [`DebugEngine::execute_command_bounded`] is — see
+/// [`DebugEngine::read_memory_bounded`] for why no watchdog is armed — so the deadline is observed
+/// *between* transfers, and a read can finish one of them past its budget. One page is the
+/// smallest useful unit to build that residual from: it is what the target's memory is readable or
+/// not in, so a chunk that starts page-aligned either comes back whole or fails at its first byte,
+/// and the total a cut-short read reports is the same total a single `ReadVirtual` of the same
+/// range would have.
+///
+/// The same technique as `pool::snapshot`'s `EXTENT_READ_CHUNK`, sized for a different promise.
+/// That one bounds a *walk* — thousands of reads, where the budget is a ceiling on total effort
+/// and 256 KiB a chunk keeps a megabyte-scale extent to a handful of transfers. This one bounds a
+/// *single call* whose caller has told somebody else when it will be done, so the residual is the
+/// figure that matters and the transfer count is not.
+const READ_CHUNK_BYTES: usize = 4096;
+
+/// How many bytes the next chunk of a read covers: up to the end of the page `done` bytes in, and
+/// never past what is left.
+///
+/// The first chunk is trimmed to the page boundary rather than taking a whole
+/// [`READ_CHUNK_BYTES`], which is what makes every chunk after it lie **within** one page. Without
+/// that trim an unaligned read would have every chunk straddle two pages, so a chunk whose second
+/// page is a hole would come back short and stop the read a page earlier than the range allows —
+/// reporting a smaller total than a single `ReadVirtual` of it.
+fn read_chunk_len(address: u64, done: usize, size: usize) -> usize {
+    let at = address.wrapping_add(done as u64);
+    let to_page_end = READ_CHUNK_BYTES - (at as usize % READ_CHUNK_BYTES);
+    size.saturating_sub(done).min(to_page_end)
+}
+
+/// Reads `size` bytes from `address` a chunk at a time, asking `halt` before each one whether to
+/// stop.
+///
+/// A free function taking the read as a closure, for the reason [`Watchdog::arm`] takes its break
+/// as one: it is what lets the rules below be asserted without a debuggee, over a reader that can
+/// be made to come back short, to fail, or to outlast a deadline on demand.
+///
+/// **The check sits before each read, never after**, so the residual is one chunk and a read that
+/// finished everything is never reported cut short. Checking afterwards would turn a complete
+/// read's `cut_short` into a `Some` with nothing missing, which is the manufactured incompleteness
+/// `docs/unknown-not-absent.md` names as the same lie from the other side.
+///
+/// **A chunk that comes back short, or fails with bytes already in hand, is the
+/// [`DbgEngError::ShortRead`] a single `ReadVirtual` of the whole range would have produced** —
+/// same `requested`, same `actual`, because that is what happened: the read reached that far and
+/// no further. A failure on the *first* chunk is propagated as itself, since nothing was read and
+/// there is no short read to report. The one case reading in pieces can see that a single call
+/// could not is a `ReadVirtual` that fails outright part-way through a range whose start was
+/// readable; it is reported as the short read rather than as its `HRESULT`, which loses the
+/// engine's own text and keeps the two paths answering in one shape.
+fn read_chunked(
+    address: u64,
+    size: usize,
+    mut halt: impl FnMut() -> Option<Interruption>,
+    mut read_chunk: impl FnMut(u64, &mut [u8]) -> Result<usize, DbgEngError>,
+) -> Result<MemoryRead, DbgEngError> {
+    let mut bytes = vec![0u8; size];
+    let mut done = 0usize;
+    let short = |done: usize| DbgEngError::ShortRead {
+        address,
+        requested: size,
+        actual: done,
+    };
+    while done < size {
+        if let Some(cut_short) = halt() {
+            bytes.truncate(done);
+            return Ok(MemoryRead {
+                bytes,
+                cut_short: Some(cut_short),
+            });
+        }
+        // A range whose end wraps past the top of the address space is one no target can answer
+        // for. It stops here as a short read rather than being refused at the door, because that
+        // is what it is — the bytes below the wrap were read — and `done` is necessarily non-zero
+        // by the time it can happen: only the *end* of a range can wrap, never its start.
+        let Some(at) = address.checked_add(done as u64) else {
+            return Err(short(done));
+        };
+        let len = read_chunk_len(address, done, size);
+        let read = match read_chunk(at, &mut bytes[done..done + len]) {
+            // Clamped, because a reader claiming more than the slice it was handed would walk
+            // `done` past `size` and slice out of range on the next turn.
+            Ok(read) => read.min(len),
+            Err(_) if done > 0 => return Err(short(done)),
+            Err(source) => return Err(source),
+        };
+        done += read;
+        if read < len {
+            return Err(short(done));
+        }
+    }
+    Ok(MemoryRead {
+        bytes,
+        cut_short: None,
+    })
+}
+
 /// `DEBUG_INVALID_OFFSET` from `dbgeng.h`: the engine's "there is no address here".
 ///
 /// Spelled out because the `windows` crate does not generate it, and the value matters — a
@@ -3723,14 +3842,18 @@ impl DebugEngine {
         identity_of(&self.client)
     }
 
-    pub fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>, DbgEngError> {
+    /// One `ReadVirtual` into `into`, answering how many bytes it filled.
+    ///
+    /// The single place this crate calls `ReadVirtual`, so the whole-range read below and the
+    /// chunked one beside it cannot drift in how they ask or in what they make of a failure.
+    fn read_virtual_into(&self, address: u64, into: &mut [u8]) -> Result<usize, DbgEngError> {
+        let size = into.len();
         let size_u32 = u32::try_from(size).map_err(|_| DbgEngError::BufferTooLarge(size))?;
-        let mut buffer = vec![0; size];
         let mut read = 0u32;
         unsafe {
             self.dataspaces.ReadVirtual(
                 address,
-                buffer.as_mut_ptr().cast(),
+                into.as_mut_ptr().cast(),
                 size_u32,
                 Some(&mut read),
             )
@@ -3739,15 +3862,105 @@ impl DebugEngine {
             operation: format!("reading {size} bytes of virtual memory at {address:#x}"),
             source,
         })?;
-        if read as usize != size {
+        Ok(read as usize)
+    }
+
+    /// Reads `size` bytes of target virtual memory, all of it or none.
+    ///
+    /// **Unbounded**, and deliberately so: this is the read every walker in this crate is built on
+    /// — one per free-tree node, per list entry, per object directory entry — where the caller's
+    /// deadline is polled *between* reads and a bound inside each one would be a lock and a clock
+    /// read on the hottest path there is. A caller that needs the bound inside the read wants
+    /// [`Self::read_memory_bounded`], which is the same read in pieces.
+    pub fn read_memory(&self, address: u64, size: usize) -> Result<Vec<u8>, DbgEngError> {
+        u32::try_from(size).map_err(|_| DbgEngError::BufferTooLarge(size))?;
+        let mut buffer = vec![0; size];
+        let read = self.read_virtual_into(address, &mut buffer)?;
+        if read != size {
             return Err(DbgEngError::ShortRead {
                 address,
                 requested: size,
-                actual: read as usize,
+                actual: read,
             });
         }
 
         Ok(buffer)
+    }
+
+    /// Like [`Self::read_memory`], but **bounded**: the range is read a page at a time and the
+    /// deadline is checked before each one, so a read that outlasts `budget_ms` comes back with
+    /// what it had rather than with the session held until the target gets round to it.
+    ///
+    /// Returns [`MemoryRead`]: the bytes, **and** whether that is all of them. `budget_ms == 0`
+    /// asks for no deadline (the parallel of [`Self::execute_command_bounded`]), which still buys
+    /// the other half of this — a host's [`InterruptHandle::interrupt`] is read between chunks
+    /// too, so a megabyte over a slow link is no longer a call nobody can stop.
+    ///
+    /// # Why this is not the watchdog the two other bounded operations use
+    ///
+    /// [`Self::execute_command_bounded`] and every [`Bound::Watchdog`] wait get their bound from a
+    /// thread that `SetInterrupt`s the engine at the deadline. That works because `Execute` and
+    /// `WaitForEvent` poll for the break — it is what WinDbg's Ctrl+Break drives. `ReadVirtual` is
+    /// neither, and Microsoft documents no interrupt polling in it; whether a break reaches one in
+    /// progress is not something this crate knows, and the target it would have to be measured on
+    /// is a live kernel behind a link slow enough for a read to sit in — see [`Bound::Watchdog`]'s
+    /// own limitation for the other place `SetInterrupt` turned out not to reach.
+    ///
+    /// So the bound here is one this crate can keep without that answer. Splitting the range is the
+    /// same move `pool::snapshot`'s `read_extent` makes for the same reason, and the extra calls
+    /// cost little enough to be free at the scale this is for: 1 MiB of `ntdll` out of a local
+    /// user-mode target — the fastest reads there are, so the worst ratio — took 410–450µs as one
+    /// `ReadVirtual` and 630–680µs as 256 of them, three runs of
+    /// `test_a_bounded_read_costs_little_against_an_unbounded_one` on dbgeng 10.0.26100.1. A
+    /// quarter of a millisecond, against the link where that same megabyte is the tens of seconds
+    /// dbgscope#95 is about.
+    ///
+    /// **What the bound does not reach is one chunk.** A read of at most [`READ_CHUNK_BYTES`]
+    /// within a page is a single `ReadVirtual` with nothing between its start and its return, so a
+    /// caller asking for sixteen bytes has a bound in name only — which is the honest shape of it,
+    /// and harmless where such a read is one round trip anyway. What the budget rules out is the
+    /// *megabyte*: 1 MiB is 256 checks, so the overshoot is a page's worth of link time rather
+    /// than a megabyte's.
+    pub fn read_memory_bounded(
+        &self,
+        address: u64,
+        size: usize,
+        budget_ms: u32,
+    ) -> Result<MemoryRead, DbgEngError> {
+        u32::try_from(size).map_err(|_| DbgEngError::BufferTooLarge(size))?;
+        // A request that arrives from here on names this read and only this one, exactly as it
+        // does for a bounded command: a break aimed at whatever ran before is invisible to it, so
+        // nothing can cut this read short on somebody else's account.
+        let operation = self.begin_operation();
+        let deadline = (budget_ms > 0)
+            .then(|| Instant::now().checked_add(Duration::from_millis(u64::from(budget_ms))))
+            .flatten();
+        let read = read_chunked(
+            address,
+            size,
+            || {
+                // The deadline is asked first, so the one caller who is both out of time and being
+                // asked to stop is told the thing it can act on. A request left unread here is not
+                // lost: it stays filed against this operation, and `Operation::drop` discards it
+                // and drains the engine's pending break.
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Some(Interruption::Deadline {
+                        after_ms: budget_ms,
+                    });
+                }
+                operation
+                    .took_break_request()
+                    .then_some(Interruption::OnRequest)
+            },
+            |at, into| self.read_virtual_into(at, into),
+        );
+        // A request this read *took* is this read's to account for, so the `SetInterrupt` behind it
+        // is drained here rather than left pending to break into whatever runs next — the same
+        // policy, at the same point in it, as the bounded command path's.
+        if matches!(&read, Ok(read) if read.cut_short == Some(Interruption::OnRequest)) {
+            let _ = self.interrupted();
+        }
+        read
     }
 
     pub fn kernel_base(&self) -> Result<u64, DbgEngError> {
@@ -8790,6 +9003,380 @@ mod tests {
         );
 
         let _ = e.end_session();
+    }
+
+    /// **A bounded read answers exactly what an unbounded one does**, and what the extra calls cost.
+    ///
+    /// Reading in pieces is only invisible if it is: the same bytes, and nothing reported cut short
+    /// for a read that finished. The timing is the other half — [`READ_CHUNK_BYTES`] and
+    /// [`DebugEngine::read_memory_bounded`] both quote it, and a figure quoted in prose has to come
+    /// from somewhere that can be re-run.
+    ///
+    /// **Not a performance gate.** It prints the two times rather than asserting a ratio between
+    /// them: the number is an observation about one machine and one target, and a threshold here
+    /// would fail on a slower host for no defect. What it asserts is the equivalence, which is the
+    /// property. A regression that made chunking *expensive* — a sleep, a lock per chunk — shows up
+    /// in the printed figure, which is what it is printed for.
+    ///
+    /// Ignored: needs a live target; see the note by the other live-debuggee tests.
+    /// `cargo test --lib -- --ignored --nocapture --test-threads=1 test_a_bounded_read_costs_little`
+    #[cfg(not(miri))]
+    #[test]
+    #[ignore = "needs a live debuggee; run manually with --ignored"]
+    fn test_a_bounded_read_costs_little_against_an_unbounded_one() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+
+        // Its own image: mapped all the way down, and large enough to be the megabyte-scale read
+        // the bound exists for. A heap range would be neither reliably.
+        let ntdll = e
+            .modules()
+            .expect("modules failed")
+            .into_iter()
+            .find(|module| module.name.to_ascii_lowercase().contains("ntdll"))
+            .expect("the target has no ntdll to read");
+        let size = (ntdll.size as usize).min(1024 * 1024);
+        assert!(
+            size > 16 * READ_CHUNK_BYTES,
+            "ntdll is {size} bytes here, which is too few chunks to measure"
+        );
+
+        // Warmed, so the figures compare two reads of the same cached range rather than the first
+        // read of it against the second.
+        let _ = e
+            .read_memory(ntdll.base, size)
+            .expect("ntdll's image did not read whole");
+
+        let at = Instant::now();
+        let whole = e
+            .read_memory(ntdll.base, size)
+            .expect("unbounded read failed");
+        let unbounded = at.elapsed();
+
+        let at = Instant::now();
+        let pieces = e
+            .read_memory_bounded(ntdll.base, size, 60_000)
+            .expect("bounded read failed");
+        let bounded = at.elapsed();
+
+        assert_eq!(
+            pieces.cut_short, None,
+            "a read that finished well inside a 60s budget reported itself cut short"
+        );
+        assert_eq!(
+            pieces.bytes, whole,
+            "reading in pieces did not produce the bytes one call does"
+        );
+
+        println!(
+            "{size} bytes in {} chunks: one call {unbounded:?}, chunked {bounded:?}",
+            size.div_ceil(READ_CHUNK_BYTES)
+        );
+
+        let _ = e.end_session();
+    }
+
+    /// A reader that fills every byte with a function of **its own address**, and records what it
+    /// was asked for.
+    ///
+    /// The address-derived fill is what makes the assembled buffer testable: a `read_chunked` that
+    /// dropped a chunk, repeated one, or wrote it at the wrong offset produces bytes that no
+    /// longer match the range, where a constant fill would look identical either way.
+    fn recording_reader(
+        calls: &RefCell<Vec<(u64, usize)>>,
+    ) -> impl FnMut(u64, &mut [u8]) -> Result<usize, DbgEngError> + '_ {
+        move |at, into| {
+            calls.borrow_mut().push((at, into.len()));
+            for (offset, byte) in into.iter_mut().enumerate() {
+                *byte = at.wrapping_add(offset as u64) as u8;
+            }
+            Ok(into.len())
+        }
+    }
+
+    /// What [`recording_reader`] must have produced for `size` bytes from `address`.
+    fn expected_bytes(address: u64, size: usize) -> Vec<u8> {
+        (0..size)
+            .map(|offset| address.wrapping_add(offset as u64) as u8)
+            .collect()
+    }
+
+    /// **A bounded read stops between chunks, keeps what it had, and says why there is no more.**
+    ///
+    /// The three halves of [`MemoryRead`]'s contract in one case, asserted over a fake reader so
+    /// they run under Miri and so the stop can be placed exactly rather than raced for: a real
+    /// deadline on a real target either fires between two chunks nobody chose or does not fire at
+    /// all.
+    ///
+    /// The bytes are compared against the whole prefix rather than counted, because the count
+    /// alone passes for a reader whose chunks were assembled out of order — the one failure
+    /// reading in pieces can have that a single `ReadVirtual` cannot.
+    #[test]
+    fn test_a_bounded_read_stops_between_chunks_and_keeps_what_it_had() {
+        const BASE: u64 = 0x1_0000;
+        let calls = RefCell::new(Vec::new());
+        let polls = RefCell::new(0usize);
+        let read = read_chunked(
+            BASE,
+            4 * READ_CHUNK_BYTES,
+            || {
+                let mut polls = polls.borrow_mut();
+                *polls += 1;
+                // Two chunks read, then out of time.
+                (*polls == 3).then_some(Interruption::Deadline { after_ms: 250 })
+            },
+            recording_reader(&calls),
+        )
+        .expect("a read cut short reports its stop rather than failing");
+
+        assert_eq!(
+            read.cut_short,
+            Some(Interruption::Deadline { after_ms: 250 }),
+            "a read that stopped on its deadline did not say so, so its caller reads a short \
+             buffer as the range it asked for"
+        );
+        assert_eq!(
+            read.bytes,
+            expected_bytes(BASE, 2 * READ_CHUNK_BYTES),
+            "the bytes read before the stop are not the prefix of the range asked for"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                (BASE, READ_CHUNK_BYTES),
+                (BASE + READ_CHUNK_BYTES as u64, READ_CHUNK_BYTES)
+            ],
+            "the stop did not land between two chunks"
+        );
+    }
+
+    /// **A read that finished is never reported cut short**, however close to the bound it ran.
+    ///
+    /// The other side of "the check sits before each read": a check *after* the last chunk would
+    /// make this `Some` for a read with nothing missing, and a caller acting on that discards a
+    /// complete answer.
+    #[test]
+    fn test_a_read_that_finished_is_never_reported_cut_short() {
+        const BASE: u64 = 0x2_0000;
+        const SIZE: usize = 3 * READ_CHUNK_BYTES;
+        let calls = RefCell::new(Vec::new());
+        // Halts the moment it is asked — so the only way this read completes is by not being asked
+        // again once the last chunk is in.
+        let read = read_chunked(
+            BASE,
+            SIZE,
+            {
+                let polls = RefCell::new(0usize);
+                move || {
+                    let mut polls = polls.borrow_mut();
+                    *polls += 1;
+                    (*polls > 3).then_some(Interruption::OnRequest)
+                }
+            },
+            recording_reader(&calls),
+        )
+        .expect("read failed");
+
+        assert_eq!(
+            read.cut_short, None,
+            "a complete read reported itself cut short"
+        );
+        assert_eq!(read.bytes, expected_bytes(BASE, SIZE));
+    }
+
+    /// **A read inside one page is one transfer, and the bound cannot reach into it.**
+    ///
+    /// The limit [`DebugEngine::read_memory_bounded`] states, pinned rather than left to the
+    /// prose: a caller reading sixteen bytes gets a `ReadVirtual` with nothing between its start
+    /// and its return. It is asserted because it is the shape of the guarantee — a later change
+    /// that "fixed" it by splitting sub-page reads would buy nothing and cost every small read an
+    /// extra call.
+    #[test]
+    fn test_a_read_inside_one_page_is_one_transfer_the_bound_cannot_reach() {
+        let calls = RefCell::new(Vec::new());
+        let read =
+            read_chunked(0x3_0010, 16, || None, recording_reader(&calls)).expect("read failed");
+
+        assert_eq!(read.bytes.len(), 16);
+        assert_eq!(
+            *calls.borrow(),
+            vec![(0x3_0010, 16)],
+            "a sub-page read was split, which costs a call and bounds nothing"
+        );
+    }
+
+    /// **Every chunk lies within one page**, whatever the range's alignment — including the first,
+    /// which is what its trim to the page boundary buys.
+    ///
+    /// Asserted over the alignments that can go wrong rather than one: a plan that took a full
+    /// [`READ_CHUNK_BYTES`] every time passes at offset zero and straddles a page at every other
+    /// offset.
+    #[test]
+    fn test_every_chunk_lies_within_one_page() {
+        let page = READ_CHUNK_BYTES as u64;
+        for base in [0u64, 1, 8, page - 1, page, page + 1, 3 * page - 8] {
+            for size in [1usize, 16, READ_CHUNK_BYTES, 5 * READ_CHUNK_BYTES + 3] {
+                let address = 0x10_0000 + base;
+                let mut done = 0usize;
+                let mut chunks = Vec::new();
+                while done < size {
+                    let len = read_chunk_len(address, done, size);
+                    assert!(
+                        len > 0,
+                        "a zero-length chunk would never finish {address:#x}+{size}"
+                    );
+                    chunks.push((address + done as u64, len));
+                    done += len;
+                }
+                assert_eq!(
+                    done, size,
+                    "the chunks of {address:#x}+{size} do not cover it"
+                );
+                for (index, (at, len)) in chunks.iter().enumerate() {
+                    assert!(
+                        at / page == (at + *len as u64 - 1) / page,
+                        "chunk {index} of {address:#x}+{size} straddles a page: {at:#x}+{len}"
+                    );
+                    assert!(*len <= READ_CHUNK_BYTES);
+                }
+                // The trim is what buys that, so the first chunk is short exactly when the range
+                // starts unaligned and is long enough to reach the boundary.
+                let (_, first) = chunks[0];
+                assert_eq!(
+                    first,
+                    size.min((page - address % page) as usize),
+                    "the first chunk of {address:#x}+{size} was not trimmed to the page boundary"
+                );
+            }
+        }
+    }
+
+    /// **A short chunk is the short read a single `ReadVirtual` of the whole range would have
+    /// been** — same `requested`, same `actual`.
+    ///
+    /// Which is the point of reading in pieces at all being invisible: a caller that hands a range
+    /// running into a hole must not be able to tell [`DebugEngine::read_memory`] from
+    /// [`DebugEngine::read_memory_bounded`] by the error it gets back.
+    #[test]
+    fn test_a_short_chunk_is_the_short_read_a_single_call_would_have_reported() {
+        const BASE: u64 = 0x4_0000;
+        const SIZE: usize = 4 * READ_CHUNK_BYTES;
+        // The third chunk runs into a hole a third of the way in.
+        const GOT: usize = READ_CHUNK_BYTES / 3;
+        let reads = RefCell::new(0usize);
+        let error = read_chunked(
+            BASE,
+            SIZE,
+            || None,
+            |_, into| {
+                let mut reads = reads.borrow_mut();
+                *reads += 1;
+                Ok(if *reads == 3 { GOT } else { into.len() })
+            },
+        )
+        .expect_err("a range the target cannot answer for is an error, not a cut-short read");
+
+        match error {
+            DbgEngError::ShortRead {
+                address,
+                requested,
+                actual,
+            } => {
+                assert_eq!(address, BASE, "the short read named a chunk, not the range");
+                assert_eq!(
+                    requested, SIZE,
+                    "the short read named a chunk's size, not the range's"
+                );
+                assert_eq!(
+                    actual,
+                    2 * READ_CHUNK_BYTES + GOT,
+                    "the bytes already read were not counted"
+                );
+            }
+            other => panic!("a short chunk was reported as {other:?}"),
+        }
+    }
+
+    /// **A failure on the first chunk is its own error; one after it is the short read.**
+    ///
+    /// The two are different facts and a caller does different things with them: the first says
+    /// the engine refused the read, which a range starting in a hole does and which carries the
+    /// engine's own `HRESULT`; the second says the read got that far, which is all a single call
+    /// would have said either.
+    #[test]
+    fn test_a_first_chunk_that_fails_is_its_own_error_and_a_later_one_is_a_short_read() {
+        const BASE: u64 = 0x5_0000;
+        const SIZE: usize = 3 * READ_CHUNK_BYTES;
+        let fail_at = |nth: usize| {
+            let reads = RefCell::new(0usize);
+            read_chunked(
+                BASE,
+                SIZE,
+                || None,
+                move |_, into| {
+                    let mut reads = reads.borrow_mut();
+                    *reads += 1;
+                    if *reads == nth {
+                        Err(DbgEngError::NoDebuggee)
+                    } else {
+                        Ok(into.len())
+                    }
+                },
+            )
+        };
+
+        assert!(
+            matches!(fail_at(1), Err(DbgEngError::NoDebuggee)),
+            "a read that never got a byte swallowed the engine's reason for refusing it"
+        );
+        assert!(
+            matches!(
+                fail_at(2),
+                Err(DbgEngError::ShortRead {
+                    requested: SIZE,
+                    actual: READ_CHUNK_BYTES,
+                    ..
+                })
+            ),
+            "a chunk that failed with bytes already read was not reported as the short read it is"
+        );
+    }
+
+    /// **A range whose end wraps past the top of the address space stops at the wrap**, rather
+    /// than reading whatever lives at the wrapped address.
+    ///
+    /// Reading in pieces is what makes this reachable at all — a single `ReadVirtual` hands the
+    /// whole range to the engine and lets it refuse — so the guard belongs with the pieces. The
+    /// failure it prevents is silent: bytes taken from address zero, assembled into a buffer whose
+    /// caller believes they came from the top of memory.
+    #[test]
+    fn test_a_range_whose_end_wraps_stops_at_the_wrap() {
+        let address = u64::MAX - READ_CHUNK_BYTES as u64 + 1;
+        let calls = RefCell::new(Vec::new());
+        let error = read_chunked(
+            address,
+            2 * READ_CHUNK_BYTES,
+            || None,
+            recording_reader(&calls),
+        )
+        .expect_err("a range that wraps was read as though it did not");
+
+        assert!(
+            matches!(
+                error,
+                DbgEngError::ShortRead {
+                    actual: READ_CHUNK_BYTES,
+                    ..
+                }
+            ),
+            "a wrapping range reported {error:?} rather than the bytes it did read"
+        );
+        assert_eq!(
+            calls.borrow().len(),
+            1,
+            "the read carried on past the top of the address space"
+        );
     }
 
     /// A spec is born **armed**, which is the opposite of what the engine does and the whole
