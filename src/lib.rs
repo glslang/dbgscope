@@ -49,6 +49,10 @@
 //!   up to the break*. Not an `Err`, which would discard that output — the whole reason to
 //!   interrupt rather than end the session — and not a bare [`String`], because a search cut
 //!   short prints the hits it reached and nothing to say there were more.
+//!   [`MemoryRead`](dbgeng::MemoryRead) is the same shape a page at a time, for a read that ran
+//!   out of budget part way through a range: the bytes it did get, truncated to those actually
+//!   read, and why there are no more. A `Vec<u8>` alone would have its caller decode a structure's
+//!   tail out of zeroes that were never filled.
 //!
 //! * **Tags.** A pool tag is four bytes and its printed form is a lossy rendering: every
 //!   unprintable byte becomes `.`, and so does a literal `.`. The tag stays raw internally,
