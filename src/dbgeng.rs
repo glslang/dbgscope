@@ -2341,6 +2341,12 @@ pub struct Instruction {
     pub address: u64,
     /// The encoding, as the engine prints it — `48895c2408`. Empty when the line carried no byte
     /// column, which is not a shape any current engine produces for a readable address.
+    ///
+    /// **"As the engine prints it" is not always memory order.** On x86 and x64 the two coincide,
+    /// the engine printing the bytes in the order they are stored. On ARM64 it prints the
+    /// instruction *word*: `a9bf7bfd` for `stp fp,lr,[sp,#-0x10]!`, whose four bytes in memory
+    /// read `fd 7b bf a9`. [`DebugEngine::decode_range`] follows the same convention there even
+    /// though it reads memory, so one instruction has one spelling whichever path produced it.
     pub bytes: String,
     /// The mnemonic and its operands — `mov qword ptr [rsp+8],rbx` — with the engine's column
     /// padding collapsed to single spaces, since the columns it was aligning are separate fields
