@@ -42,9 +42,18 @@ All notable changes to this project are documented here. The format follows
 
   **SVE and SME have no such exception**, so an `incb x0` there comes back claiming nothing about
   `x0`. That is deliberate rather than an oversight: a partial decode of that space would remove
-  the `Other` marker from the encodings it shaped while leaving the gather loads and `ctermeq`'s
-  flags unshaped, handing back an access list that looks complete and is not. Closing it means
-  enumerating that space's general-purpose surface and shaping all of it at once.
+  the marker from the encodings it shaped while leaving the gather loads and `ctermeq`'s flags
+  unread, handing back an access list that looks complete and is not. Closing it means enumerating
+  that space's general-purpose surface and shaping all of it at once.
+- **`Operand::Undecoded`**, which is how an instruction says its fields are defaults rather than
+  answers. `InstructionSet::operands_are_read` answers for a *set*, and that was enough while every
+  decoder here was complete over its own; A64's is the first that is not, and the distinction
+  previously lived in a convention about what an `Operand::Other` contained — which a consumer had
+  to know the space names to apply. It is the whole operand list wherever it appears.
+
+  **Migration:** an exhaustive `match` on `Operand` gains an arm. A consumer that must not believe
+  a stale value treats `Undecoded` as clobbering whatever it is tracking; one that would rather
+  lose a finding than invent one stops at it.
 
   Measured against the engine's own rendering of all 1,233,502 words of a 26100 ARM64 kernel's
   `nt` (`.text` and `PAGE`): 5,021 instructions — 0.42% of the 1,189,047 the engine could render —

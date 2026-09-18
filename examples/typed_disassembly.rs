@@ -8,17 +8,14 @@
 //! `Other` count and the `Unknown` flow count, both of which should be zero on x64.
 //!
 //! **On ARM64 the `Other` count is not expected to be zero, and that is the contract rather than a
-//! shortfall** — so the run prints *what* each one was and not only how many, because the two
-//! kinds of `Other` mean opposite things and the count alone cannot tell them apart:
+//! shortfall.** An `Other` there is an operand kind this type has no shape for, named rather than
+//! dropped — a system register (`s3_0_c1_c0_0`), a barrier's domain (`sy`), a shift folded into an
+//! arithmetic operand (`lsl #0x38`), a vector lane (`v17.d[1]`) — and the instruction around one is
+//! fully decoded. The run prints what each was, so that stays visible.
 //!
-//! * an **operand kind this type has no shape for**, named rather than dropped — a system
-//!   register (`s3_0_c1_c0_0`), a barrier's domain (`sy`), a shift folded into an arithmetic
-//!   operand (`lsl #0x38`), a vector lane (`v17.d[1]`). The instruction around it is fully
-//!   decoded and this is the operand's name.
-//! * an **instruction in a space the decoder does not shape**, which is the whole operand list and
-//!   carries that space's name — `advanced-simd`, `sve`, `unallocated`. This is the count the
-//!   issue was about, and over an IOCTL dispatch routine, which is integer code, it should be
-//!   nothing at all.
+//! What says an **instruction** was not read is [`Operand::Undecoded`], which is the whole operand
+//! list and names the space it came from. That is the count dbgscope#170 was about, and over an
+//! IOCTL dispatch routine, which is integer code, it should be nothing at all.
 //!
 //! It also answers the question the reading exists for: how many `cmp`/`sub` immediates inside an
 //! IOCTL dispatch routine decode as plausible `CTL_CODE` values, which is the premise a static
@@ -158,7 +155,8 @@ fn main() {
         left_the_function.len()
     );
 
-    let (mut unreadable, mut other_operands, mut unknown_flow) = (0usize, 0usize, 0usize);
+    let (mut unreadable, mut other_operands, mut unknown_flow, mut unread) =
+        (0usize, 0usize, 0usize, 0usize);
     let mut other_kinds: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     let mut candidates: Vec<(u64, u64)> = Vec::new();
@@ -177,13 +175,23 @@ fn main() {
             );
         }
         for operand in &instruction.operands {
-            if let Operand::Other(text) = operand {
-                other_operands += 1;
-                *other_kinds.entry(text.clone()).or_insert(0usize) += 1;
-                println!(
-                    "  OTHER OPERAND {:#x}  {}  <- {text:?}",
-                    instruction.address, instruction.text
-                );
+            match operand {
+                Operand::Other(text) => {
+                    other_operands += 1;
+                    *other_kinds.entry(text.clone()).or_insert(0usize) += 1;
+                    println!(
+                        "  OTHER OPERAND {:#x}  {}  <- {text:?}",
+                        instruction.address, instruction.text
+                    );
+                }
+                Operand::Undecoded(space) => {
+                    unread += 1;
+                    println!(
+                        "  UNREAD {:#x}  {}  <- {space:?}",
+                        instruction.address, instruction.text
+                    );
+                }
+                _ => {}
             }
         }
 
@@ -279,6 +287,7 @@ fn main() {
     println!("\n--- what the reading could not read ---");
     println!("instructions the engine could not render: {unreadable}");
     println!("operands kept as Other:                   {other_operands}");
+    println!("instructions the decoder did not read:    {unread}");
     println!("instructions with Unknown flow:           {unknown_flow}");
     // The breakdown, because the count above carries two different meanings -- see the header.
     for (text, count) in &other_kinds {
