@@ -1969,8 +1969,9 @@ pub struct StackFrame {
 /// # Two gates, not one, because ARM64 answers yes to one of them
 ///
 /// [`Self::flow_is_read`] and [`Self::operands_are_read`] used to be the same question and are no
-/// longer. Flow on A64 is a bounded, fixed-width decode of six encoding classes ([`crate::arm64`]);
-/// typed *operands* there are a second decoder with nobody waiting for them. So ARM64 answers
+/// longer. Flow on A64 is a bounded, fixed-width decode of the Armv8 baseline's six branch classes
+/// ([`crate::arm64`], which records what a later architecture's seventh would cost); typed
+/// *operands* there are a second decoder with nobody waiting for them. So ARM64 answers
 /// [`Flow`] and empty operands, and a caller asks the **set** which of the two it is getting.
 ///
 /// That is a change of contract worth stating plainly: "no operands were read" used to be legible
