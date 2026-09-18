@@ -327,17 +327,24 @@ mod tests {
 
     #[test]
     fn test_test_and_branch_reads_a_shorter_displacement() {
-        // `fffff802ea69dc34  36800208  tbz w8,#0x10,nt!KiSystemStartup+0xb4 (fffff802ea69dc74)`.
-        // Fourteen bits, not nineteen: reading it as nineteen would take in the bit-position field
-        // above it and land somewhere else entirely, which is the whole reason this is its own arm.
+        // `fffff802e9ef919c  36800208  tbz x8,#0x10,nt!PsSessionGetWin32Callouts+0x4c
+        // (fffff802e9ef91dc)`. Fourteen bits, not nineteen: reading it as nineteen would take in
+        // the bit-position field above it and land somewhere else entirely, which is the whole
+        // reason this is its own arm.
+        //
+        // **The engine names an `x` register here and the architecture names a `w`**, `b5` being
+        // clear. That divergence is the operand decoder's business rather than this one's -- see
+        // `operand::test_and_branch` -- and it is noted here because an earlier draft of this
+        // comment quoted a `w8` rendering that this bench's engine does not produce.
         assert_eq!(
-            flow(0x3680_0208, 0xfffff802_ea69dc34),
-            Flow::Branch(Some(0xfffff802_ea69dc74))
+            flow(0x3680_0208, 0xfffff802_e9ef919c),
+            Flow::Branch(Some(0xfffff802_e9ef91dc))
         );
-        // `fffff802ea69dc78  36100168  tbz w8,#2,nt!KiSystemStartup+0xe4 (fffff802ea69dca4)`.
+        // `fffff802e9e493ac  36100168  tbz x8,#2,nt!IopAttachDeviceToDeviceStackSafe+0x328
+        // (fffff802e9e493d8)`.
         assert_eq!(
-            flow(0x3610_0168, 0xfffff802_ea69dc78),
-            Flow::Branch(Some(0xfffff802_ea69dca4))
+            flow(0x3610_0168, 0xfffff802_e9e493ac),
+            Flow::Branch(Some(0xfffff802_e9e493d8))
         );
     }
 
