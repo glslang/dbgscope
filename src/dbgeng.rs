@@ -2013,11 +2013,14 @@ impl InstructionSet {
     /// none of which is a claim about the instruction.
     ///
     /// **True for ARM64 since [`crate::arm64`] grew an operand decoder**, which is what closed
-    /// dbgscope#170. What that decoder does *not* shape — the Advanced SIMD, SVE and SME spaces,
-    /// less every encoding in them that reaches a general-purpose register or the flags — says so
-    /// in the instruction rather than in this answer: a single [`Operand::Other`] naming the space
-    /// it came from. Measured over the 26100 ARM64 kernel's `nt`, that is 0.42% of the 1,189,047
-    /// instructions the engine could render in `.text` and `PAGE`.
+    /// dbgscope#170.
+    ///
+    /// **It answers for the set and not for every instruction in it**, which x86 and x64 never
+    /// made a distinction worth drawing: iced reads the whole of those. A64's decoder reads the
+    /// general-purpose architecture and names the vector extensions rather than shaping them, and
+    /// an instruction it did not read says so itself, with a single [`Operand::Undecoded`].
+    /// Measured over the 26100 ARM64 kernel's `nt`, that is 0.500% of the 2,367,602 instructions
+    /// the engine could render across its executable sections.
     pub fn operands_are_read(self) -> bool {
         matches!(self, Self::X86 | Self::Amd64 | Self::Arm64)
     }
@@ -2322,8 +2325,38 @@ pub enum Operand {
     /// displacement the encoding carries.
     Target(u64),
     /// An operand kind this does not shape — a far branch, or a string operation's implicit
-    /// operand — named rather than forced into one of the others.
+    /// operand, and on A64 a system register, a barrier's domain or a shift folded into an
+    /// arithmetic operand — named rather than forced into one of the others.
+    ///
+    /// **The instruction around it is decoded.** This says a shape is missing, not a reading; what
+    /// says a *reading* is missing is [`Self::Undecoded`].
     Other(String),
+    /// **This instruction was not read**, and the string names the encoding space it was in:
+    /// `sve`, `advanced-simd`, `unallocated`. It is the whole operand list where it appears, and
+    /// every other field of the [`Instruction`] is a default rather than an answer — no
+    /// registers in [`Instruction::writes`] or [`Instruction::reads`], `false` for
+    /// [`Instruction::privileged`] and [`Instruction::writes_flags`], [`Effect::Other`].
+    ///
+    /// # Why an instruction set can be read and an instruction in it not
+    ///
+    /// [`InstructionSet::operands_are_read`] answers for a *set*, and it was enough while the only
+    /// decoders here were complete over theirs. A64's is not: it reads the general-purpose
+    /// architecture and names the vector extensions rather than shaping them
+    /// ([`crate::arm64`] says exactly where the line falls and why it is drawn there). Without this
+    /// variant that distinction lived in a convention about [`Self::Other`]'s *contents*, which a
+    /// consumer had to know the space names to apply — and three review rounds on dbgscope#171
+    /// each found a caller that would not have.
+    ///
+    /// **A consumer that must not believe a stale value treats this as clobbering everything it is
+    /// tracking**; one that would rather lose a finding than invent one stops at it instead. What
+    /// neither should do is read the empty lists beside it as "this instruction touches nothing".
+    ///
+    /// **What this cannot express is a *partial* reading**, and no decoder here produces one: an
+    /// instruction is shaped or it is this, and there is no third state where the operands are
+    /// read and the access lists are only half of an answer. A decoder that grew one would need
+    /// something else, and should not reach for this — the whole value of a marker that is the
+    /// entire operand list is that it cannot be missed.
+    Undecoded(String),
 }
 
 /// One disassembled instruction, as [`DebugEngine::disassemble`] reports it.
@@ -2371,6 +2404,9 @@ pub struct Instruction {
     /// names its source first — `str x8,[x9]` is `[Register, Memory]` where x64's `mov [rcx],rax`
     /// is `[Memory, Register]` — so `operands[0]` is not the destination there. [`Self::writes`]
     /// is the field that answers what changed, on both.
+    ///
+    /// **A single [`Operand::Undecoded`] is not an operand list**: it is this instruction saying
+    /// nothing was read, and every other field beside it is a default rather than an answer.
     pub operands: Vec<Operand>,
     /// What the instruction does to control flow.
     pub flow: Flow,
@@ -2450,11 +2486,8 @@ pub struct Instruction {
     /// **And empty on a set that *is* decoded, for an instruction inside it that is not.** A
     /// decoder may read most of an instruction set and name the rest: A64's does, the vector
     /// extensions being where it stops ([`crate::arm64`]). Such an instruction comes back with
-    /// [`Self::operands`] holding a single [`Operand::Other`] that names the space it was in, and
-    /// that operand is the tell -- a list of one `Other` and nothing else means this claims
-    /// nothing about the instruction, these lists included. A consumer that must not believe a
-    /// stale value treats it as clobbering whatever it is tracking; one that would rather lose a
-    /// finding than invent one can stop there instead.
+    /// [`Self::operands`] holding a single [`Operand::Undecoded`], which is the tell and says
+    /// what to do about it.
     pub writes: Vec<RegisterOperand>,
     /// Every register the instruction **reads**, explicit and implicit.
     ///

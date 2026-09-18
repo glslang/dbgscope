@@ -32,11 +32,10 @@
 //! Every count below has a floor that is not zero and is not a defect, and the run prints *what*
 //! each one was so a reader can tell the floor from a regression:
 //!
-//! * **`Other` operands** are two different things. An operand kind [`Operand`] has no shape for —
-//!   an A64 system register, a barrier's domain, a shift folded into an arithmetic operand — is
-//!   named rather than dropped, and the instruction around it is fully decoded. An *instruction*
-//!   in a space the decoder does not shape is a single `Other` carrying that space's name. The
-//!   breakdown separates them by eye; the counts cannot.
+//! * **`Other` operands** are an operand kind [`Operand`] has no shape for — an A64 system
+//!   register, a barrier's domain, a shift folded into an arithmetic operand. The instruction
+//!   around one is fully decoded; what says an *instruction* was not read is
+//!   [`Operand::Undecoded`], which is counted on its own line.
 //! * **Immediates and displacements the rendering does not contain** include every one the decoder
 //!   deliberately reports differently from how it was printed — A64 folds `#0x222,lsl #12` into
 //!   `0x222000`, and a `sys` operation's name is reported as the register space it reaches.
@@ -150,6 +149,7 @@ struct Report {
     /// goes unreported rather than misreported.
     vocabulary: HashSet<String>,
     other: Counted,
+    spaces: Counted,
     mnemonics: Counted,
     registers: Counted,
     immediates: Counted,
@@ -274,20 +274,18 @@ impl Report {
             }
         }
 
-        // **Whether the decoder shaped this instruction at all**, which the ranged copy is what
-        // says: it has no rendering to take a mnemonic from, so an empty one there means nothing
-        // was decoded and its single `Other` names the space rather than an operand. The checks
-        // that compare an operand list against a rendering have nothing to say about those.
-        // A word the engine renders `???` is the common case on A64 -- inter-function padding,
-        // whose four bytes were read perfectly well and are a `udf`.
-        let shaped = ranged.map_or(!text.starts_with('?'), |other| !other.mnemonic.is_empty());
+        // **Whether the decoder read this instruction at all**, which the instruction itself says:
+        // an unread one is a single [`Operand::Undecoded`] naming the space it was in. This used to
+        // be inferred from the ranged copy's empty mnemonic, which meant it could not be asked at
+        // all where a page was missing from the dump and `decode_range` failed for the window.
+        let shaped = !matches!(one.operands.first(), Some(Operand::Undecoded(_)));
         // **Counted against what the engine could render**, which is the denominator that makes
         // the fraction mean "of the code DbgEng calls code, how much does this decline". Over a
         // whole image the other denominator is mostly padding: a `udf` the engine renders `???`
-        // is unshaped by construction, and this kernel has 113,915 of them.
-        if let Some(other) = ranged.filter(|_| !text.starts_with('?')) {
+        // is unread by construction, and this kernel has 113,915 of them.
+        if !text.starts_with('?') {
             self.shapeable += 1;
-            self.unshaped += u64::from(other.mnemonic.is_empty());
+            self.unshaped += u64::from(!shaped);
         }
 
         // **Nothing below compares against a rendering the engine did not produce.** `???` with a
@@ -318,6 +316,7 @@ impl Report {
             for operand in &one.operands {
                 match operand {
                     Operand::Other(name) => self.other.hit(name.clone(), sample),
+                    Operand::Undecoded(space) => self.spaces.hit(space.clone(), sample),
                     Operand::Register(register) => {
                         self.registers.checked += 1;
                         if !printed.contains(&register.name) {
@@ -440,6 +439,7 @@ impl Report {
         self.counts
             .print("operand counts differing from the rendering", 15);
         self.other.print("operands kept as Other", 20);
+        self.spaces.print("instructions left unread, by space", 10);
     }
 }
 

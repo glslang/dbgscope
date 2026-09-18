@@ -13,11 +13,14 @@
 //! `mov` out of `orr`, `lsr` out of `ubfm`) because an alias changes the operand *list* and not
 //! just the spelling.
 //!
-//! The Advanced SIMD, scalar floating-point, SVE and SME spaces are **not** shaped, and
-//! [`Operand::Other`] naming the space is what an instruction in them comes back as —
-//! `advanced-simd`, `floating-point`, `sve`, `unallocated`. An operand list that is one of those
-//! and nothing else is this decoder saying it read nothing, which is why an *empty* operand list
-//! still means "this instruction takes none", the same thing it means on x64.
+//! The Advanced SIMD, scalar floating-point, SVE and SME spaces are **not** shaped, and an
+//! instruction in them comes back as a single [`Operand::Undecoded`] naming the space —
+//! `advanced-simd`, `floating-point`, `sve`, `unallocated`. That variant exists because this is
+//! the first decoder here that reads most of an instruction set rather than all of it, and the
+//! distinction had nowhere to live: an *empty* operand list means "this instruction takes none",
+//! the same thing it means on x64, so saying "nothing was read" needed a shape of its own rather
+//! than a convention about what an [`Operand::Other`] contained. Three review rounds on
+//! dbgscope#171 each found a caller that would have read the convention wrongly.
 //!
 //! # The exception, and where it stops
 //!
@@ -56,14 +59,14 @@
 //! sections, of which the engine rendered 2,513,920 and the rest are pages a minidump does not
 //! carry — it takes 51 seconds and reports:
 //!
-//! * **11,842 unshaped, 0.500%** of what the engine could render, of which 11,501 are Advanced
-//!   SIMD and the remaining 341 are SVE, scalar floating-point, and encodings no class allocates.
-//!   Nothing the four general-purpose groups *do* allocate comes back unshaped.
+//! * **11,879 unread, 0.501%** of what the engine could render: 11,501 Advanced SIMD, 216 SVE, 157
+//!   scalar floating-point, and 5 encodings no class allocates. Nothing the four general-purpose
+//!   groups *do* allocate comes back unread.
 //! * **0** instructions with [`crate::dbgeng::Flow::Unknown`], and **0** disagreements between
 //!   this decode and [`crate::dbgeng::DebugEngine::decode_range`]'s over 2,508,800 comparisons.
 //! * **0** wrong resolved addresses out of 94,166 — which is what pins `adrp`'s page truncation
 //!   and the fact that A64 measures a displacement from the instruction rather than from its end.
-//! * **75** registers out of 2,896,734 where the rendering and this decode disagree, and no
+//! * **71** registers out of 2,896,751 where the rendering and this decode disagree, and no
 //!   category of them is this decoder's: the engine prints a `W` register for an `sxtx`-extended
 //!   operand and for a literal `ldrsw`, where the architecture says `X`; and `xzr` is an operand
 //!   here and deliberately not a read.
@@ -77,6 +80,12 @@
 //! written, among them a `ccmp` whose fixed bit was read the wrong way round — which rejected
 //! every one of the 3,009 in the image — and a no-allocate pair load decoded out of an `opc` that
 //! form does not allocate, which only a sweep past `.text` reaches.
+//!
+//! **What a sweep of a Windows kernel cannot find is what a Windows kernel does not contain**, and
+//! that is most of what review caught on dbgscope#171: a `brab` spelled backwards, because this
+//! image signs with `pacibsp` and returns with a plain `ret`; `subps`, `ldg` and `ldapur`, because
+//! nothing here is built for memory tagging. A corpus is a net under the shapes a target uses, and
+//! the fixtures beside it are for the ones it does not.
 //!
 //! **Nothing here panics on any input**, which is worth answering exhaustively rather than by
 //! sample: this runs inside a debugger worker, and a word it is handed may be data, a truncated
@@ -137,12 +146,14 @@ impl Out {
         }
     }
 
-    /// A word in a space this does not shape. The mnemonic is left empty so
-    /// [`crate::dbgeng::split_instruction`] falls back to the rendering's first token, which is
-    /// the engine's own and is worth more than nothing; the operand names the space.
+    /// A word in a space this does not shape, which says so in a shape a caller cannot read past:
+    /// [`Operand::Undecoded`] naming the space, as the whole operand list.
+    ///
+    /// The mnemonic is left empty so [`crate::dbgeng::split_instruction`] falls back to the
+    /// rendering's first token, which is the engine's own and is worth more than nothing.
     fn undecoded(space: &str) -> Self {
         let mut out = Self::new("");
-        out.operands.push(Operand::Other(space.to_string()));
+        out.operands.push(Operand::Undecoded(space.to_string()));
         out
     }
 
@@ -1395,12 +1406,105 @@ fn loads_and_stores(word: u32, address: u64) -> Out {
     if word & 0x3b00_0000 == 0x1800_0000 {
         return load_literal(word, address);
     }
+    if word & 0x3f00_0000 == 0x1900_0000 {
+        return match field(word, 21, 1) {
+            0 => unscaled_acquire(word),
+            _ => memory_tags(word),
+        };
+    }
     match word & 0x3800_0000 {
         0x2800_0000 => load_store_pair(word),
         0x3800_0000 => load_store_register(word),
-        // The memory-tagging and unscaled-acquire corners, which no Windows ARM64 kernel image
-        // measured here contains an instance of.
-        _ => Out::undecoded("load-store"),
+        _ => Out::undecoded("unallocated"),
+    }
+}
+
+/// `ldapur`/`stlur` and their narrowing forms: an ordinary unscaled load or store that also orders.
+///
+/// The `size`/`opc` table is the one every other single-register form reads, which is the whole
+/// reason this is fifteen lines: what the encoding changes is the ordering the access carries and
+/// the name it is written under, and neither is a different operand shape. The one hole in the
+/// shared table is the prefetch, which this space does not allocate.
+fn unscaled_acquire(word: u32) -> Out {
+    let (size, opc) = (field(word, 30, 2), field(word, 22, 2));
+    let Some(access) = access_of(size, opc, false).filter(|access| !access.prefetch) else {
+        return Out::undecoded("unallocated");
+    };
+    if field(word, 10, 2) != 0 {
+        return Out::undecoded("unallocated");
+    }
+    let mnemonic = format!(
+        "{}{}",
+        if access.load { "ldapur" } else { "stlur" },
+        access.suffix
+    );
+    let memory = MemoryOperand {
+        size: Some(access.bytes),
+        base: Some(gpr(field(word, 5, 5), true, true)),
+        scale: 1,
+        displacement: sign_extend(field(word, 12, 9), 9),
+        ..MemoryOperand::default()
+    };
+    transfer_operands(Out::new(&mnemonic), field(word, 0, 5), &access, memory)
+}
+
+/// The memory-tagging accesses: `stg` and its relatives, `ldg`, and the whole-granule forms.
+///
+/// **`ldg` reads the register it writes**, which is the one thing in this family a first-operand
+/// rule gets wrong: the tag it loads is *inserted into* `Xt`'s existing value rather than replacing
+/// it, so the address already in that register survives the load.
+///
+/// The displacement is in tag granules of sixteen bytes, and [`Effect::Other`] throughout: what
+/// these move is an allocation tag, which is not a value any consumer here follows.
+fn memory_tags(word: u32) -> Out {
+    // 64-bit only; the `size` field is fixed at `11` for every member.
+    if field(word, 30, 2) != 0b11 {
+        return Out::undecoded("unallocated");
+    }
+    let (opc, index) = (field(word, 22, 2), field(word, 10, 2));
+    let (rn, rt) = (field(word, 5, 5), field(word, 0, 5));
+    let displacement = sign_extend(field(word, 12, 9), 9) * 16;
+    // `op2` zero is the whole-granule form, which takes no index mode and no displacement.
+    let granule = index == 0b00;
+    let mnemonic = match (opc, granule) {
+        (0b00, true) => "stzgm",
+        (0b00, false) => "stg",
+        (0b01, true) => "ldg",
+        (0b01, false) => "stzg",
+        (0b10, true) => "stgm",
+        (0b10, false) => "st2g",
+        (0b11, true) => "ldgm",
+        _ => "stz2g",
+    };
+    if granule && displacement != 0 {
+        return Out::undecoded("unallocated");
+    }
+    let loads = matches!(mnemonic, "ldg" | "ldgm");
+    let out = Out::new(mnemonic);
+    let out = match (loads, mnemonic) {
+        // `ldg` combines the tag with what `Xt` already holds; `ldgm` replaces it.
+        (true, "ldg") => out.inout_reg(gpr(rt, true, false)),
+        (true, _) => out.out_reg(gpr(rt, true, false)),
+        (false, _) => out.in_reg(gpr(rt, true, false)),
+    };
+    let out = out.mem(MemoryOperand {
+        size: Some(16),
+        base: Some(gpr(rn, true, true)),
+        scale: 1,
+        // A post-indexed access happens at the base, as everywhere else here.
+        displacement: match index {
+            0b01 => 0,
+            _ => displacement,
+        },
+        ..MemoryOperand::default()
+    });
+    let out = match index {
+        0b01 => out.other(post_index_amount(displacement)),
+        _ => out,
+    };
+    match index {
+        0b01 | 0b11 => out.writes_only(gpr(rn, true, true)),
+        _ => out,
     }
 }
 
@@ -1624,7 +1728,9 @@ fn load_store_register(word: u32) -> Out {
                 _ => out,
             }
         }
-        _ => Out::undecoded("load-store"),
+        // `(1, 0b00)` with `V` set, which is the atomics' slot in the vector half and allocates
+        // nothing.
+        _ => Out::undecoded("unallocated"),
     }
 }
 
@@ -2246,7 +2352,12 @@ fn conditional_select(word: u32) -> Out {
 /// The two-source operations: division, the variable shifts, CRC and the pointer-tagging pair.
 fn data_processing_two_source(word: u32) -> Out {
     let wide = word & 0x8000_0000 != 0;
-    if word & 0x2000_0000 != 0 {
+    // **`subps` is the one allocated encoding here with `S` set**, and a blanket rejection of that
+    // bit -- which is right for every other class in this space -- took its registers and its
+    // flags with it. Raised on dbgscope#171; the guards in the neighbouring classes were audited
+    // in the same pass and reject only field values the architecture does not allocate.
+    let sets_flags = word & 0x2000_0000 != 0;
+    if sets_flags && !(wide && field(word, 10, 6) == 0b000000) {
         return Out::undecoded("unallocated");
     }
     let (destination, left, right) = (
@@ -2283,6 +2394,13 @@ fn data_processing_two_source(word: u32) -> Out {
     // The CRC accumulators take a 32-bit accumulator and a source whose width the mnemonic names,
     // which is the one place in this class where the two operands are not the same width.
     let crc = mnemonic.starts_with("crc32");
+    if sets_flags {
+        return Out::new("subps")
+            .out_reg(destination)
+            .in_reg(left)
+            .in_reg(right)
+            .flags();
+    }
     let out = Out::new(mnemonic);
     match crc {
         true => out
@@ -3383,7 +3501,7 @@ mod tests {
         let vector = shapes(0x6f00_e402);
         assert_eq!(
             vector.operands,
-            [Operand::Other("advanced-simd".to_string())]
+            [Operand::Undecoded("advanced-simd".to_string())]
         );
         assert!(
             vector.mnemonic.is_empty(),
@@ -3393,11 +3511,11 @@ mod tests {
         // `a5e0a01f  ld1d {z31.d},p0/z,[x0]` and the zero word, which is `udf`.
         assert_eq!(
             shapes(0xa5e0_a01f).operands,
-            [Operand::Other("sve".to_string())]
+            [Operand::Undecoded("sve".to_string())]
         );
         assert_eq!(
             shapes(0x0000_0000).operands,
-            [Operand::Other("reserved".to_string())]
+            [Operand::Undecoded("reserved".to_string())]
         );
     }
 
@@ -3485,17 +3603,17 @@ mod tests {
         // reserves.
         assert_eq!(
             shapes(0x1200_fc00).operands,
-            [Operand::Other("unallocated".to_string())]
+            [Operand::Undecoded("unallocated".to_string())]
         );
         // A move-wide with `opc` 01, which is unallocated, and a 32-bit one whose `hw` asks for
         // a shift of 32 -- the field is two bits and only the 64-bit forms may use both.
         assert_eq!(
             shapes(0x3280_0000).operands,
-            [Operand::Other("unallocated".to_string())]
+            [Operand::Undecoded("unallocated".to_string())]
         );
         assert_eq!(
             shapes(0x52c0_0000).operands,
-            [Operand::Other("unallocated".to_string())]
+            [Operand::Undecoded("unallocated".to_string())]
         );
     }
 
@@ -3618,6 +3736,113 @@ mod tests {
         assert_eq!(spellings(&javascript.writes), ["x0"]);
         // The conversions beside it do not touch the flags.
         assert!(!shapes(0x1e18_0000).writes_flags, "fcvtzs");
+    }
+
+    /// The memory-tagging and unscaled-acquire families, which sat behind one decline until a
+    /// second review round landed on the same seam as the first. Raised on dbgscope#171.
+    ///
+    /// **`ldg` reads the register it writes**, which is the member of the family a first-operand
+    /// rule gets wrong: the tag it loads is inserted into what `Xt` already holds rather than
+    /// replacing it, so the address in that register survives the load.
+    #[test]
+    fn test_the_tagging_and_acquiring_accesses_are_shaped() {
+        // `d9600128  ldg x8,[x9]`.
+        let tag = shapes(0xd960_0128);
+        assert_eq!(tag.mnemonic, "ldg");
+        assert_eq!(spellings(&tag.writes), ["x8"]);
+        assert_eq!(
+            spellings(&tag.reads),
+            ["x8", "x9"],
+            "the address survives: {tag:?}"
+        );
+        // `d9201462  stg x2,[x3],#16` -- post-indexed, so the access is at the base and the amount
+        // is named, and the granule scale is sixteen rather than one.
+        let store = shapes(0xd920_1462);
+        assert_eq!(store.mnemonic, "stg");
+        assert_eq!(store.operands[2], Operand::Other("#0x10".to_string()));
+        assert_eq!(spellings(&store.writes), ["x3"]);
+        assert_eq!(spellings(&store.reads), ["x2", "x3"]);
+        let Operand::Memory(memory) = &store.operands[1] else {
+            panic!("{store:?}");
+        };
+        assert_eq!(memory.displacement, 0);
+        // `d9a00128  stgm x8,[x9]` -- a whole-granule form, which takes no index mode.
+        assert_eq!(shapes(0xd9a0_0128).mnemonic, "stgm");
+        // `199b7088  ldapursb x8,[x4,#-0x49]` -- the acquiring half reads the same `size`/`opc`
+        // table as every other single-register form, and only the name and the ordering change.
+        let acquire = shapes(0x199b_7088);
+        assert_eq!(acquire.mnemonic, "ldapursb");
+        assert_eq!(acquire.effect, Effect::MoveSigned);
+        let Operand::Memory(memory) = &acquire.operands[1] else {
+            panic!("{acquire:?}");
+        };
+        assert_eq!(memory.displacement, -0x49);
+        // `d9404020  ldapur x0,[x1,#4]`, and the store beside it.
+        assert_eq!(shapes(0xd940_4020).mnemonic, "ldapur");
+        assert_eq!(shapes(0xd900_4020).mnemonic, "stlur");
+        // The prefetch slot the shared table has is not allocated here.
+        assert_eq!(
+            shapes(0xd980_4020).operands,
+            [Operand::Undecoded("unallocated".to_string())]
+        );
+    }
+
+    /// `subps` is the one allocated encoding in the two-source class with the flag-setting bit, and
+    /// a blanket rejection of that bit took its registers and its flags with it. Raised on
+    /// dbgscope#171; the neighbouring classes' guards were audited in the same pass.
+    #[test]
+    fn test_the_flag_setting_pointer_subtraction_is_not_rejected_with_its_class() {
+        // `bac50083  subps x3,x4,x5`.
+        let subps = shapes(0xbac5_0083);
+        assert_eq!(subps.mnemonic, "subps");
+        assert!(subps.writes_flags, "{subps:?}");
+        assert_eq!(spellings(&subps.writes), ["x3"]);
+        assert_eq!(spellings(&subps.reads), ["x4", "x5"]);
+        // `9ac50083  subp x3,x4,x5` -- the same opcode without the bit, which sets no flags.
+        let subp = shapes(0x9ac5_0083);
+        assert_eq!(subp.mnemonic, "subp");
+        assert!(!subp.writes_flags);
+        // Every other opcode in the class **is** unallocated with that bit, and a 32-bit `subps`
+        // is too: the form is 64-bit only.
+        assert_eq!(
+            shapes(0xbac5_0883).operands,
+            [Operand::Undecoded("unallocated".to_string())]
+        );
+        assert_eq!(
+            shapes(0x3ac5_0083).operands,
+            [Operand::Undecoded("unallocated".to_string())]
+        );
+    }
+
+    /// An instruction this does not read says so in a shape of its own, which is what separates it
+    /// from an operand kind that merely has no shape.
+    ///
+    /// The two used to be one [`Operand::Other`] told apart by its contents, and three review
+    /// rounds on dbgscope#171 each found a caller that would not have. A consumer matching this
+    /// variant needs to know no architecture and no space name.
+    #[test]
+    fn test_an_unread_instruction_is_a_different_shape_from_an_unshaped_operand() {
+        // `6f00e402  movi v2.2d,#0` -- read by nothing here, so every field beside it is a
+        // default: no registers, no effect, no privilege.
+        let unread = shapes(0x6f00_e402);
+        assert_eq!(
+            unread.operands,
+            [Operand::Undecoded("advanced-simd".to_string())]
+        );
+        assert!(unread.writes.is_empty() && unread.reads.is_empty());
+        assert!(!unread.privileged && !unread.writes_flags);
+        assert_eq!(unread.effect, Effect::Other);
+        // `d5033abf  dmb ishst` -- fully read, and the domain is the one thing with no shape.
+        let shaped = shapes(0xd503_3abf);
+        assert_eq!(shaped.mnemonic, "dmb");
+        assert_eq!(shaped.operands, [Operand::Other("ishst".to_string())]);
+        assert!(
+            !shaped
+                .operands
+                .iter()
+                .any(|operand| matches!(operand, Operand::Undecoded(_))),
+            "a named operand kind is not an unread instruction: {shaped:?}"
+        );
     }
 
     /// The flow comes from [`super::flow`] unchanged, so one word has one answer whichever field
