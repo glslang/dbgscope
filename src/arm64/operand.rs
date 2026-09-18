@@ -59,17 +59,23 @@
 //! sections, of which the engine rendered 2,513,920 and the rest are pages a minidump does not
 //! carry — it takes 51 seconds and reports:
 //!
-//! * **11,879 unread, 0.501%** of what the engine could render: 11,501 Advanced SIMD, 216 SVE, 157
-//!   scalar floating-point, and 5 encodings no class allocates. Nothing the four general-purpose
-//!   groups *do* allocate comes back unread.
+//! * **11,875 unread, 0.501%** of what the engine could render: 11,501 Advanced SIMD, 216 SVE, 157
+//!   scalar floating-point, and one encoding no class allocates — a fixed-point conversion asking
+//!   for more fraction bits than a 32-bit destination has, which the engine renders and the
+//!   architecture does not define. Nothing the four general-purpose groups *do* allocate comes
+//!   back unread.
 //! * **0** instructions with [`crate::dbgeng::Flow::Unknown`], and **0** disagreements between
 //!   this decode and [`crate::dbgeng::DebugEngine::decode_range`]'s over 2,508,800 comparisons.
 //! * **0** wrong resolved addresses out of 94,166 — which is what pins `adrp`'s page truncation
 //!   and the fact that A64 measures a displacement from the instruction rather than from its end.
-//! * **71** registers out of 2,896,751 where the rendering and this decode disagree, and no
-//!   category of them is this decoder's: the engine prints a `W` register for an `sxtx`-extended
-//!   operand and for a literal `ldrsw`, where the architecture says `X`; and `xzr` is an operand
-//!   here and deliberately not a read.
+//! * **48,116** operand spellings out of 2,896,755 that differ from the rendering, and **22**
+//!   registers the rendering names under a spelling this decode did not produce — one question
+//!   from both sides rather than two. No category of either is this decoder's: 48,094 are
+//!   `tbz`/`tbnz`, where `b5` clear names a `W` register and this engine names an `X` throughout;
+//!   20 are a literal `ldrsw`, whose destination the engine prints `W` and the architecture `X`;
+//!   one is `xzr`, an operand here and deliberately not a read; and one is register 31 in a
+//!   *shifted*-register `subs`, which the engine prints `sp` and the encoding calls the zero
+//!   register.
 //! * **192** mnemonics out of 2,370,233, each the debugger's preferred spelling rather than the
 //!   architecture's — `movi` for a `mov` of a wide bitmask, `mov` for the 57 `umov`s that have a
 //!   `MOV` alias, `hint #0x16` for `clrbhb`, `lsl w9,w9,#0` for a `ubfm` whose preferred alias is
@@ -677,11 +683,17 @@ fn logical_immediate(word: u32) -> Out {
     };
     let (rd, rn) = (field(word, 0, 5), field(word, 5, 5));
     let source = gpr(rn, wide, false);
+    // **Built once, because the aliases below share it.** `and`, `orr` and `eor` may write the
+    // stack pointer and `ands` may not, which is what makes `tst` its alias -- and the `mov` arm
+    // constructing its own destination is how that rule was stated twice and got wrong once:
+    // `mov sp,#imm` reported writing nothing at all, the zero register being dropped by design.
+    // Raised on dbgscope#171.
+    let destination = gpr(rd, wide, opc != 0b11);
     match (opc, rd, rn) {
         // `mov Rd,#imm` -- `orr` from the zero register, which is how a constant too wide for a
         // `movz` but regular enough for a bitmask reaches a register in one instruction.
         (0b01, _, 31) => Out::new("mov")
-            .out_reg(gpr(rd, wide, false))
+            .out_reg(destination)
             .imm(value)
             .effect(Effect::Move),
         // `tst Rn,#imm` -- `ands` discarding its result.
@@ -691,15 +703,13 @@ fn logical_immediate(word: u32) -> Out {
             .effect(Effect::Test)
             .flags(),
         _ => {
-            // `and`, `orr` and `eor` may write the stack pointer; `ands` writes the zero register
-            // when `Rd` is 31, which is what makes `tst` its alias.
             let out = Out::new(match opc {
                 0b00 => "and",
                 0b01 => "orr",
                 0b10 => "eor",
                 _ => "ands",
             })
-            .out_reg(gpr(rd, wide, opc != 0b11))
+            .out_reg(destination)
             .in_reg(source)
             .imm(value)
             .effect(match opc {
@@ -956,18 +966,24 @@ fn compare_and_branch(word: u32, address: u64) -> Out {
 /// `tbz`/`tbnz`. The bit number is split across the word, its top bit sitting where `sf` does
 /// everywhere else.
 ///
-/// **That bit is not a width selector and the register is named at 64 bits either way**, which is
-/// what the engine prints and what the encoding means: `b5` *is* bit five of the bit number, and
-/// deriving an operand width from it reads one field as two things. Measured over the 26100 ARM64
-/// kernel's 23,448 of these, the engine names an `x` register in every single one, `b5` set or
-/// clear.
+/// **`b5` is a width selector as well as the bit number's top bit**, and an earlier draft of this
+/// argued it could not be both. It is: the architecture names a `W` register when it is clear and
+/// an `X` when it is set, and those agree with each other, a bit number of 32 or more needing a
+/// 64-bit operand to be in.
+///
+/// **The engine disagrees and is the outlier.** Measured over the 26100 ARM64 kernel's 23,448 of
+/// these, it names an `X` register in every single one, `b5` set or clear -- where the
+/// architecture's syntax and a second disassembler both name `W` for the clear half. The encoding
+/// is what this decodes, so the encoding wins, and [`RegisterOperand::full`] is `x8` either way,
+/// which is what keeps the two spellings one register for anything matching on it.
+/// Raised on dbgscope#171.
 fn test_and_branch(word: u32, address: u64) -> Out {
     let bit = (field(word, 31, 1) << 5) | field(word, 19, 5);
     Out::new(match field(word, 24, 1) {
         0 => "tbz",
         _ => "tbnz",
     })
-    .in_reg(gpr(field(word, 0, 5), true, false))
+    .in_reg(gpr(field(word, 0, 5), bit >= 32, false))
     .imm(bit as u64)
     .target(super::relative(address, field(word, 5, 14), 14))
 }
@@ -2273,7 +2289,12 @@ fn add_subtract_extended_register(word: u32) -> Out {
     let (rd, rn) = (field(word, 0, 5), field(word, 5, 5));
     let destination = gpr(rd, wide, !sets_flags);
     let left = gpr(rn, wide, true);
-    let right = gpr(field(word, 16, 5), option & 0b011 == 0b011, false);
+    // **An extended source is `X` only where the operation is 64-bit.** `add w0,w1,w2,uxtx`
+    // names a `W` register: nothing above bit 31 of it survives a 32-bit add, so there is nothing
+    // wider to name. A round-one finding said so and was declined on a misreading of the width
+    // table; the engine and a second decoder both render `w`, and they are right.
+    // Raised again on dbgscope#171.
+    let right = gpr(field(word, 16, 5), wide && option & 0b011 == 0b011, false);
     let plain = amount == 0 && matches!(option, 0b010 | 0b011);
     let modifier = match plain {
         true => None,
@@ -3412,6 +3433,11 @@ mod tests {
         );
         // `eb20c27f  cmp x19,w0,sxtw #0` -- signed, so not a plain register either.
         assert_eq!(shapes(0xeb20_c27f).effect, Effect::Other);
+        // **An extended source is `X` only where the operation is**, nothing above bit 31 of it
+        // surviving a 32-bit add. `0b226020  add w0,w1,w2,uxtx` against `8b226020`, the same
+        // encoding at 64 bits.
+        assert_eq!(shapes(0x0b22_6020).operands[2], register("w2", "x2", 4));
+        assert_eq!(shapes(0x8b22_6020).operands[2], register("x2", "x2", 8));
     }
 
     /// A multiply that accumulates the zero register is a plain multiply, and its operand list is
@@ -3666,17 +3692,27 @@ mod tests {
         assert_eq!(frame.operands[1], register("sp", "sp", 8));
     }
 
-    /// `tbz` names a 64-bit register whatever `b5` says, that bit being part of the bit number.
+    /// `tbz`'s `b5` is the bit number's top bit **and** the operand's width, and those agree: a
+    /// bit at 32 or above needs a 64-bit register to be in.
+    ///
+    /// An earlier round argued it could not be both and named the register at 64 bits throughout,
+    /// on the strength of this engine printing `x` for all 23,448 of them. The engine is the
+    /// outlier -- the architecture's syntax and a second disassembler both name `w` for the clear
+    /// half -- and the encoding is what this decodes. Raised on dbgscope#171.
     #[test]
-    fn test_a_test_and_branch_names_the_whole_register() {
-        // `fffff802ea69dc34  36800208  tbz x8,#0x10,nt!KiSystemStartup+0xb4`.
-        let low = decode(0x3680_0208, 0xfffff802_ea69dc34);
+    fn test_a_test_and_branch_takes_its_width_from_the_bit_number() {
+        // `fffff802e9ef919c  36800208  tbz x8,#0x10,nt!PsSessionGetWin32Callouts+0x4c` -- `b5`
+        // clear, so the architecture names a `w` register where this engine prints an `x`. The
+        // two are one register, which [`RegisterOperand::full`] is what says.
+        let low = decode(0x3680_0208, 0xfffff802_e9ef919c);
         assert_eq!(low.mnemonic, "tbz");
-        assert_eq!(low.operands[0], register("x8", "x8", 8));
+        assert_eq!(low.operands[0], register("w8", "x8", 4));
         assert_eq!(low.operands[1], Operand::Immediate(16));
-        assert_eq!(low.flow, Flow::Branch(Some(0xfffff802_ea69dc74)));
-        // `b6f80148  tbz x8,#0x3F,...` -- `b5` set, so the bit number is above 31.
+        assert_eq!(low.flow, Flow::Branch(Some(0xfffff802_e9ef91dc)));
+        // `b6f80148  tbz x8,#0x3F,...` -- `b5` set, so the bit number is above 31 and so is the
+        // operand's width. The two halves of that field agree, which is why one bit can be both.
         let high = shapes(0xb6f8_0148);
+        assert_eq!(high.operands[0], register("x8", "x8", 8));
         assert_eq!(high.operands[1], Operand::Immediate(0x3f));
         // `fffff802ea3773f0  b4000293  cbz x19,nt!EtwpDestructIptData+0x68`.
         let compare = decode(0xb400_0293, 0xfffff802_ea3773f0);
@@ -4080,6 +4116,10 @@ mod tests {
             (
                 0x9240_03ff,
                 "and sp,xzr,#1 — a logical immediate's destination",
+            ),
+            (
+                0xb266_97ff,
+                "mov sp,#-0x4000000 — and the same through its `mov` alias",
             ),
             (0x9180_03ff, "addg sp,sp,#0,#0"),
             (0x9adf_13ff, "irg sp,sp"),

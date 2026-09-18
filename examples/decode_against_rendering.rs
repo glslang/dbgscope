@@ -41,9 +41,16 @@
 //!   `0x222000`, and a `sys` operation's name is reported as the register space it reaches.
 //! * **Mnemonics** differ wherever the debugger's preferred spelling is not the architecture's.
 //!
-//! What *should* be zero, on any target: an instruction with [`Flow::Unknown`], a register the
-//! rendering names that the decode did not touch, a resolved address that is not the one the
-//! engine printed, and a disagreement between the two decode paths.
+//! What *should* be zero, on any target: an instruction with [`Flow::Unknown`], a resolved address
+//! that is not the one the engine printed, and a disagreement between the two decode paths.
+//!
+//! **The two register categories are one question asked from both sides**, and neither is expected
+//! to be zero. A decoder and a debugger can name the same register differently — A64's `tbz` is the
+//! large case, where the architecture names a `W` and this engine an `X` — and telling that apart
+//! from a register one of them lost would need a table of each architecture's register widths,
+//! which is what this example is built to do without. What the pair guarantees is the useful half:
+//! a register the decode missed **entirely** appears in one of them, because it can then be in
+//! neither the operands nor the access lists under any spelling.
 
 use dbgscope::dbgeng::{DebugEngine, Flow, Instruction, InstructionSet, Operand};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -150,6 +157,7 @@ struct Report {
     vocabulary: HashSet<String>,
     other: Counted,
     spaces: Counted,
+    spellings: Counted,
     mnemonics: Counted,
     registers: Counted,
     immediates: Counted,
@@ -318,9 +326,15 @@ impl Report {
                     Operand::Other(name) => self.other.hit(name.clone(), sample),
                     Operand::Undecoded(space) => self.spaces.hit(space.clone(), sample),
                     Operand::Register(register) => {
-                        self.registers.checked += 1;
+                        // **Spelled differently is not missed**, and the two were one counter
+                        // until A64's `tbz` made the difference 48,138 instructions wide: the
+                        // architecture names a `w` register there and this engine names an `x`,
+                        // so every one of them is a spelling this decoder and the rendering
+                        // disagree on and not one is a register either of them lost. The check
+                        // below is the one that answers the second question.
+                        self.spellings.checked += 1;
                         if !printed.contains(&register.name) {
-                            self.registers
+                            self.spellings
                                 .hit(format!("{}/{}", one.mnemonic, register.name), sample);
                         }
                     }
@@ -429,8 +443,12 @@ impl Report {
         self.paths.print("the two decode paths disagreeing", 10);
         self.mnemonics
             .print("mnemonics differing from the rendering", 15);
-        self.registers
-            .print("registers the rendering and the decode disagree on", 15);
+        self.spellings
+            .print("operand spellings differing from the rendering", 10);
+        self.registers.print(
+            "registers the rendering names that the decode did not see",
+            15,
+        );
         self.addresses
             .print("resolved addresses not in the rendering", 10);
         self.immediates.print("immediates not in the rendering", 10);
