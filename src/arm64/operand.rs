@@ -13,19 +13,39 @@
 //! `mov` out of `orr`, `lsr` out of `ubfm`) because an alias changes the operand *list* and not
 //! just the spelling.
 //!
-//! The Advanced SIMD, scalar floating-point, SVE and SME spaces are **not** shaped, with one
-//! exception that is the whole reason the line can be drawn here: every encoding in them that
-//! touches a *general-purpose* register or the flags is decoded — the floating-point conversions,
-//! `fmov` between the register files, `umov`/`smov`/`ins`/`dup`, `fcmp` and its conditional
-//! relatives, and the base-register writeback of a vector load or store. What is left writes only
-//! vector registers, and a consumer following a value through a routine is following a
-//! general-purpose one.
+//! The Advanced SIMD, scalar floating-point, SVE and SME spaces are **not** shaped, and
+//! [`Operand::Other`] naming the space is what an instruction in them comes back as —
+//! `advanced-simd`, `floating-point`, `sve`, `unallocated`. An operand list that is one of those
+//! and nothing else is this decoder saying it read nothing, which is why an *empty* operand list
+//! still means "this instruction takes none", the same thing it means on x64.
 //!
-//! **An instruction this does not shape says so in its operands**, as a single
-//! [`Operand::Other`] naming the space it came from (`advanced-simd`, `sve`, `unallocated`). That
-//! is the measurement `examples/typed_disassembly.rs` counts, and it is why an empty operand list
-//! here means "this instruction takes none" rather than "nothing was read" — the same thing it
-//! means on x64, which is what lets one gate answer for both.
+//! # The exception, and where it stops
+//!
+//! Advanced SIMD and scalar floating-point have one: **every encoding in those two that reaches a
+//! general-purpose register or the flags is decoded**, and the list is short enough to give in
+//! full — the floating-point conversions in both directions, `fmov` between the register files
+//! including its upper-lane form, `umov`/`smov`/`ins`/`dup`, `fcmp`/`fccmp` and `fjcvtzs` for the
+//! flags, and the base-register writeback of a vector load or store. Everything left in those two
+//! spaces reaches vector registers only, so a caller following a value through a routine — which
+//! is following a general-purpose one — loses nothing to it.
+//!
+//! **SVE and SME have no such exception, and that is a real gap rather than a claim.** `incb x0`
+//! increments a general-purpose register by the vector length and `whilelt p0.s,x3,x4` reads two,
+//! and both come back as `Operand::Other("sve")` with empty access lists — so a consumer that
+//! read those lists as "touches nothing" would keep a value `incb` had changed. Raised on
+//! dbgscope#171.
+//!
+//! It is left that way deliberately, because **a partial decode of that space would be worse than
+//! none**. The marker is what tells a caller nothing was read; shaping the counting instructions
+//! would remove it from exactly those encodings while leaving the gather loads, the predicate
+//! counts and `ctermeq`'s flags unshaped — handing back an access list that looks complete and is
+//! not, in place of one that says outright that it is empty. The way to close this is to enumerate
+//! the SVE encodings that reach a general-purpose register or the flags and shape all of them at
+//! once, the way the two spaces above were; until then the honest answer is the one the marker
+//! already gives. Measured on the 26100 ARM64 kernel's `.text` and `PAGE`, the whole SVE space is
+//! 1,085 words of which the engine declines to render 958 — so a Windows kernel image barely
+//! reaches it, which is why the gap has cost nothing so far and is **not** the reason it is
+//! acceptable. The reason is the paragraph above.
 //!
 //! # What that line costs, measured rather than estimated
 //!
@@ -912,6 +932,11 @@ fn branch_register(word: u32) -> Out {
     // `op3` carries the authentication: none, `a`-key or `b`-key. A form that names a second
     // register (`braa`) has `op4` as that register; a form that does not requires it to be zero,
     // or `11111` for the returns.
+    //
+    // **The key is the letter after the `a`, not in place of it.** The family is `braa`/`brab`,
+    // `retaa`/`retab` — a fixed `a` for the instruction and then the key — so a mnemonic built as
+    // `br` + key + `a` spells every b-key form backwards, and no Windows ARM64 image measured here
+    // contains one to notice it by. Raised on dbgscope#171.
     let key = match op3 {
         0b000000 => "",
         0b000010 => "a",
@@ -925,8 +950,8 @@ fn branch_register(word: u32) -> Out {
             let modifier = opc == 0b1000;
             let out = Out::new(&match (key, modifier) {
                 ("", _) => "br".to_string(),
-                (key, false) => format!("br{key}az"),
-                (key, true) => format!("br{key}a"),
+                (key, false) => format!("bra{key}z"),
+                (key, true) => format!("bra{key}"),
             })
             .in_reg(gpr(rn, true, false));
             match modifier {
@@ -938,8 +963,8 @@ fn branch_register(word: u32) -> Out {
             let modifier = opc == 0b1001;
             let out = Out::new(&match (key, modifier) {
                 ("", _) => "blr".to_string(),
-                (key, false) => format!("blr{key}az"),
-                (key, true) => format!("blr{key}a"),
+                (key, false) => format!("blra{key}z"),
+                (key, true) => format!("blra{key}"),
             })
             .in_reg(gpr(rn, true, false));
             let out = match modifier {
@@ -953,7 +978,7 @@ fn branch_register(word: u32) -> Out {
         0b0010 => {
             let out = Out::new(&match key {
                 "" => "ret".to_string(),
-                key => format!("ret{key}a"),
+                key => format!("reta{key}"),
             });
             match (key, rn) {
                 ("", 30) => out.reads_only(link_register()),
@@ -966,7 +991,7 @@ fn branch_register(word: u32) -> Out {
         // `eret` and `drps` return from an exception and from debug state. Both are EL1 and above.
         0b0100 => Out::new(&match key {
             "" => "eret".to_string(),
-            key => format!("eret{key}a"),
+            key => format!("ereta{key}"),
         })
         .privileged(),
         0b0101 => Out::new("drps").privileged(),
@@ -1225,7 +1250,21 @@ fn pstate(op1: u32, crm: u32, op2: u32) -> Out {
         (0b000, 0b000..=0b010) => out.flags(),
         _ => out,
     };
-    match privileged_level(op1) || matches!((op1, op2), (0b011, 0b110 | 0b111)) {
+    // **`op1` decides this everywhere else and cannot decide it here**, because the immediate form
+    // addresses a processor-state *field* rather than a system register, and `op1` zero holds two
+    // kinds of them: `uao`, `pan` and `spsel`, which are EL1, and the three FlagM instructions
+    // above, which reach `NZCV` and nothing else. EL0 may already write the whole of `NZCV` with
+    // `msr nzcv`, so inverting a carry flag is not a privileged act — and reporting it as one puts
+    // a compiler's own flag manipulation in a driver hazard report. Raised on dbgscope#171.
+    //
+    // The other carve-out runs the opposite way: `daifset` and `daifclr` encode EL0's `op1` and
+    // are EL1 all the same, EL0 reaching them only where `SCTLR_EL1.UMA` allows it.
+    let privileged = match (op1, op2) {
+        (0b000, 0b000..=0b010) => false,
+        (0b011, 0b110 | 0b111) => true,
+        (op1, _) => privileged_level(op1),
+    };
+    match privileged {
         true => out.privileged(),
         false => out,
     }
@@ -1789,25 +1828,38 @@ fn vector_structures(word: u32) -> Out {
             .collect::<Vec<_>>()
             .join(", ")
     ));
+    // **A load that fills one lane reads the register it fills**, the other lanes surviving it —
+    // the same fact that makes `ins` a read of its destination. The whole-register forms and the
+    // replicate forms do not: those write every lane there is.
+    let merges = load && single && replicate.is_empty();
     for step in 0..count {
         let register = vreg_whole((first + step) % 32);
-        match load {
-            true => out = out.writes_only(register),
-            false => out = out.reads_only(register),
+        if merges || !load {
+            out = out.reads_only(register.clone());
+        }
+        if load {
+            out = out.writes_only(register);
         }
     }
-    let rm = field(word, 16, 5);
     let out = out.mem(MemoryOperand {
         base: Some(gpr(rn, true, true)),
-        // A post-index by a register names it; `11111` there means the immediate form, whose
-        // amount is the transfer's own size.
-        index: match post_index && rm != 0b11111 {
-            true => Some(gpr(rm, true, false)),
-            false => None,
-        },
         scale: 1,
         ..MemoryOperand::default()
     });
+    // **The post-index register is not part of the address**, which is the whole point of a
+    // post-index: the access happens at the base and the register is what moves it afterwards.
+    // Reporting it as [`MemoryOperand::index`] describes an access at `base + index` that the
+    // instruction never makes — so it is a read of its own, as the engine prints it, and the
+    // memory operand keeps only the base. Raised on dbgscope#171.
+    //
+    // `11111` there is the immediate form instead, whose amount is the transfer's own size and is
+    // not named: it is implied by the register list and the element width rather than encoded, and
+    // computing it would be a second reading of fields this does not otherwise decode.
+    let rm = field(word, 16, 5);
+    let out = match post_index && rm != 0b11111 {
+        true => out.in_reg(gpr(rm, true, false)),
+        false => out,
+    };
     match post_index {
         true => out.writes_only(gpr(rn, true, true)),
         false => out,
@@ -2454,14 +2506,21 @@ fn float_integer_conversion(word: u32) -> Out {
         if rmode != 0b01 || !wide || !matches!(opcode, 0b110 | 0b111) {
             return Out::undecoded("unallocated");
         }
+        // The lane is an operand kind [`Operand`] has no shape for, so it is named -- and the
+        // register behind that name is still reached, which is a separate question and the one
+        // the access lists answer. Writing `Vd.D[1]` leaves the low half standing, so that
+        // direction **reads** the register it writes, exactly as `ins` does. Raised on
+        // dbgscope#171, where both halves were missing.
         return match opcode {
             0b110 => Out::new("fmov")
                 .out_reg(gpr(rd, true, false))
-                .other(format!("v{rn}.d[1]")),
+                .other(format!("v{rn}.d[1]"))
+                .reads_only(vreg_whole(rn)),
             _ => Out::new("fmov")
                 .other(format!("v{rd}.d[1]"))
                 .in_reg(gpr(rn, true, false))
-                .writes_only(vreg_whole(rd)),
+                .writes_only(vreg_whole(rd))
+                .reads_only(vreg_whole(rd)),
         };
     }
     let Some(bytes) = float_width(kind) else {
@@ -2484,13 +2543,21 @@ fn float_integer_conversion(word: u32) -> Out {
         (0b11, 0b110) if kind == 0b01 && !wide => "fjcvtzs",
         _ => return Out::undecoded("unallocated"),
     };
-    match matches!(opcode, 0b010 | 0b011 | 0b111) {
+    let out = match matches!(opcode, 0b010 | 0b011 | 0b111) {
         true => Out::new(mnemonic)
             .out_reg(vreg(rd, bytes))
             .in_reg(gpr(rn, wide, false)),
         false => Out::new(mnemonic)
             .out_reg(gpr(rd, wide, false))
             .in_reg(vreg(rn, bytes)),
+    };
+    // **`fjcvtzs` is the one conversion that also writes the flags**, reporting in `Z` whether the
+    // conversion was exact -- which is the Javascript semantics it exists for, and which a caller
+    // asking "what set the flags this branch reads" has to see. Found by enumerating this space
+    // after dbgscope#171 raised two other holes in it.
+    match mnemonic == "fjcvtzs" {
+        true => out.flags(),
+        false => out,
     }
 }
 
@@ -3430,6 +3497,127 @@ mod tests {
             shapes(0x52c0_0000).operands,
             [Operand::Other("unallocated".to_string())]
         );
+    }
+
+    /// An authenticated branch spells its key **after** the `a`, and the `b`-key forms are the
+    /// half a corpus of Windows kernel code cannot check: it signs with `pacibsp` and returns with
+    /// a plain `ret`, so not one `brab` or `retab` occurs in the image this decoder was measured
+    /// on. Raised on dbgscope#171.
+    #[test]
+    fn test_an_authenticated_branch_spells_its_key_after_the_a() {
+        // `d71f0843  braa x2,x3` and `d71f0c43  brab x2,x3` -- the modifier register is a read of
+        // its own, being what the pointer is authenticated against.
+        let a_key = shapes(0xd71f_0843);
+        assert_eq!(a_key.mnemonic, "braa");
+        assert_eq!(spellings(&a_key.reads), ["x2", "x3"]);
+        let b_key = shapes(0xd71f_0c43);
+        assert_eq!(b_key.mnemonic, "brab", "not `brba`: {b_key:?}");
+        assert_eq!(b_key.flow, Flow::Jmp(None));
+        // The zero-modifier forms, which take no second register.
+        assert_eq!(shapes(0xd61f_0840).mnemonic, "braaz");
+        assert_eq!(shapes(0xd61f_0c40).mnemonic, "brabz");
+        // And the same through the three other opcodes in the class.
+        let call = shapes(0xd73f_0c43);
+        assert_eq!(call.mnemonic, "blrab");
+        assert_eq!(spellings(&call.writes), ["lr"]);
+        assert_eq!(shapes(0xd63f_0840).mnemonic, "blraaz");
+        assert_eq!(shapes(0xd65f_0bff).mnemonic, "retaa");
+        assert_eq!(shapes(0xd65f_0fff).mnemonic, "retab");
+        assert_eq!(shapes(0xd69f_0fff).mnemonic, "eretab");
+        assert!(shapes(0xd69f_0fff).privileged);
+    }
+
+    /// `op1` decides privilege everywhere but the processor-state fields, where zero holds both
+    /// exception levels: `uao`, `pan` and `spsel` are EL1, and the three FlagM instructions beside
+    /// them reach `NZCV` and nothing else.
+    ///
+    /// Reporting the second three as privileged puts a compiler's own flag manipulation in a
+    /// driver hazard report, which is the field's whole consumer. Raised on dbgscope#171.
+    #[test]
+    fn test_the_flag_manipulation_fields_are_not_privileged() {
+        // `d500401f  msr cfinv,#0`, `d500403f  xaflag`, `d500405f  axflag`.
+        for word in [0xd500_401f_u32, 0xd500_403f, 0xd500_405f] {
+            let flags = shapes(word);
+            assert_eq!(flags.mnemonic, "msr");
+            assert!(!flags.privileged, "{word:#010x} is EL0: {flags:?}");
+            assert!(flags.writes_flags, "{word:#010x}: {flags:?}");
+        }
+        // Their neighbours under the same `op1` are EL1, and so are the interrupt masks under the
+        // `op1` that otherwise names EL0.
+        for (word, field) in [
+            (0xd500_407f_u32, "uao"),
+            (0xd500_409f, "pan"),
+            (0xd500_40bf, "spsel"),
+            (0xd503_41df, "daifset"),
+            (0xd503_42ff, "daifclr"),
+        ] {
+            let one = shapes(word);
+            assert_eq!(one.operands[0], Operand::Other(field.to_string()));
+            assert!(one.privileged, "{field} is EL1: {one:?}");
+        }
+        // And the EL0 fields under `op1` three stay unprivileged: `d503403f  msr dit,#1` is
+        // `op1` 011, `op2` 010.
+        assert!(!shapes(0xd503_405f).privileged);
+    }
+
+    /// A vector structure access's post-index register is **not part of the address**: the access
+    /// happens at the base and the register is what moves it afterwards, so reporting it as the
+    /// memory operand's index describes an address the instruction never forms.
+    ///
+    /// And a load that fills one lane reads the register it fills, the other lanes surviving it —
+    /// which the replicate forms, writing every lane, do not. Both raised on or found beside
+    /// dbgscope#171.
+    #[test]
+    fn test_a_vector_structure_access_keeps_its_post_index_register_out_of_the_address() {
+        // `4dcaefb2  ld3r {v18.2d,v19.2d,v20.2d},[fp], x10`.
+        let replicate = shapes(0x4dca_efb2);
+        assert_eq!(replicate.mnemonic, "ld3r");
+        let Operand::Memory(memory) = &replicate.operands[1] else {
+            panic!("{replicate:?}");
+        };
+        assert_eq!(memory.index, None, "the access is at the base alone");
+        assert_eq!(memory.base.as_deref(), Some("fp"));
+        assert_eq!(replicate.operands[2], register("x10", "x10", 8));
+        assert_eq!(spellings(&replicate.writes), ["v18", "v19", "v20", "fp"]);
+        assert_eq!(spellings(&replicate.reads), ["fp", "x10"]);
+        // `0dff0020  ld2 {v0.b,v1.b}[0],[x1],#2` -- one lane each, so both registers survive in
+        // part and are reads as well as writes.
+        let lanes = shapes(0x0dff_0020);
+        assert_eq!(lanes.mnemonic, "ld2");
+        assert_eq!(spellings(&lanes.writes), ["v0", "v1", "x1"]);
+        assert_eq!(spellings(&lanes.reads), ["v0", "v1", "x1"]);
+        // `4d40c110  ld1r {v16.16b},[x8]` -- every lane written, and no writeback.
+        let whole = shapes(0x4d40_c110);
+        assert_eq!(whole.mnemonic, "ld1r");
+        assert_eq!(spellings(&whole.writes), ["v16"]);
+        assert_eq!(spellings(&whole.reads), ["x8"]);
+    }
+
+    /// The two halves of the vector boundary a name on an operand hides: an upper-lane `fmov`
+    /// still reaches the register its lane belongs to, and `fjcvtzs` is the one conversion that
+    /// reports on itself in the flags.
+    ///
+    /// Both are the case where leaving a field unread is worse than leaving an operand unshaped:
+    /// a consumer asking what set the flags a `b.eq` reads, or what a `fmov` left changed, gets a
+    /// wrong answer rather than no answer. Raised on and found beside dbgscope#171.
+    #[test]
+    fn test_the_upper_lane_moves_and_the_javascript_conversion_reach_what_they_name() {
+        // `9eae0020  fmov x0,v1.d[1]`.
+        let out_of = shapes(0x9eae_0020);
+        assert_eq!(out_of.mnemonic, "fmov");
+        assert_eq!(spellings(&out_of.writes), ["x0"]);
+        assert_eq!(spellings(&out_of.reads), ["v1"]);
+        // `9eaf0062  fmov v2.d[1],x3` -- the low half survives, so the destination is a read too.
+        let into = shapes(0x9eaf_0062);
+        assert_eq!(spellings(&into.writes), ["v2"]);
+        assert_eq!(spellings(&into.reads), ["x3", "v2"]);
+        // `1e7e0000  fjcvtzs w0,d0`.
+        let javascript = shapes(0x1e7e_0000);
+        assert_eq!(javascript.mnemonic, "fjcvtzs");
+        assert!(javascript.writes_flags, "{javascript:?}");
+        assert_eq!(spellings(&javascript.writes), ["x0"]);
+        // The conversions beside it do not touch the flags.
+        assert!(!shapes(0x1e18_0000).writes_flags, "fcvtzs");
     }
 
     /// The flow comes from [`super::flow`] unchanged, so one word has one answer whichever field

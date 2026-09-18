@@ -2446,6 +2446,15 @@ pub struct Instruction {
     /// Empty for an instruction set whose operands this build does not decode -- nothing was
     /// read, so nothing is claimed, and a consumer that needs the difference reads
     /// [`InstructionSet::operands_are_read`].
+    ///
+    /// **And empty on a set that *is* decoded, for an instruction inside it that is not.** A
+    /// decoder may read most of an instruction set and name the rest: A64's does, the vector
+    /// extensions being where it stops ([`crate::arm64`]). Such an instruction comes back with
+    /// [`Self::operands`] holding a single [`Operand::Other`] that names the space it was in, and
+    /// that operand is the tell -- a list of one `Other` and nothing else means this claims
+    /// nothing about the instruction, these lists included. A consumer that must not believe a
+    /// stale value treats it as clobbering whatever it is tracking; one that would rather lose a
+    /// finding than invent one can stop there instead.
     pub writes: Vec<RegisterOperand>,
     /// Every register the instruction **reads**, explicit and implicit.
     ///
