@@ -11,13 +11,28 @@
 //!
 //! # Why the flow half is small enough to write by hand
 //!
-//! A64 is fixed-width and regular. Every transfer of control is one of six encoding classes, all
-//! discriminated by a mask on the top bits of a 32-bit word, and there is no seventh: A64 has no
-//! instruction that writes the program counter as a general register, so a word outside those
-//! classes falls through by construction. That is what makes `Flow::Fallthrough` the default here
-//! a *decoded* answer rather than a guess — the opposite of the x86 side, where the default has to
-//! be [`Flow::Unknown`](crate::dbgeng::Flow::Unknown) because a variable-length encoding this
-//! decoder does not know may be anything at all.
+//! A64 is fixed-width and regular. Every transfer of control in the Armv8 baseline is one of six
+//! encoding classes, all discriminated by a mask on the top bits of a 32-bit word — and there is
+//! no seventh *there*, because A64 has no instruction that writes the program counter as a general
+//! register. So `Flow::Fallthrough` is much closer to a decoded answer here than on the x86 side,
+//! where the default has to be [`Flow::Unknown`](crate::dbgeng::Flow::Unknown) because a
+//! variable-length encoding this decoder does not know may be anything at all.
+//!
+//! **It is not decoded, though, and an earlier draft of this paragraph said it was.** "No
+//! instruction writes the PC" rules out a *seventh shape*; it does not rule out a seventh
+//! **class**, and a later architecture can add one — Armv9.6's FEAT_CMPBR does, with a
+//! register-to-register compare-and-branch at `0111010` where the Armv8 conditional branch is
+//! `0101010`. This decodes six classes and reads anything else as a fall-through, so on a target
+//! with such an instruction it is **incomplete rather than wrong**: a conditional branch read as a
+//! fall-through keeps the edge that is really there and loses the taken one. That costs a
+//! [`Flow::Branch`](crate::dbgeng::Flow::Branch)'s second edge, which weakens a NOT REACHABLE — a
+//! best-effort verdict by contract — and never underwrites a REACHABLE, which is the one that has
+//! to be sound.
+//!
+//! FEAT_CMPBR is not decoded because no target here has it: adding masks for an encoding nothing
+//! can render would put a *computed branch destination* behind a recollection of a table, and a
+//! wrong destination is the one failure this whole module is arranged to avoid. Reopen it with a
+//! target that renders one.
 //!
 //! # The word, and which end of it is first
 //!
@@ -174,6 +189,9 @@ pub(crate) fn flow(word: u32, address: u64) -> Flow {
     if (word >> 25) & 0xf == 0 {
         return Flow::Trap;
     }
+    // Not a class this decodes. On the Armv8 baseline that is an ordinary instruction and the
+    // answer is right; on a later architecture it may be a branch class that did not exist when
+    // these masks were written, and the module header says which one and why it is not here.
     Flow::Fallthrough
 }
 
@@ -412,6 +430,22 @@ mod tests {
         // for ever, and they carry no control flow to get wrong either way.
         assert_eq!(flow(0x0200_0000, 0x1000), Flow::Fallthrough);
         assert_eq!(flow(0x0600_0000, 0x1000), Flow::Fallthrough);
+    }
+
+    /// A branch class this does not decode reads as a fall-through, and that is a **documented**
+    /// limit rather than an undiscovered one.
+    ///
+    /// The word is Armv9.6 FEAT_CMPBR's `cbbne w1,w2,+8` as review reported it, and it is
+    /// *unverified here* — no target on this bench renders one, which is the whole reason the
+    /// class is not decoded. So what this pins is the behaviour and not the encoding: a word in
+    /// that space is read as continuing, which loses the taken edge and keeps the real one.
+    ///
+    /// It is deliberately a test that **fails when somebody decodes CMPBR**, at which point the
+    /// module header's paragraph about it is the thing to update rather than this assertion to
+    /// relax.
+    #[test]
+    fn test_a_branch_class_this_does_not_decode_reads_as_a_fall_through() {
+        assert_eq!(flow(0x74e2_8041, 0x1000), Flow::Fallthrough);
     }
 
     #[test]
