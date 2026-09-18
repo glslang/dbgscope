@@ -105,17 +105,28 @@ pub(crate) fn flow(word: u32, address: u64) -> Flow {
             _ => Flow::Fallthrough,
         };
     }
-    // Exception generation: `11010100 opc imm16 op2 LL`.
+    // Exception generation: `11010100 opc imm16 op2 LL`. **Only the system-call family continues
+    // at the next instruction**, and that is the rule rather than a list of the ones that do not.
+    //
+    // `svc`, `hvc` and `smc` are `opc` `000`: they call into a higher exception level and return
+    // to the following word, so stopping there would discard everything after a system call.
+    // Everything else in this class raises an exception that resumes somewhere else or not at all
+    // — `brk` and `hlt` (`001`, `010`), which MSVC emits as `brk #0xf000` behind an unreachable
+    // tail, this architecture's `__fastfail`; `tcancel` (`011`), which unwinds to the continuation
+    // its `tstart` named and is UNDEFINED outside a transaction, so it has no fall-through under
+    // either reading; the `dcps` family (`101`), which enters debug state rather than continuing;
+    // and every unallocated encoding in between, UNDEFINED being an exception too.
+    //
+    // **The default here is the opposite of this function's**, deliberately. Outside this class a
+    // word nothing matched is almost always an ordinary instruction from an extension this does
+    // not enumerate, so falling through is the accurate answer. Inside it the encoding space is
+    // small and all of it traps, so the accurate answer is to stop — and where the two readings
+    // of a rare encoding differ, stopping costs a `NOT REACHABLE` that is best-effort by contract
+    // while continuing costs a `REACHABLE` that is meant to be sound.
     if word & 0xff00_0000 == 0xd400_0000 {
         return match (word >> 21) & 0x7 {
-            // `brk` and `hlt`. Both trap to the debugger or the host with no architectural return
-            // path, and MSVC emits `brk #0xf000` as the padding behind an unreachable tail — the
-            // `__fastfail` of this architecture, and the reason a walk must not fall through one.
-            0b001 | 0b010 => Flow::Trap,
-            // `svc`, `hvc`, `smc` (`opc` `000`), and the `dcps` family (`101`), which exists only
-            // in debug state. All of them resume at the next instruction, so stopping here would
-            // discard everything after a system call.
-            _ => Flow::Fallthrough,
+            0b000 => Flow::Fallthrough,
+            _ => Flow::Trap,
         };
     }
     // `udf #imm16` — the permanently undefined encoding, `0000000000000000 imm16`. It is what a
@@ -283,9 +294,34 @@ mod tests {
         assert_eq!(flow(0xd43e_0000, 0x1000), Flow::Trap);
         // `hlt #0`.
         assert_eq!(flow(0xd440_0000, 0x1000), Flow::Trap);
-        // `svc #0` returns, and a walk that stopped there would lose the rest of every routine
-        // that makes a system call.
+        // The system-call family, all three of it: `svc #0`, `hvc #0`, `smc #0`. A walk that
+        // stopped at one would lose the rest of every routine that makes a system call.
         assert_eq!(flow(0xd400_0001, 0x1000), Flow::Fallthrough);
+        assert_eq!(flow(0xd400_0002, 0x1000), Flow::Fallthrough);
+        assert_eq!(flow(0xd400_0003, 0x1000), Flow::Fallthrough);
+    }
+
+    /// Everything in the exception-generation class but the system-call family stops.
+    ///
+    /// The point is the **default**, not the individual encodings: this class is where a word
+    /// nothing matched must not be read as falling through, and the two that make that concrete
+    /// are `tcancel` and `dcps`. `tcancel` unwinds to the continuation its `tstart` named and is
+    /// UNDEFINED outside a transaction, so it has no fall-through under either reading — and it is
+    /// the one a catch-all gets wrong quietly, since it would report the post-cancel code as
+    /// reachable by an edge the processor has not got.
+    #[test]
+    fn test_nothing_else_in_the_exception_class_falls_through() {
+        // `tcancel #1`, `opc` 011.
+        assert_eq!(flow(0xd460_0020, 0x1000), Flow::Trap);
+        // `dcps1`, `dcps2`, `dcps3` — `opc` 101, `LL` 01/10/11.
+        assert_eq!(flow(0xd4a0_0001, 0x1000), Flow::Trap);
+        assert_eq!(flow(0xd4a0_0002, 0x1000), Flow::Trap);
+        assert_eq!(flow(0xd4a0_0003, 0x1000), Flow::Trap);
+        // An unallocated `opc` in the class. UNDEFINED is an exception, so it does not continue
+        // either, and this is the arm the reasoning above is actually about.
+        assert_eq!(flow(0xd480_0000, 0x1000), Flow::Trap);
+        // The neighbouring class is untouched: `1101 011` is the register branches, not this.
+        assert_eq!(flow(0xd65f_03c0, 0x1000), Flow::Return);
     }
 
     #[test]
