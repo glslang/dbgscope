@@ -86,11 +86,22 @@ pub(crate) fn flow(word: u32, address: u64) -> Flow {
     // register, so every one of these is `None` — the encoding does not carry it, and a caller
     // reading `None` as "no edge" stays sound.
     //
-    // `opc` alone separates them, including the pointer-authentication forms: `braa`/`brab` are
-    // `1000` to `br`'s `0000`, `blraa`/`blrab` are `1001` to `blr`'s `0001`, and `retaa`/`retab`
-    // share `ret`'s `0010`. So the low three bits of `opc` would be enough for the first two and
-    // the whole nibble is matched anyway, because `0101` (`drps`) is not `0001`.
+    // **The fixed fields are checked first, and only the two that are fixed the same way for every
+    // allocated form.** `op2` is `11111` and `op3` is one of three values throughout the table, so
+    // requiring them cannot exclude a real branch — while `0xd6200000`, which has `op2` zero, is
+    // unallocated and would otherwise read as a `blr` and fall through. `Rn` and `op4` vary *per
+    // form* (`retaa` pins `Rn`, `braa` uses `op4` as a second register), and a mistake there costs
+    // a truncated walk at every indirect call on the architecture, which is a worse failure than
+    // the one this is closing. So they are left unchecked deliberately rather than overlooked.
+    //
+    // `opc` then separates the forms, pointer authentication included: `braa`/`brab` are `1000` to
+    // `br`'s `0000`, `blraa`/`blrab` are `1001` to `blr`'s `0001`, and `retaa`/`retab` share
+    // `ret`'s `0010`.
     if word & 0xfe00_0000 == 0xd600_0000 {
+        let (op2, op3) = ((word >> 16) & 0x1f, (word >> 10) & 0x3f);
+        if op2 != 0b11111 || !matches!(op3, 0b000000 | 0b000010 | 0b000011) {
+            return Flow::Trap;
+        }
         return match (word >> 21) & 0xf {
             // `br`, `braaz`, `brabz`, `braa`, `brab`.
             0b0000 | 0b1000 => Flow::Jmp(None),
@@ -100,32 +111,39 @@ pub(crate) fn flow(word: u32, address: u64) -> Flow {
             // and a debug-state restore: neither continues at the next instruction, which is the
             // only property `Return` claims here.
             0b0010 | 0b0100 | 0b0101 => Flow::Return,
-            // Unallocated. Fall through rather than stop: this decodes control flow, and a word it
-            // does not recognise has not been shown to transfer any.
-            _ => Flow::Fallthrough,
+            // Unallocated, and UNDEFINED is an exception rather than a no-op: control does not
+            // reach the next word. Same rule as the class below, and see it for why the default
+            // inside a class is the opposite of this function's own.
+            _ => Flow::Trap,
         };
     }
     // Exception generation: `11010100 opc imm16 op2 LL`. **Only the system-call family continues
     // at the next instruction**, and that is the rule rather than a list of the ones that do not.
     //
-    // `svc`, `hvc` and `smc` are `opc` `000`: they call into a higher exception level and return
-    // to the following word, so stopping there would discard everything after a system call.
-    // Everything else in this class raises an exception that resumes somewhere else or not at all
-    // — `brk` and `hlt` (`001`, `010`), which MSVC emits as `brk #0xf000` behind an unreachable
-    // tail, this architecture's `__fastfail`; `tcancel` (`011`), which unwinds to the continuation
-    // its `tstart` named and is UNDEFINED outside a transaction, so it has no fall-through under
-    // either reading; the `dcps` family (`101`), which enters debug state rather than continuing;
-    // and every unallocated encoding in between, UNDEFINED being an exception too.
+    // `svc`, `hvc` and `smc` call into a higher exception level and return to the following word,
+    // so stopping there would discard everything after a system call. They are the three `LL`
+    // values under `opc` `000` with `op2` zero, and all three fields are matched: `opc` alone lets
+    // `0xd4000000` (reserved `LL`) and `0xd4000004` (nonzero `op2`) through, and both are
+    // unallocated.
     //
-    // **The default here is the opposite of this function's**, deliberately. Outside this class a
-    // word nothing matched is almost always an ordinary instruction from an extension this does
-    // not enumerate, so falling through is the accurate answer. Inside it the encoding space is
-    // small and all of it traps, so the accurate answer is to stop — and where the two readings
-    // of a rare encoding differ, stopping costs a `NOT REACHABLE` that is best-effort by contract
-    // while continuing costs a `REACHABLE` that is meant to be sound.
+    // Everything else here raises an exception that resumes somewhere else or not at all — `brk`
+    // and `hlt` (`001`, `010`), which MSVC emits as `brk #0xf000` behind an unreachable tail, this
+    // architecture's `__fastfail`; `tcancel` (`011`), which unwinds to the continuation its
+    // `tstart` named and is UNDEFINED outside a transaction, so it has no fall-through under
+    // either reading; the `dcps` family (`101`), which enters debug state rather than continuing;
+    // and every unallocated encoding among them, UNDEFINED being an exception too.
+    //
+    // **The default inside a class is the opposite of this function's**, deliberately, and it is
+    // why both this class and the register branches above end in `Trap`. Outside them a word
+    // nothing matched is almost always an ordinary instruction from an extension this does not
+    // enumerate, so falling through is the accurate answer; inside them the encoding space is
+    // fully spoken for and what is left over is UNDEFINED. Where the two readings of a rare
+    // encoding differ, stopping costs a `NOT REACHABLE` that is best-effort by contract while
+    // continuing costs a `REACHABLE` that is meant to be sound.
     if word & 0xff00_0000 == 0xd400_0000 {
-        return match (word >> 21) & 0x7 {
-            0b000 => Flow::Fallthrough,
+        let (opc, op2, ll) = ((word >> 21) & 0x7, (word >> 2) & 0x7, word & 0x3);
+        return match (opc, op2, ll) {
+            (0b000, 0b000, 0b01 | 0b10 | 0b11) => Flow::Fallthrough,
             _ => Flow::Trap,
         };
     }
@@ -299,6 +317,36 @@ mod tests {
         assert_eq!(flow(0xd400_0001, 0x1000), Flow::Fallthrough);
         assert_eq!(flow(0xd400_0002, 0x1000), Flow::Fallthrough);
         assert_eq!(flow(0xd400_0003, 0x1000), Flow::Fallthrough);
+    }
+
+    /// An encoding a class does not allocate is UNDEFINED, and UNDEFINED does not fall through.
+    ///
+    /// Both classes whose whole encoding space is spoken for end in `Trap`, and the fields that
+    /// decide it are the ones a mask on the top bits does not reach. `0xd6200000` has `opc` `0001`
+    /// and would read as a `blr` — it has `op2` zero, so it is not one; `0xd4000000` has `opc`
+    /// `000` and would read as a system call — its `LL` is the reserved value; `0xd4000004` has a
+    /// nonzero `op2`. Each of the three falls through if only `opc` is read, which is a sequential
+    /// edge the processor has not got.
+    ///
+    /// The controls beside them are the real instructions nearest each: getting the guard wrong in
+    /// the other direction would turn every indirect call on the architecture into a dead end.
+    #[test]
+    fn test_an_unallocated_encoding_in_an_allocated_class_stops() {
+        // `op2` must be `11111` and `op3` one of three values, for every form in the table.
+        assert_eq!(flow(0xd620_0000, 0x1000), Flow::Trap);
+        assert_eq!(flow(0xd63f_0400, 0x1000), Flow::Trap);
+        // And the four real ones those two are a bit away from.
+        assert_eq!(flow(0xd63f_0000, 0x1000), Flow::Call(None));
+        assert_eq!(flow(0xd61f_0000, 0x1000), Flow::Jmp(None));
+        assert_eq!(flow(0xd65f_0bff, 0x1000), Flow::Return);
+        assert_eq!(flow(0xd63f_0800, 0x1000), Flow::Call(None));
+        // An unallocated `opc` inside the class, which used to fall through.
+        assert_eq!(flow(0xd67f_0000, 0x1000), Flow::Trap);
+
+        // The system-call family is `opc` `000`, `op2` `000`, and one of three `LL` values.
+        assert_eq!(flow(0xd400_0000, 0x1000), Flow::Trap);
+        assert_eq!(flow(0xd400_0004, 0x1000), Flow::Trap);
+        assert_eq!(flow(0xd400_0005, 0x1000), Flow::Trap);
     }
 
     /// Everything in the exception-generation class but the system-call family stops.
