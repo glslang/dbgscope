@@ -7,9 +7,31 @@
 //! dispatch routine and reports what it could **not** read — the number that matters is the
 //! `Other` count and the `Unknown` flow count, both of which should be zero on x64.
 //!
+//! **On ARM64 the `Other` count is not expected to be zero, and that is the contract rather than a
+//! shortfall** — so the run prints *what* each one was and not only how many, because the two
+//! kinds of `Other` mean opposite things and the count alone cannot tell them apart:
+//!
+//! * an **operand kind this type has no shape for**, named rather than dropped — a system
+//!   register (`s3_0_c1_c0_0`), a barrier's domain (`sy`), a shift folded into an arithmetic
+//!   operand (`lsl #0x38`), a vector lane (`v17.d[1]`). The instruction around it is fully
+//!   decoded and this is the operand's name.
+//! * an **instruction in a space the decoder does not shape**, which is the whole operand list and
+//!   carries that space's name — `advanced-simd`, `sve`, `unallocated`. This is the count the
+//!   issue was about, and over an IOCTL dispatch routine, which is integer code, it should be
+//!   nothing at all.
+//!
 //! It also answers the question the reading exists for: how many `cmp`/`sub` immediates inside an
 //! IOCTL dispatch routine decode as plausible `CTL_CODE` values, which is the premise a static
 //! IOCTL map rests on.
+//!
+//! Measured on `mountmgr!MountMgrDeviceControl` in the 26100 **ARM64** kernel dump: 582
+//! instructions walked, no unknown flow, the two decode paths agreeing on every one of them, six
+//! `Other` operands — three shift modifiers, two post-index amounts and a vector lane, every one
+//! of them a *named* operand kind and none of them an instruction left unshaped — and five
+//! recovered control codes.
+//! The compare that recovers them is `cmp w19,#0x6DC,lsl #0xC`, which is the shifted literal
+//! dbgscope#170 was about: the immediate has to reach the caller as `0x6dc000` and not as
+//! `0x6dc`, or the map is of a driver that accepts nothing.
 //!
 //! ```text
 //! cargo run --example typed_disassembly -- <dump> <module>!<symbol> [image search path]
@@ -137,6 +159,8 @@ fn main() {
     );
 
     let (mut unreadable, mut other_operands, mut unknown_flow) = (0usize, 0usize, 0usize);
+    let mut other_kinds: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     let mut candidates: Vec<(u64, u64)> = Vec::new();
     let mut calls: Vec<(u64, String)> = Vec::new();
 
@@ -155,16 +179,27 @@ fn main() {
         for operand in &instruction.operands {
             if let Operand::Other(text) = operand {
                 other_operands += 1;
+                *other_kinds.entry(text.clone()).or_insert(0usize) += 1;
                 println!(
-                    "  UNREAD OPERAND {:#x}  {}  <- {text:?}",
+                    "  OTHER OPERAND {:#x}  {}  <- {text:?}",
                     instruction.address, instruction.text
                 );
             }
         }
 
         // The premise: a compare against a control code, recovered as a value.
-        if matches!(instruction.mnemonic.as_str(), "cmp" | "sub" | "xor" | "add")
-            && let Some(Operand::Immediate(value)) = instruction.operands.get(1)
+        //
+        // **Any immediate operand, not the second one.** x64's arithmetic is two-operand, so the
+        // immediate is always at index 1 there and this reads the same; A64's is three-operand
+        // (`sub w0,w0,#0x221`), and an index would find a register and report that the routine
+        // recognises nothing.
+        if matches!(
+            instruction.mnemonic.as_str(),
+            "cmp" | "sub" | "xor" | "add" | "subs" | "adds"
+        ) && let Some(Operand::Immediate(value)) = instruction
+            .operands
+            .iter()
+            .find(|operand| matches!(operand, Operand::Immediate(_)))
             && plausible_ioctl(*value)
         {
             candidates.push((instruction.address, *value));
@@ -209,15 +244,20 @@ fn main() {
                         continue;
                     };
                     compared += 1;
-                    // **The mnemonic is only compared where it is decoded.** On a set whose
-                    // operands are not read, `disassemble` takes it from the rendering's first
-                    // token and `decode_range` has no rendering to take it from, so the two differ
-                    // on every instruction by construction — which on ARM64 reported thirty
-                    // disagreements over a thirty-instruction routine and would have hidden a real
-                    // one. What is left compared there is what both paths really decode: the
-                    // encoding and the flow.
-                    let mnemonics_differ =
-                        set.operands_are_read() && one.mnemonic != other.mnemonic;
+                    // **The mnemonic is only compared where both paths decoded one.** On a set
+                    // whose operands are not read, `disassemble` takes it from the rendering's
+                    // first token and `decode_range` has no rendering to take it from, so the two
+                    // differ on every instruction by construction — which used to report thirty
+                    // disagreements over a thirty-instruction ARM64 routine and would have hidden
+                    // a real one. ARM64 decodes its operands now, so this compares there too; the
+                    // empty check is what is left of the same rule, and it still fires per
+                    // instruction, for the ones in a space the decoder names rather than shapes.
+                    // An empty mnemonic is "this path had nothing to name it" and not a
+                    // disagreement about the bytes, which the `bytes` comparison beside it covers.
+                    let mnemonics_differ = set.operands_are_read()
+                        && !one.mnemonic.is_empty()
+                        && !other.mnemonic.is_empty()
+                        && one.mnemonic != other.mnemonic;
                     if one.bytes != other.bytes || mnemonics_differ || one.flow != other.flow {
                         disagreed += 1;
                         println!(
@@ -240,6 +280,10 @@ fn main() {
     println!("instructions the engine could not render: {unreadable}");
     println!("operands kept as Other:                   {other_operands}");
     println!("instructions with Unknown flow:           {unknown_flow}");
+    // The breakdown, because the count above carries two different meanings -- see the header.
+    for (text, count) in &other_kinds {
+        println!("    {count:>5}  {text}");
+    }
 
     println!(
         "\n--- plausible CTL_CODE immediates ({}) ---",

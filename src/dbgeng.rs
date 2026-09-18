@@ -1966,25 +1966,25 @@ pub struct StackFrame {
 /// this does not implement is [`Self::Other`]: mnemonic kept, operands empty, [`Flow::Unknown`].
 /// That is a refusal rather than a guess.
 ///
-/// # Two gates, not one, because ARM64 answers yes to one of them
+/// # Two gates, not one, though the three sets here answer both the same way
 ///
-/// [`Self::flow_is_read`] and [`Self::operands_are_read`] used to be the same question and are no
-/// longer. Flow on A64 is a bounded, fixed-width decode of the Armv8 baseline's six branch classes
-/// ([`crate::arm64`], which records what a later architecture's seventh would cost); typed
-/// *operands* there are a second decoder with nobody waiting for them. So ARM64 answers
-/// [`Flow`] and empty operands, and a caller asks the **set** which of the two it is getting.
+/// [`Self::flow_is_read`] and [`Self::operands_are_read`] are different questions that currently
+/// have the same answer, and the reason to keep them apart is that ARM64 spent a release
+/// answering them differently: A64's flow is six branch classes and landed on its own
+/// (dbgscope#148), and its operands are a second decoder that landed after (dbgscope#170).
+/// A caller asks whichever it depends on — a reachability walk needs the flow, an IOCTL map needs
+/// the operands — and the next architecture may well arrive the same way round.
 ///
-/// That is a change of contract worth stating plainly: "no operands were read" used to be legible
-/// from [`Flow::Unknown`] beside an empty operand list, and on ARM64 it no longer is — the flow
-/// there is a real answer. The `Instruction` fields that used to point at the flow as their tell
-/// now point here.
+/// **Neither is legible from an instruction's fields, which is why they are here.** "No operands
+/// were read" used to be readable from [`Flow::Unknown`] beside an empty operand list; since A64,
+/// an empty operand list means an instruction that takes none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstructionSet {
     /// x86, 32-bit.
     X86,
     /// x86-64.
     Amd64,
-    /// ARM64 (AArch64). Flow is decoded; operands are not.
+    /// ARM64 (AArch64).
     Arm64,
     /// Anything else — ARM32, IA64, and the ARM64EC and ARM64X machine values, none of which has
     /// been measured here. The `IMAGE_FILE_MACHINE_*` value is kept so a caller can say which one
@@ -2012,9 +2012,14 @@ impl InstructionSet {
     /// instruction comes back with an empty operand list, no registers, and `privileged` false —
     /// none of which is a claim about the instruction.
     ///
-    /// **False for ARM64**, whose flow is read all the same: see [`Self::flow_is_read`].
+    /// **True for ARM64 since [`crate::arm64`] grew an operand decoder**, which is what closed
+    /// dbgscope#170. What that decoder does *not* shape — the Advanced SIMD, SVE and SME spaces,
+    /// less every encoding in them that reaches a general-purpose register or the flags — says so
+    /// in the instruction rather than in this answer: a single [`Operand::Other`] naming the space
+    /// it came from. Measured over the 26100 ARM64 kernel's `nt`, that is 0.42% of the 1,189,047
+    /// instructions the engine could render in `.text` and `PAGE`.
     pub fn operands_are_read(self) -> bool {
-        matches!(self, Self::X86 | Self::Amd64)
+        matches!(self, Self::X86 | Self::Amd64 | Self::Arm64)
     }
 
     /// Whether [`Instruction::flow`] is decoded for this set. False means every instruction comes
@@ -2053,8 +2058,8 @@ pub enum Flow {
     /// bytes a decoder that does know the set could not make an instruction of. Says nothing about
     /// what it does, but there *is* something there.
     ///
-    /// It is no longer the tell for "operands were not read" — ARM64 answers a real flow and no
-    /// operands, and [`InstructionSet::operands_are_read`] is what separates those.
+    /// It is not the tell for "operands were not read": [`InstructionSet::operands_are_read`] is
+    /// that question, and the two came apart when ARM64 answered a real flow with no operands.
     Unknown,
     /// There is no instruction here. The engine rendered `???`, which is what it prints when the
     /// bytes could not be read at all — an unmapped page, or a dump that never captured the code.
@@ -2359,9 +2364,13 @@ pub struct Instruction {
     pub mnemonic: String,
     /// The operands, in the order printed. Empty for an instruction that takes none — and also
     /// for an instruction set whose operands are not read, which
-    /// [`InstructionSet::operands_are_read`] tells apart. **Not the flow**: ARM64 has a decoded
-    /// flow and no operands, so reading `Flow::Unknown` as the tell reports every A64 instruction
-    /// as one that takes no operands.
+    /// [`InstructionSet::operands_are_read`] tells apart. **Not the flow**, which is a separate
+    /// question and answers for one set more than this one has ever answered for.
+    ///
+    /// **In the order printed is the contract, and on A64 that is not destination-first.** A store
+    /// names its source first — `str x8,[x9]` is `[Register, Memory]` where x64's `mov [rcx],rax`
+    /// is `[Memory, Register]` — so `operands[0]` is not the destination there. [`Self::writes`]
+    /// is the field that answers what changed, on both.
     pub operands: Vec<Operand>,
     /// What the instruction does to control flow.
     pub flow: Flow,
@@ -2375,13 +2384,18 @@ pub struct Instruction {
     /// table is generated from the instruction set itself, so the question is asked once and
     /// stays right as the set grows.
     ///
-    /// `false` on an instruction set whose operands this build does not decode — ARM64 included,
-    /// where the flow *is* decoded — because nothing was read, so nothing is claimed. A caller
-    /// that needs to tell "no privileged instructions" from "not asked" reads
-    /// [`InstructionSet::operands_are_read`], not the flow.
+    /// `false` on an instruction set whose operands this build does not decode, because nothing
+    /// was read, so nothing is claimed. A caller that needs to tell "no privileged instructions"
+    /// from "not asked" reads [`InstructionSet::operands_are_read`], not the flow.
     ///
-    /// One deliberate gap, iced's rather than this crate's: `vmcall` is excluded, being the one
-    /// CPL=0-encoded instruction a guest executes at any privilege level.
+    /// **On A64 it is `op1` rather than a register name**, that field naming the minimum exception
+    /// level of every system-register and system-instruction encoding — so the question is asked
+    /// of the encoding there too, and a table of AArch64 system-register names, which is hundreds
+    /// of rows and grows with the architecture, never has to be right.
+    /// [`crate::arm64`] states the one carve-out and why it is one.
+    ///
+    /// One deliberate gap on x64, iced's rather than this crate's: `vmcall` is excluded, being the
+    /// one CPL=0-encoded instruction a guest executes at any privilege level.
     pub privileged: bool,
     /// What the instruction does to its operands, in the classes an analysis branches on.
     ///
@@ -2465,7 +2479,7 @@ pub struct Instruction {
     ///
     /// Empty for an instruction set this build does not decode, and empty means **"not decoded"**
     /// rather than "reads nothing" -- the same contract [`Self::writes`] states, and a consumer
-    /// that needs the difference reads [`Self::flow`].
+    /// that needs the difference reads [`InstructionSet::operands_are_read`].
     pub reads: Vec<RegisterOperand>,
 }
 
@@ -3026,23 +3040,21 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
 /// disagree on an encoding one decoder knows and the other does not; they are the same bytes, and
 /// the fields say which reading they came from.
 #[derive(Debug)]
-struct Decoded {
-    mnemonic: String,
-    operands: Vec<Operand>,
-    flow: Flow,
-    privileged: bool,
-    effect: Effect,
-    condition: Option<Condition>,
-    writes_flags: bool,
-    writes: Vec<RegisterOperand>,
-    reads: Vec<RegisterOperand>,
+pub(crate) struct Decoded {
+    pub(crate) mnemonic: String,
+    pub(crate) operands: Vec<Operand>,
+    pub(crate) flow: Flow,
+    pub(crate) privileged: bool,
+    pub(crate) effect: Effect,
+    pub(crate) condition: Option<Condition>,
+    pub(crate) writes_flags: bool,
+    pub(crate) writes: Vec<RegisterOperand>,
+    pub(crate) reads: Vec<RegisterOperand>,
 }
 
 impl Decoded {
-    /// A flow and nothing else. Two callers: bytes nothing decoded, where the flow is
-    /// [`Flow::Unknown`] or [`Flow::Unreadable`] and the name is literal; and ARM64, where the
-    /// flow is a real answer and everything this zeroes is genuinely unread —
-    /// [`InstructionSet::operands_are_read`] being what says so.
+    /// A flow and nothing else: bytes nothing decoded, where the flow is [`Flow::Unknown`] or
+    /// [`Flow::Unreadable`] and the name is literal.
     fn nothing(flow: Flow) -> Self {
         Self {
             mnemonic: String::new(),
@@ -3068,12 +3080,11 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
     let bitness = match set {
         InstructionSet::X86 => 32,
         InstructionSet::Amd64 => 64,
-        // Flow only, and the mnemonic still comes from the rendering's first token, which every
-        // syntax puts first. **The word is assembled big-endian from these bytes**, which looks
-        // wrong for a little-endian architecture and is not: this column is the engine's
-        // *rendering* of the instruction, and it prints the word rather than the memory
-        // (`a9bf7bfd` for `stp fp,lr,[sp,#-0x10]!`, whose four bytes read `fd 7b bf a9`).
-        // `decode_range`, which reads memory, assembles it the other way round.
+        // **The word is assembled big-endian from these bytes**, which looks wrong for a
+        // little-endian architecture and is not: this column is the engine's *rendering* of the
+        // instruction, and it prints the word rather than the memory (`a9bf7bfd` for
+        // `stp fp,lr,[sp,#-0x10]!`, whose four bytes read `fd 7b bf a9`). `decode_range`, which
+        // reads memory, assembles it the other way round.
         InstructionSet::Arm64 => {
             let Ok(word) = <[u8; crate::arm64::INSTRUCTION_BYTES]>::try_from(
                 &bytes[..bytes.len().min(crate::arm64::INSTRUCTION_BYTES)],
@@ -3083,7 +3094,7 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
                 // built out of bytes nobody read.
                 return Decoded::nothing(Flow::Unknown);
             };
-            return Decoded::nothing(crate::arm64::flow(u32::from_be_bytes(word), address));
+            return crate::arm64::decode(u32::from_be_bytes(word), address);
         }
         // Not decoded at all: the mnemonic is still the rendering's first token, and the caller
         // reads `Flow::Unknown` as "nothing was claimed".
@@ -6802,14 +6813,11 @@ impl DebugEngine {
     /// runs into data, decodes as whatever those bytes are. Bound it with a function's own extent
     /// where there is one, and read [`Flow`] rather than trusting a listing's shape.
     ///
-    /// **ARM64 answers flow and nothing else**, the same bargain [`Self::disassemble`] makes
-    /// there: no mnemonic, no operands, no registers. That leaves an `Instruction` with neither
-    /// text nor mnemonic, which is a thin record and is still the useful one — a caller reading
-    /// this rather than the rendering is following control flow, and the alternative is
-    /// [`DbgEngError::UndecodedInstructionSet`] for a target whose flow this now decodes. A64
-    /// being fixed-width, nothing resynchronises there and a span that begins mid-instruction
-    /// cannot: it begins at a word boundary or it begins at the wrong place for every instruction
-    /// in it.
+    /// **ARM64 answers everything but the text**, [`crate::arm64`] decoding the word rather than a
+    /// rendering — so this path is the one that gains most from it, being the one with no
+    /// rendering to fall back on. A64 being fixed-width, nothing resynchronises there and a span
+    /// that begins mid-instruction cannot: it begins at a word boundary or it begins at the wrong
+    /// place for every instruction in it.
     pub fn decode_range(
         &self,
         address: u64,
@@ -6884,7 +6892,7 @@ impl DebugEngine {
         Ok(out)
     }
 
-    /// [`Self::decode_range`]'s A64 half: fixed-width words, flow, nothing else.
+    /// [`Self::decode_range`]'s A64 half: fixed-width words, decoded whole.
     ///
     /// **The bytes are assembled little-endian here and big-endian in
     /// [`split_instruction`]**, and both are right. This reads memory, where A64 stores a word
@@ -6905,19 +6913,20 @@ impl DebugEngine {
             .map(|(index, chunk)| {
                 let at = address + (index * crate::arm64::INSTRUCTION_BYTES) as u64;
                 let word = u32::from_le_bytes(chunk.try_into().expect("chunks_exact gives four"));
+                let decoded = crate::arm64::decode(word, at);
                 Instruction {
                     address: at,
                     bytes: hex::encode(word.to_be_bytes()),
                     text: String::new(),
-                    mnemonic: String::new(),
-                    operands: Vec::new(),
-                    flow: crate::arm64::flow(word, at),
-                    privileged: false,
-                    effect: Effect::Other,
-                    condition: None,
-                    writes_flags: false,
-                    writes: Vec::new(),
-                    reads: Vec::new(),
+                    mnemonic: decoded.mnemonic,
+                    operands: decoded.operands,
+                    flow: decoded.flow,
+                    privileged: decoded.privileged,
+                    effect: decoded.effect,
+                    condition: decoded.condition,
+                    writes_flags: decoded.writes_flags,
+                    writes: decoded.writes,
+                    reads: decoded.reads,
                 }
             })
             .collect())
@@ -9937,12 +9946,48 @@ mod tests {
             Flow::Call(Some(0xfffff802_e9e5d280)),
             "the destination the engine itself printed: {call:?}"
         );
-        // The mnemonic is still the rendering's first token -- nothing here decodes one -- and the
-        // operands are still empty, which `operands_are_read` is what says.
         assert_eq!(call.mnemonic, "bl");
-        assert!(call.operands.is_empty(), "{call:?}");
-        assert!(!InstructionSet::Arm64.operands_are_read());
+        assert_eq!(call.operands, [Operand::Target(0xfffff802_e9e5d280)]);
+        assert!(InstructionSet::Arm64.operands_are_read());
         assert!(InstructionSet::Arm64.flow_is_read());
+    }
+
+    /// A64's operands arrive through this path too, and the gate that used to separate them from
+    /// the flow now answers yes.
+    ///
+    /// The fields themselves are [`crate::arm64`]'s, and are tested against the engine's own
+    /// renderings there. What is asserted here is the **wiring**: that `split_instruction` hands
+    /// the word to that decoder rather than to `Decoded::nothing`, and that the rendering still
+    /// sits beside the fields untouched.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn test_an_a64_rendering_carries_decoded_operands_beside_it() {
+        let load = split_instruction(
+            0xfffff802_e9e5d5b8,
+            "fffff802`e9e5d5b8 f9426909     ldr         x9,[x8,#0x4D0]",
+            InstructionSet::Arm64,
+        );
+        assert_eq!(
+            load.text, "ldr x9,[x8,#0x4D0]",
+            "the engine's own, verbatim"
+        );
+        assert_eq!(load.mnemonic, "ldr");
+        assert_eq!(load.effect, Effect::Move);
+        assert_eq!(load.flow, Flow::Fallthrough);
+        let Some(Operand::Memory(memory)) = load.operands.get(1) else {
+            panic!("the memory operand was not read: {load:?}");
+        };
+        assert_eq!(memory.displacement, 0x4d0);
+        assert_eq!(memory.base.as_deref(), Some("x8"));
+        // A 32-bit write reaches the whole register on A64 as it does on x64, which is what makes
+        // `full` the field to match these against.
+        assert_eq!(load.writes.len(), 1, "{load:?}");
+        assert_eq!(load.writes[0].full, "x9");
+        assert_eq!(load.reads.len(), 1, "{load:?}");
+        assert_eq!(load.reads[0].full, "x8");
     }
 
     /// A register operand as a fixture writes one: the printed name, and the full-width register
@@ -10432,17 +10477,23 @@ mod tests {
             assert!(!one.privileged, "`{text}` needs no privilege: {one:?}");
         }
 
-        // An instruction set whose operands this build does not read claims nothing: `false` here
-        // means "not asked". **On ARM64 the flow no longer says so** -- `hvc #0` is privileged and
-        // comes back `false` beside a perfectly real `Fallthrough` -- so the tell is the set.
+        // A64 answers this from `op1` rather than from a mnemonic, and `hvc` is one of the few
+        // outside the system class that needs privilege: it calls into the hypervisor and returns
+        // to the following word, so the flow beside it is a real `Fallthrough`.
         let arm64 = split_instruction(
             0x1000,
             "00001000`00000000 d4000002     hvc #0",
             InstructionSet::Arm64,
         );
-        assert!(!arm64.privileged);
+        assert!(arm64.privileged, "{arm64:?}");
         assert_eq!(arm64.flow, Flow::Fallthrough);
-        assert!(!InstructionSet::Arm64.operands_are_read());
+        // And the ordinary instruction beside it does not: `d503201f nop`.
+        let nop = split_instruction(
+            0x1000,
+            "00001000`00000000 d503201f     nop",
+            InstructionSet::Arm64,
+        );
+        assert!(!nop.privileged, "{nop:?}");
 
         // An instruction set with nothing decoded at all still answers the old way.
         let arm32 = split_instruction(
@@ -10548,13 +10599,11 @@ mod tests {
 
     /// A64's flow **is** read, and a conditional branch there keeps both of its edges.
     ///
-    /// This is the half of the bargain `Arm64` added: the encoding says where control goes, and
-    /// the operands stay unread. A caller following a call graph needs the first and not the
-    /// second, which is why the two are separate questions on [`InstructionSet`].
-    ///
     /// The rendering carries the destination too, and it is **not** where this reads it from —
     /// that is the same rule the x64 side keeps, and the reason the rendered target is asserted
-    /// against here rather than parsed.
+    /// against here rather than parsed. The destination reaches the caller twice, as the flow's
+    /// and as an [`Operand::Target`], and they are one value: the flow answers a walk and the
+    /// operand answers a listing.
     #[test]
     #[cfg_attr(
         miri,
@@ -10567,7 +10616,8 @@ mod tests {
             InstructionSet::Arm64,
         );
         assert_eq!(arm64.mnemonic, "b.eq");
-        assert!(arm64.operands.is_empty(), "{arm64:?}");
+        assert_eq!(arm64.operands, [Operand::Target(0xfffff803_89201240)]);
+        assert_eq!(arm64.condition, Some(Condition::Equal));
         assert_eq!(arm64.flow, Flow::Branch(Some(0xfffff803_89201240)));
         assert!(arm64.flow.falls_through());
         assert!(
