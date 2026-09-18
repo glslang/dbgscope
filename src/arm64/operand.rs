@@ -39,7 +39,8 @@
 //! That table counts encodings this decoder does not read. The opposite question — encodings it
 //! reads that the architecture does not allocate — was measured once the review rounds kept
 //! reaching it, by decoding all 4,294,967,296 words twice and keeping every one this shapes and
-//! the generated table refuses. **86 mnemonics, 94,371,456 words, 2.2% of the encoding space.**
+//! the generated table refuses. **86 mnemonics, 88,276,608 words, 2.1% of the encoding space**,
+//! re-measured after the last of the fixes below -- three of them moved it.
 //!
 //! What is left is one kind of thing: a *reserved field nobody constrained*. The exclusive and
 //! atomic family ignores the `Rs`/`Rt2` values the architecture fixes at `11111`, `crc32` does not
