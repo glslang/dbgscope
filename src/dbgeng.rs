@@ -8683,7 +8683,8 @@ impl Drop for ScopedBreakpoint<'_> {
 
 // ---- MIRI AND THE DECODER ------------------------------------------------
 //
-// The eighteen tests below that decode an encoding are `#[cfg_attr(miri, ignore)]`, and this is
+// The twenty-eight tests below that decode an **x86** encoding are `#[cfg_attr(miri, ignore)]`,
+// and this is
 // the reason. `iced-x86`'s byte reader casts an integer to a pointer (`mk_read_xx`, an
 // `unsafe { ptr::read_unaligned(data_ptr as *const _) }`), so the pointer it produces carries no
 // provenance and Stacked Borrows refuses to retag it — inside the crate's own handler tables, on
@@ -8707,7 +8708,16 @@ impl Drop for ScopedBreakpoint<'_> {
 //
 // If iced-x86 ever needs Miri coverage here, the answer is a second job with `-Zmiri-tree-borrows`
 // rather than weakening this one. And a new decoding test that forgets the attribute turns `main`
-// red, which is how this one was found — a self-correcting omission, not a silent one.
+// red, which is how this one was found — a self-correcting omission, not a silent one. It found
+// the next one too, on the merge of dbgscope#171: `decode_instruction`'s own test forgot it, the
+// PR was green because this job runs on `main`, and the count in the first line of this note had
+// been stale since long before either.
+//
+// **The attribute is per *architecture*, not per decoding test**, which is the distinction that
+// note did not have to make until A64 arrived. `crate::arm64` is this crate's own safe Rust and
+// reaches no dependency at all, so a test that decodes only A64 keeps its Miri coverage and
+// should — it is exactly the kind of code this job is for. A test covering both has to be split
+// rather than ignored whole, which is why `decode_instruction` has two.
 
 #[cfg(test)]
 mod tests {
@@ -8726,7 +8736,14 @@ mod tests {
     /// they are calling -- so they pass whatever they have. `[0x90, 0xcc]` came back as a `nop`
     /// carrying `90cc`, and a walker stepping by that length stepped over the `int3` behind it.
     /// Raised on dbgscope#171; every length below is iced's own reading of the same bytes.
+    ///
+    /// The A64 half is a test of its own, so that it keeps running under Miri -- see the note
+    /// above.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
     fn test_a_standalone_decode_reports_only_the_bytes_it_consumed() {
         // One `nop`, then an `int3` that is not part of it.
         let nop = decode_instruction(&[0x90, 0xcc], 0x1000, InstructionSet::Amd64);
@@ -8745,6 +8762,16 @@ mod tests {
         );
         assert_eq!(load.mnemonic, "mov");
         assert_eq!(load.bytes, "488b0500000000");
+    }
+
+    /// The same rule on A64, which is a **separate test so that Miri still runs it**.
+    ///
+    /// `crate::arm64` is this crate's own safe Rust and reaches no dependency, so there is nothing
+    /// here for the iced-x86 exclusion to be about -- and this job exists for exactly this kind of
+    /// code. Folding these assertions into the test above would have ignored them on the one
+    /// architecture the exclusion has no claim over.
+    #[test]
+    fn test_a_standalone_a64_decode_reports_one_word() {
         // A64 is fixed-width, so a caller with two words gets the first.
         // `a9bf7bfd  stp fp,lr,[sp,#-0x10]!` followed by `d503201f  nop`.
         let stp = decode_instruction(
@@ -8754,8 +8781,8 @@ mod tests {
         );
         assert_eq!(stp.mnemonic, "stp");
         assert_eq!(stp.bytes, "a9bf7bfd");
-        // **Bytes nothing decoded still report what the caller passed.** There is no extent to
-        // report, the caller's buffer is the only honest answer, and `Flow::Unknown` beside it
+        // **Bytes that decode to nothing still report what the caller passed.** There is no extent
+        // to report, the caller's buffer is the only honest answer, and `Flow::Unknown` beside it
         // already says nothing was claimed -- so this is a deliberate exception rather than the
         // rule leaking.
         let unknown = decode_instruction(&[0x0f, 0x0b], 0x1000, InstructionSet::Other(0x1234));
