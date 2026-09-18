@@ -11,7 +11,28 @@
 //! data-processing immediate, branches and system, loads and stores, data-processing register —
 //! are shaped operand by operand, with the aliases a compiler emits resolved (`cmp` out of `subs`,
 //! `mov` out of `orr`, `lsr` out of `ubfm`) because an alias changes the operand *list* and not
-//! just the spelling.
+//! just the spelling. Of the extensions on top of it, these are read: the atomics and
+//! compare-and-swaps, pointer authentication, memory tagging, the acquiring unscaled loads, `crc32`,
+//! FlagM, HBC's `bc.cond`, CSSC's minimum and maximum in both their forms, and MOPS' copies and
+//! sets.
+//!
+//! **That paragraph used to be a claim and is now a measurement.** Seven review rounds on
+//! dbgscope#171 each found one or two families it was wrong about — `subps`, the tagging accesses,
+//! the acquiring loads, `cpyfp` — because nobody could check it: a corpus finds only what a target
+//! contains, and no Windows ARM64 image contains any of those.
+//! `examples/undecoded_families.rs` checks it instead, by decoding every 32-bit word twice, once
+//! here and once with tables generated from the architecture, and listing what the second knows and
+//! the first does not. What that leaves, of 3,762 definitions with a general-purpose operand:
+//!
+//! | left unread | what it is |
+//! |---|---|
+//! | 112 | SVE, SVE2 and SME — declined, and the section below says why all-or-nothing |
+//! | 174 | named extensions past Armv8.2: `THE` and `D128` (64), `LSUI` (34), `LSE128` (12), MOPS' guarded forms (12), CMPBR (24), and `LS64`, `CPA`, `POE2`, `RCPC3`, `LSCP`, `GCS`, `TME`, `WFXT` (28 between them) |
+//! | 23 | a definition whose *canonical* encoding is not a legal instruction, so this refuses it correctly: a register-offset load with `option` zero, an `mrs` with bit 20 clear, a fixed-point `fcvtzs` with no fraction bits, a `umov` naming no element size |
+//!
+//! Nothing in the base architecture is left. The extensions are one command away from being
+//! re-counted, which is the point: the next one to be added is a row that moves rather than a round
+//! of review.
 //!
 //! The Advanced SIMD, scalar floating-point, SVE and SME spaces are **not** shaped, and an
 //! instruction in them comes back as a single [`Operand::Undecoded`] naming the space —
@@ -655,8 +676,33 @@ fn add_subtract_immediate(word: u32) -> Out {
 /// `addg`/`subg`, which adjust a pointer's address and its tag together. Decoded for its registers
 /// rather than for its arithmetic: the tag is not a value a caller here follows.
 fn add_subtract_immediate_tags(word: u32) -> Out {
-    // 64-bit only, and `o2` must be zero.
-    if word & 0x8000_0000 == 0 || word & 0x0040_0000 != 0 {
+    // **This slot holds two families, and the bit that separates them is the one an earlier
+    // version rejected on.** With bit 22 set it is CSSC's minimum and maximum against an eight-bit
+    // literal, whose register forms this already decoded two classes away -- so half a family was
+    // read and half was not. Found by enumerating a generated instruction table against this
+    // decoder rather than by review; see `examples/undecoded_families.rs`.
+    if word & 0x0040_0000 != 0 {
+        let wide = word & 0x8000_0000 != 0;
+        if word & 0x6000_0000 != 0 {
+            return Out::undecoded("unallocated");
+        }
+        let (mnemonic, signed) = match field(word, 18, 2) {
+            0b00 => ("smax", true),
+            0b01 => ("umax", false),
+            0b10 => ("smin", true),
+            _ => ("umin", false),
+        };
+        let literal = field(word, 10, 8);
+        return Out::new(mnemonic)
+            .out_reg(gpr(field(word, 0, 5), wide, false))
+            .in_reg(gpr(field(word, 5, 5), wide, false))
+            .imm(match signed {
+                true => sign_extend(literal, 8) as u64,
+                false => literal as u64,
+            });
+    }
+    // The tagged add and subtract, which are 64-bit only.
+    if word & 0x8000_0000 == 0 {
         return Out::undecoded("unallocated");
     }
     Out::new(match word & 0x4000_0000 == 0 {
@@ -1465,6 +1511,15 @@ fn loads_and_stores(word: u32, address: u64) -> Out {
     if word & 0x3b00_0000 == 0x1800_0000 {
         return load_literal(word, address);
     }
+    // The memory-copy and memory-set family, which occupies two top-level slots and is told from
+    // its neighbours in them by `sz` being zero and `op4` being `01`.
+    if matches!(word & 0x3f00_0000, 0x1900_0000 | 0x1d00_0000)
+        && field(word, 30, 2) == 0
+        && field(word, 21, 1) == 0
+        && field(word, 10, 2) == 0b01
+    {
+        return memory_operations(word);
+    }
     if word & 0x3f00_0000 == 0x1900_0000 {
         return match field(word, 21, 1) {
             0 => unscaled_acquire(word),
@@ -1505,6 +1560,52 @@ fn unscaled_acquire(word: u32) -> Out {
         ..MemoryOperand::default()
     };
     transfer_operands(Out::new(&mnemonic), field(word, 0, 5), &access, memory)
+}
+
+/// `cpy` and `set`: the memory-copy and memory-set instructions, which a compiler emits in place
+/// of a `memcpy` or `memset` call.
+///
+/// **All three registers are read and written**, which is the fact worth having: each instruction
+/// is one third of a copy -- a prologue, a main body and an epilogue, run in sequence -- and each
+/// leaves the pointers and the remaining count advanced for the next. A consumer that did not know
+/// that would carry three stale values across an inlined `memcpy`.
+///
+/// The naming is systematic rather than a table, which is the only reason it is here in full:
+/// `op1` picks the stage, and `op2` picks the memory attributes as two independent halves, one for
+/// the read side and one for the write. Derived from a generated instruction table rather than
+/// recalled -- see `examples/undecoded_families.rs`, which is what found this family after review
+/// raised it on dbgscope#171.
+fn memory_operations(word: u32) -> Out {
+    // The two slots differ by one bit: `cpyf`/`set` ignore the tags, `cpy`/`setg` do not.
+    let tagged = field(word, 26, 1) != 0;
+    let (op1, op2) = (field(word, 22, 2), field(word, 12, 4));
+    let (other, rn, rd) = (field(word, 16, 5), field(word, 5, 5), field(word, 0, 5));
+    let stage = ["p", "m", "e"];
+    if op1 == 0b11 {
+        // A set names a destination, a count and the byte to write; only the byte is not updated.
+        let Some(which) = stage.get((op2 >> 2) as usize) else {
+            return Out::undecoded("unallocated");
+        };
+        let suffix = ["", "t", "n", "tn"][(op2 & 0b11) as usize];
+        return Out::new(&format!(
+            "set{}{which}{suffix}",
+            if tagged { "g" } else { "" }
+        ))
+        .inout_reg(gpr(rd, true, false))
+        .inout_reg(gpr(rn, true, false))
+        .in_reg(gpr(other, true, false));
+    }
+    // A copy names a destination, a source and a count, and advances all three.
+    let which = stage[op1 as usize];
+    let read = ["", "wt", "rt", "t"][(op2 & 0b11) as usize];
+    let write = ["", "wn", "rn", "n"][(op2 >> 2) as usize];
+    Out::new(&format!(
+        "cpy{}{which}{read}{write}",
+        if tagged { "" } else { "f" }
+    ))
+    .inout_reg(gpr(rd, true, false))
+    .inout_reg(gpr(other, true, false))
+    .inout_reg(gpr(rn, true, false))
 }
 
 /// The memory-tagging accesses: `stg` and its relatives, `ldg`, and the whole-granule forms.
@@ -2915,14 +3016,20 @@ fn vector_copy(word: u32) -> Out {
             .in_reg(gpr(rn, element == 'd', false))
             .writes_only(vreg_whole(rd))
             .reads_only(vreg_whole(rd)),
+        // **Both are copies out of a lane and neither was saying so.** `umov` zero-extends and
+        // `smov` sign-extends, which is the same pair of effects `uxtb` and `sxtb` carry on the
+        // general-purpose side and the same distinction `Effect::MoveSigned` exists to draw: what
+        // the value means afterwards. Raised on dbgscope#171.
         0b0101 => Out::new("smov")
             .out_reg(gpr(rd, q, false))
             .other(lane(rn))
-            .reads_only(vreg_whole(rn)),
+            .reads_only(vreg_whole(rn))
+            .effect(Effect::MoveSigned),
         0b0111 => Out::new("umov")
             .out_reg(gpr(rd, element == 'd', false))
             .other(lane(rn))
-            .reads_only(vreg_whole(rn)),
+            .reads_only(vreg_whole(rn))
+            .effect(Effect::Move),
         _ => Out::undecoded("advanced-simd"),
     }
 }
@@ -4207,6 +4314,89 @@ mod tests {
         assert_eq!(spellings(&key.reads), ["x7"]);
         // And the base is stack-pointer capable, as every addressing mode's is.
         assert_eq!(spellings(&shapes(0xf82b_9fff).writes), ["sp"]);
+    }
+
+    /// `cpy` and `set`, whose three registers are all read and all written -- the fact a consumer
+    /// carrying values across an inlined `memcpy` needs, and the family review raised on
+    /// dbgscope#171 after a corpus of a million kernel instructions could not: Windows does not
+    /// build for Armv8.8.
+    ///
+    /// Every mnemonic below is the one a generated instruction table gives for the same word, the
+    /// naming being systematic enough to derive rather than tabulate.
+    #[test]
+    fn test_a_memory_copy_advances_all_three_of_its_registers() {
+        // `19010440  cpyfp [x0]!, [x1]!, x2!`.
+        let prologue = shapes(0x1901_0440);
+        assert_eq!(prologue.mnemonic, "cpyfp");
+        assert_eq!(spellings(&prologue.reads), ["x0", "x1", "x2"]);
+        assert_eq!(spellings(&prologue.writes), ["x0", "x1", "x2"]);
+        // The stage is `op1` and the memory attributes are `op2`, as two independent halves.
+        assert_eq!(shapes(0x1941_0440).mnemonic, "cpyfm");
+        assert_eq!(shapes(0x1981_0440).mnemonic, "cpyfe");
+        assert_eq!(shapes(0x1900_5440).mnemonic, "cpyfpwtwn");
+        assert_eq!(shapes(0x1900_f400).mnemonic, "cpyfptn");
+        // The second slot is the tag-preserving copy.
+        assert_eq!(shapes(0x1d01_0440).mnemonic, "cpyp");
+        // `19c20420  setp [x0]!, x1!, x2` -- a set advances two and reads the third, that being
+        // the byte it writes rather than a pointer.
+        let set = shapes(0x19c2_0420);
+        assert_eq!(set.mnemonic, "setp");
+        assert_eq!(spellings(&set.writes), ["x0", "x1"]);
+        assert_eq!(spellings(&set.reads), ["x0", "x1", "x2"]);
+        assert_eq!(shapes(0x19c0_b400).mnemonic, "setetn");
+        assert_eq!(shapes(0x1dc0_0400).mnemonic, "setgp");
+        // `op2` above eleven allocates no stage for a set.
+        assert_eq!(
+            shapes(0x19c0_c400).operands,
+            [Operand::Undecoded("unallocated".to_string())]
+        );
+    }
+
+    /// CSSC's minimum and maximum against a literal, which share the tagged add's slot and were
+    /// half a family: the register forms two classes away were already read.
+    ///
+    /// Found by enumerating a generated table against this decoder rather than by review, which is
+    /// the check `examples/undecoded_families.rs` exists to be.
+    #[test]
+    fn test_the_literal_minimum_and_maximum_share_the_tagged_add_s_slot() {
+        // `11c00000  smax w0,w0,#0` and the three beside it, which `opc` picks.
+        for (word, mnemonic) in [
+            (0x11c0_0000_u32, "smax"),
+            (0x11c4_0000, "umax"),
+            (0x11c8_0000, "smin"),
+            (0x11cc_0000, "umin"),
+        ] {
+            let one = shapes(word);
+            assert_eq!(one.mnemonic, mnemonic);
+            assert_eq!(spellings(&one.writes), ["x0"]);
+        }
+        // The signed pair read their literal as signed and the unsigned pair do not, which is the
+        // only thing separating `smax w0,w0,#-1` from `umax w0,w0,#255`.
+        assert_eq!(shapes(0x11c3_fc00).operands[2], Operand::Immediate(!0));
+        assert_eq!(shapes(0x11c7_fc00).operands[2], Operand::Immediate(0xff));
+        // And the tagged add still has the slot with that bit clear: `918003ff  addg sp,sp,#0,#0`.
+        let tagged = shapes(0x9180_03ff);
+        assert_eq!(tagged.mnemonic, "addg");
+        assert_eq!(spellings(&tagged.writes), ["sp"]);
+    }
+
+    /// `umov` and `smov` copy a lane into a general-purpose register, zero-extending and
+    /// sign-extending respectively -- the same pair of effects `uxtb` and `sxtb` carry, and the
+    /// distinction [`Effect::MoveSigned`] exists to draw. Raised on dbgscope#171.
+    #[test]
+    fn test_a_lane_extraction_is_a_move_and_says_which_kind() {
+        // `0e053c20  umov w0,v1.b[2]` and `0e0e2ce6  smov w6,v7.h[3]`.
+        let zero = shapes(0x0e05_3c20);
+        assert_eq!(zero.mnemonic, "umov");
+        assert_eq!(zero.effect, Effect::Move);
+        assert_eq!(spellings(&zero.writes), ["x0"]);
+        let signed = shapes(0x0e0e_2ce6);
+        assert_eq!(signed.mnemonic, "smov");
+        assert_eq!(signed.effect, Effect::MoveSigned);
+        // The other two members of the class are not copies: `ins` fills one lane and leaves the
+        // rest, and `dup` broadcasts into every one.
+        assert_eq!(shapes(0x4e08_1d10).effect, Effect::Other);
+        assert_eq!(shapes(0x4e04_0c60).effect, Effect::Other);
     }
 
     /// The flow comes from [`super::flow`] unchanged, so one word has one answer whichever field

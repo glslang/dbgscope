@@ -2989,6 +2989,38 @@ pub struct BreakpointInfo {
     pub passes_remaining: u32,
 }
 
+/// One instruction, decoded from bytes you already have, with no debug session anywhere.
+///
+/// Everything else here reaches an instruction through a target: [`DebugEngine::disassemble`] asks
+/// the engine to render one and [`DebugEngine::decode_range`] reads a span out of a live address
+/// space. This is the same decoding without either, for a caller holding the encoding already --
+/// bytes read out of a file, an image mapped by something else, or a word under test.
+///
+/// [`Instruction::text`] is empty, nothing having rendered it, exactly as it is for
+/// [`DebugEngine::decode_range`]. `set` is the caller's to supply, there being no target to ask.
+///
+/// **The bytes are in [`Instruction::bytes`]' order and that is not always memory order.** On x86
+/// and x64 the two coincide. On ARM64 it is the instruction *word*, most significant byte first --
+/// `a9bf7bfd` for `stp fp,lr,[sp,#-0x10]!`, whose four bytes in memory read `fd 7b bf a9` -- so a
+/// caller with a `u32` word passes `word.to_be_bytes()` and one with memory reverses first.
+pub fn decode_instruction(bytes: &[u8], address: u64, set: InstructionSet) -> Instruction {
+    let decoded = decode_operation(bytes, address, set);
+    Instruction {
+        address,
+        bytes: hex::encode(bytes),
+        text: String::new(),
+        mnemonic: decoded.mnemonic,
+        operands: decoded.operands,
+        flow: decoded.flow,
+        privileged: decoded.privileged,
+        effect: decoded.effect,
+        condition: decoded.condition,
+        writes_flags: decoded.writes_flags,
+        writes: decoded.writes,
+        reads: decoded.reads,
+    }
+}
+
 /// Reads a string out of one of DbgEng's two-call string getters.
 ///
 /// They all take the same shape — a buffer, its length, and an out-parameter for the size the

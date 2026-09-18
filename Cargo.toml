@@ -70,6 +70,15 @@ features = [
     "Wdk_System_SystemServices",
 ]
 
+# `examples/undecoded_families.rs` only, which decodes every 32-bit word twice -- once with this
+# crate's A64 decoder and once with a table generated from the architecture -- and reports the
+# instruction families the second knows and the first does not. Seven review rounds on dbgscope#171
+# each found one or two of those by hand; this answers the whole question in fifty seconds, and it
+# is worth a dev-dependency to make "what else is missing" a command rather than a round of review.
+# A dev-dependency costs a consumer of the library nothing: it is not in their graph.
+[dev-dependencies]
+disarm64 = "0.2"
+
 # Only `examples/user_heap_smoke.rs` allocates on the host heap it then walks. Cargo unifies
 # this with the normal dependency when building examples and tests, and a downstream consumer
 # of the library still resolves the four features above and no more.
