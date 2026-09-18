@@ -1100,11 +1100,21 @@ fn branch_register(word: u32) -> Out {
             }
         }
         // `eret` and `drps` return from an exception and from debug state. Both are EL1 and above.
-        0b0100 => Out::new(&match key {
-            "" => "eret".to_string(),
-            key => format!("ereta{key}"),
-        })
-        .privileged(),
+        0b0100 => {
+            let out = Out::new(&match key {
+                "" => "eret".to_string(),
+                key => format!("ereta{key}"),
+            })
+            .privileged();
+            // `eretaa`/`eretab` authenticate the saved exception return address against the stack
+            // pointer, exactly as `retaa` does the link register, and name it no more than that
+            // one does. Raised on dbgscope#171: the `ret` arm above recorded the modifier and this
+            // did not.
+            match key.is_empty() {
+                true => out,
+                false => out.reads_only(stack_pointer()),
+            }
+        }
         0b0101 => Out::new("drps").privileged(),
         _ => Out::undecoded("unallocated"),
     }
@@ -1492,6 +1502,18 @@ fn transfer_operands(out: Out, rt: u32, access: &Access, memory: MemoryOperand) 
         (false, true) => out.out_reg(transfer(rt, access)),
         (false, false) => out.in_reg(transfer(rt, access)),
     };
+    // **A prefetch has no transfer width.** Its `size` field scales the offset -- which is why
+    // [`Access::bytes`] is eight for one and has to be -- but nothing eight bytes wide is moved,
+    // and a consumer bounding an instruction's memory effect from this would be told a range the
+    // architecture does not define. What a prefetch touches is a cache line, whose size is an
+    // implementation's business. Raised on dbgscope#171.
+    let memory = match access.prefetch {
+        true => MemoryOperand {
+            size: None,
+            ..memory
+        },
+        false => memory,
+    };
     out.mem(memory)
         .effect(match (access.prefetch, access.suffix) {
             (true, _) => Effect::Other,
@@ -1581,6 +1603,18 @@ fn memory_operations(word: u32) -> Out {
     let (op1, op2) = (field(word, 22, 2), field(word, 12, 4));
     let (other, rn, rd) = (field(word, 16, 5), field(word, 5, 5), field(word, 0, 5));
     let stage = ["p", "m", "e"];
+    // **A bracketed operand is a memory reference here as it is everywhere else in this decoder**,
+    // which is what a consumer enumerating an instruction's memory effects looks for -- and these
+    // instructions are the whole of a copy or a fill, so reporting none would be the wrong answer
+    // about the largest memory effect the architecture has. The **size is unknown**: how much is
+    // moved is the count register's value rather than an encoded width. The pointer registers stay
+    // in the access lists, a memory operand's base being a read and its writeback a write.
+    // Raised on dbgscope#171.
+    let through = |number: u32| MemoryOperand {
+        base: Some(gpr(number, true, false)),
+        scale: 1,
+        ..MemoryOperand::default()
+    };
     if op1 == 0b11 {
         // A set names a destination, a count and the byte to write; only the byte is not updated.
         let Some(which) = stage.get((op2 >> 2) as usize) else {
@@ -1591,7 +1625,8 @@ fn memory_operations(word: u32) -> Out {
             "set{}{which}{suffix}",
             if tagged { "g" } else { "" }
         ))
-        .inout_reg(gpr(rd, true, false))
+        .mem(through(rd))
+        .writes_only(gpr(rd, true, false))
         .inout_reg(gpr(rn, true, false))
         .in_reg(gpr(other, true, false));
     }
@@ -1603,8 +1638,10 @@ fn memory_operations(word: u32) -> Out {
         "cpy{}{which}{read}{write}",
         if tagged { "" } else { "f" }
     ))
-    .inout_reg(gpr(rd, true, false))
-    .inout_reg(gpr(other, true, false))
+    .mem(through(rd))
+    .writes_only(gpr(rd, true, false))
+    .mem(through(other))
+    .writes_only(gpr(other, true, false))
     .inout_reg(gpr(rn, true, false))
 }
 
@@ -1697,7 +1734,8 @@ fn load_literal(word: u32, address: u64) -> Out {
         (false, 0b00) => (Out::new("ldr").out_reg(gpr(rt, false, false)), 4),
         (false, 0b01) => (Out::new("ldr").out_reg(gpr(rt, true, false)), 8),
         (false, 0b10) => (Out::new("ldrsw").out_reg(gpr(rt, true, false)), 4),
-        (false, _) => (Out::new("prfm").other(prefetch_operation(rt)), 8),
+        // The literal prefetch, whose width is unknown for the reason `transfer_operands` gives.
+        (false, _) => (Out::new("prfm").other(prefetch_operation(rt)), 0),
         (true, 0b00) => (Out::new("ldr").out_reg(vreg(rt, 4)), 4),
         (true, 0b01) => (Out::new("ldr").out_reg(vreg(rt, 8)), 8),
         (true, 0b10) => (Out::new("ldr").out_reg(vreg(rt, 16)), 16),
@@ -1709,7 +1747,7 @@ fn load_literal(word: u32, address: u64) -> Out {
         _ => Effect::Move,
     };
     out.mem(MemoryOperand {
-        size: Some(bytes),
+        size: (bytes != 0).then_some(bytes),
         displacement,
         address: Some(target),
         ..MemoryOperand::default()
@@ -3882,6 +3920,10 @@ mod tests {
         assert_eq!(shapes(0xd65f_0fff).mnemonic, "retab");
         assert_eq!(shapes(0xd69f_0fff).mnemonic, "eretab");
         assert!(shapes(0xd69f_0fff).privileged);
+        // An authenticated exception return reads the stack pointer it authenticates against,
+        // exactly as `retaa` does, and a plain `eret` reads nothing.
+        assert_eq!(spellings(&shapes(0xd69f_0bff).reads), ["sp"]);
+        assert!(shapes(0xd69f_03e0).reads.is_empty());
     }
 
     /// `op1` decides privilege everywhere but the processor-state fields, where zero holds both
@@ -4330,6 +4372,16 @@ mod tests {
         assert_eq!(prologue.mnemonic, "cpyfp");
         assert_eq!(spellings(&prologue.reads), ["x0", "x1", "x2"]);
         assert_eq!(spellings(&prologue.writes), ["x0", "x1", "x2"]);
+        // The two bracketed operands are memory references and the count is not, which is what a
+        // consumer looking for this instruction's memory effect finds. Their size is unknown: how
+        // much is moved is what the count register holds.
+        let Operand::Memory(destination) = &prologue.operands[0] else {
+            panic!("{prologue:?}");
+        };
+        assert_eq!(destination.base.as_deref(), Some("x0"));
+        assert_eq!(destination.size, None);
+        assert!(matches!(prologue.operands[1], Operand::Memory(_)));
+        assert_eq!(prologue.operands[2], register("x2", "x2", 8));
         // The stage is `op1` and the memory attributes are `op2`, as two independent halves.
         assert_eq!(shapes(0x1941_0440).mnemonic, "cpyfm");
         assert_eq!(shapes(0x1981_0440).mnemonic, "cpyfe");
@@ -4341,6 +4393,8 @@ mod tests {
         // the byte it writes rather than a pointer.
         let set = shapes(0x19c2_0420);
         assert_eq!(set.mnemonic, "setp");
+        assert!(matches!(set.operands[0], Operand::Memory(_)));
+        assert_eq!(set.operands[2], register("x2", "x2", 8));
         assert_eq!(spellings(&set.writes), ["x0", "x1"]);
         assert_eq!(spellings(&set.reads), ["x0", "x1", "x2"]);
         assert_eq!(shapes(0x19c0_b400).mnemonic, "setetn");
@@ -4397,6 +4451,31 @@ mod tests {
         // rest, and `dup` broadcasts into every one.
         assert_eq!(shapes(0x4e08_1d10).effect, Effect::Other);
         assert_eq!(shapes(0x4e04_0c60).effect, Effect::Other);
+    }
+
+    /// A prefetch's `size` field scales its offset and is not a transfer width, so it claims none.
+    ///
+    /// Eight bytes was the plausible wrong answer: the field is the one a 64-bit load uses and the
+    /// scaling really is by eight, but nothing that wide moves. What a prefetch touches is a cache
+    /// line, whose size the implementation decides. Raised on dbgscope#171.
+    #[test]
+    fn test_a_prefetch_claims_no_transfer_width() {
+        let size = |word: u32| {
+            let one = shapes(word);
+            let Operand::Memory(memory) = &one.operands[1] else {
+                panic!("{one:?}");
+            };
+            (one.mnemonic.clone(), memory.size, memory.displacement)
+        };
+        // `f9800130  prfm PSTL1KEEP,[x9]` and `f9801021  prfm PLDL1STRM,[x1,#0x20]` -- the offset
+        // is still scaled by eight, which is what the field is for.
+        assert_eq!(size(0xf980_0130), ("prfm".to_string(), None, 0));
+        assert_eq!(size(0xf980_1021), ("prfm".to_string(), None, 0x20));
+        // `f880c040  prfum PLDL1KEEP,[x2,#0xC]` and the literal form.
+        assert_eq!(size(0xf880_c040), ("prfum".to_string(), None, 0xc));
+        assert_eq!(size(0xd807_aa98).1, None);
+        // An ordinary load of the same width still reports one: `f9400021  ldr x1,[x1]`.
+        assert_eq!(size(0xf940_0021), ("ldr".to_string(), Some(8), 0));
     }
 
     /// The flow comes from [`super::flow`] unchanged, so one word has one answer whichever field
