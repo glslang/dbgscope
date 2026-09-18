@@ -75,7 +75,8 @@ All notable changes to this project are documented here. The format follows
   the link register and the stack pointer its word does not name. The rule was already written in
   the comment above the code that did not apply it. Settled by differencing that whole encoding
   space against a generated instruction table, which now agrees with it exactly but for `texit`,
-  an extension this declines.
+  an extension this declines. The same check refuses an unauthenticated `braa`/`blraa`, which has
+  no encoding: `0xd71f0000` was a `br x0` that also read `x0` as a modifier.
 
 - **Every A64 system operation is reported privileged**, where `sys`, `dc`, `ic` and `tlbi`
   previously took their answer from `op1` alone and so called the `op1`-three encodings EL0's.

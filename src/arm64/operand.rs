@@ -1119,6 +1119,14 @@ fn branch_register(word: u32) -> Out {
         true => 0b00000,
         false => 0b11111,
     };
+    // **And a modifier form exists only with a key.** `braa`/`brab` and `blraa`/`blrab` are the
+    // whole of the `opc` bit-three space; there is no plain `br` that takes a second register, so
+    // `0xd71f0000` is not a `br x0` reading `x0` as a modifier -- it is not an instruction. Spelled
+    // by the `("", _)` arm below, which answers for the key and not for the form.
+    let modifier_form = field(word, 21, 4) & 0b1000 != 0;
+    if modifier_form && key.is_empty() {
+        return Out::undecoded("unallocated");
+    }
     match field(word, 21, 4) {
         // `br`/`braaz`/`brabz`, then `braa`/`brab`, which name a modifier register.
         opc @ (0b0000 | 0b1000) => {
@@ -4426,6 +4434,11 @@ mod tests {
         let modifier = shapes(0xd71f_0843);
         assert_eq!(modifier.mnemonic, "braa");
         assert_eq!(spellings(&modifier.reads), ["x2", "x3"]);
+        // **A modifier form with no key is not a `br`**, though the arm that spells these answers
+        // for the key and would have called it one while still reading `op4` as a register.
+        // `0xd71f0000` was `br x0` reading `x0` twice; there is no unauthenticated form here.
+        unallocated(0xd71f_0000);
+        unallocated(0xd73f_0000);
     }
 
     /// The encodings the access-width audit found shaped here and unallocated in the architecture,
