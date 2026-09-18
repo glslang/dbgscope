@@ -52,9 +52,9 @@
 //! It is left open on purpose. Closing it means a fixed-field check in most of the functions here,
 //! which is a large change whose own risk is demonstrated in this file's history: two of the four
 //! bugs the sizeless-access audit found were *introduced* by tightening a neighbouring guard. The
-//! measurement is the deliverable, and the command that produces it is the same differential the
-//! family table above comes from — so this paragraph is a number to re-run rather than a claim to
-//! trust.
+//! measurement is the deliverable, and `examples/undecoded_families.rs` prints this listing beside
+//! the one above — the same sweep, the other direction — so this paragraph is a number to re-run
+//! rather than a claim to trust.
 //!
 //! The Advanced SIMD, scalar floating-point, SVE and SME spaces are **not** shaped, and an
 //! instruction in them comes back as a single [`Operand::Undecoded`] naming the space —

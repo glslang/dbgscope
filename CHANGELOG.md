@@ -90,6 +90,13 @@ All notable changes to this project are documented here. The format follows
   operations the exception is the whole set, so that arm now reads no `op1` at all rather than
   growing a second list a round at a time.
 
+- **`examples/undecoded_families.rs` reports both directions of the differential.** Beside the
+  families this decoder leaves unread, it now lists the words it *shapes* that the generated table
+  refuses — a field nobody constrained rather than a family nobody decoded, which the first listing
+  structurally cannot find because it compares definitions. It is the same sweep and costs nothing
+  extra. Five of this release's decoder fixes came out of running it, none of which any corpus
+  contains an instance of.
+
 - **Three more A64 encodings read the field they were actually given.** `isb`'s `CRm` is an option
   and shared `dsb`'s shareability table, so `isb #7` was spelled `isb nsh` — a domain `isb` has no
   concept of. `dsb #0` and `dsb #4` are `ssbb` and `pssbb`, the speculative-store-bypass barriers,
