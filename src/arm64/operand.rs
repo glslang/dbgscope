@@ -1480,15 +1480,27 @@ fn memory_tags(word: u32) -> Out {
         return Out::undecoded("unallocated");
     }
     let loads = matches!(mnemonic, "ldg" | "ldgm");
+    // **The tagging stores name an `|SP` transfer register**, unlike every other store in the
+    // architecture: `stg sp,[sp]` tags the stack frame a prologue just made, which is the whole
+    // point of the instruction. The loads and the granule-group forms do not.
+    let tagged = gpr(rt, true, !loads && !granule);
     let out = Out::new(mnemonic);
     let out = match (loads, mnemonic) {
         // `ldg` combines the tag with what `Xt` already holds; `ldgm` replaces it.
-        (true, "ldg") => out.inout_reg(gpr(rt, true, false)),
-        (true, _) => out.out_reg(gpr(rt, true, false)),
-        (false, _) => out.in_reg(gpr(rt, true, false)),
+        (true, "ldg") => out.inout_reg(tagged),
+        (true, _) => out.out_reg(tagged),
+        (false, _) => out.in_reg(tagged),
     };
     let out = out.mem(MemoryOperand {
-        size: Some(16),
+        // **`st2g` and `stz2g` reach two granules**, which is what the `2` in them is, so a caller
+        // reading this to bound an affected range misses half of a `stz2g`'s zeroing without it.
+        // The granule-group forms reach a number of granules `GMID_EL1.BS` decides, which is a
+        // run-time fact rather than an encoded one, so they claim no size at all.
+        size: match (granule, mnemonic) {
+            (true, _) => None,
+            (_, "st2g" | "stz2g") => Some(32),
+            _ => Some(16),
+        },
         base: Some(gpr(rn, true, true)),
         scale: 1,
         // A post-indexed access happens at the base, as everywhere else here.
@@ -2360,11 +2372,6 @@ fn data_processing_two_source(word: u32) -> Out {
     if sets_flags && !(wide && field(word, 10, 6) == 0b000000) {
         return Out::undecoded("unallocated");
     }
-    let (destination, left, right) = (
-        gpr(field(word, 0, 5), wide, false),
-        gpr(field(word, 5, 5), wide, false),
-        gpr(field(word, 16, 5), wide, false),
-    );
     // The variable shifts are written by their alias everywhere: `lsl x0,x1,x2` is `lslv`.
     let (mnemonic, effect) = match field(word, 10, 6) {
         0b000010 => ("udiv", Effect::Other),
@@ -2391,14 +2398,30 @@ fn data_processing_two_source(word: u32) -> Out {
         0b011011 => ("umin", Effect::Other),
         _ => return Out::undecoded("unallocated"),
     };
+    // **Which positions read register 31 as the stack pointer is per instruction here**, and this
+    // class is the only one in the data-processing space where it is not "none of them": the four
+    // pointer-arithmetic instructions the memory-tagging extension adds take `|SP` operands, and
+    // reading them as the zero register drops the access entirely -- `irg sp,sp` reported no
+    // registers at all. Raised on dbgscope#171, alongside the same mistake in `memory_tags`; the
+    // other twenty-two sites in this module that read a 31 were audited in the same pass.
+    let (destination, left, right) = (
+        gpr(field(word, 0, 5), wide, matches!(mnemonic, "irg")),
+        gpr(
+            field(word, 5, 5),
+            wide,
+            matches!(mnemonic, "irg" | "gmi" | "subp"),
+        ),
+        gpr(field(word, 16, 5), wide, matches!(mnemonic, "subp")),
+    );
     // The CRC accumulators take a 32-bit accumulator and a source whose width the mnemonic names,
     // which is the one place in this class where the two operands are not the same width.
     let crc = mnemonic.starts_with("crc32");
     if sets_flags {
+        // `subps` shares `subp`'s shape, both of its sources included.
         return Out::new("subps")
-            .out_reg(destination)
-            .in_reg(left)
-            .in_reg(right)
+            .out_reg(gpr(field(word, 0, 5), wide, false))
+            .in_reg(gpr(field(word, 5, 5), wide, true))
+            .in_reg(gpr(field(word, 16, 5), wide, true))
             .flags();
     }
     let out = Out::new(mnemonic);
@@ -2630,10 +2653,14 @@ fn float_integer_conversion(word: u32) -> Out {
         // direction **reads** the register it writes, exactly as `ins` does. Raised on
         // dbgscope#171, where both halves were missing.
         return match opcode {
+            // Into a general-purpose register, which ends up holding exactly the lane: a copy.
             0b110 => Out::new("fmov")
                 .out_reg(gpr(rd, true, false))
                 .other(format!("v{rn}.d[1]"))
-                .reads_only(vreg_whole(rn)),
+                .reads_only(vreg_whole(rn))
+                .effect(Effect::Move),
+            // And out of one into half a vector register, which is **not** a copy: what the
+            // destination holds afterwards is the source beside the low lane it kept.
             _ => Out::new("fmov")
                 .other(format!("v{rd}.d[1]"))
                 .in_reg(gpr(rn, true, false))
@@ -2668,6 +2695,15 @@ fn float_integer_conversion(word: u32) -> Out {
         false => Out::new(mnemonic)
             .out_reg(gpr(rd, wide, false))
             .in_reg(vreg(rn, bytes)),
+    };
+    // **`fmov` is the one member of this class that copies rather than converts**, and it is the
+    // distinction the effect exists to draw: a consumer propagating values across a routine can
+    // follow `fmov x0,d1` and must not follow `fcvtzs x0,d1`, which is the same two registers and
+    // a different number. Raised on dbgscope#171. The upper-lane forms are handled above, where
+    // only one direction is a whole copy.
+    let out = match mnemonic == "fmov" {
+        true => out.effect(Effect::Move),
+        false => out,
     };
     // **`fjcvtzs` is the one conversion that also writes the flags**, reporting in `Z` whether the
     // conversion was exact -- which is the Javascript semantics it exists for, and which a caller
@@ -3842,6 +3878,97 @@ mod tests {
                 .iter()
                 .any(|operand| matches!(operand, Operand::Undecoded(_))),
             "a named operand kind is not an unread instruction: {shaped:?}"
+        );
+    }
+
+    /// Which positions read register 31 as the stack pointer is per instruction, and the
+    /// memory-tagging additions are the only ones outside the addressing modes that do.
+    ///
+    /// Reading them as the zero register does not merely mislabel an operand: [`Out::record_write`]
+    /// drops the zero register, so `irg sp,sp` came back touching nothing at all. Raised on
+    /// dbgscope#171; the module's other twenty-two sites that read a 31 were audited beside it and
+    /// one more was wrong, the transfer register of a tag store.
+    #[test]
+    fn test_the_pointer_arithmetic_reads_register_thirty_one_as_the_stack_pointer() {
+        // `9adf13ff  irg sp,sp` -- both ends of it.
+        let tag = shapes(0x9adf_13ff);
+        assert_eq!(tag.mnemonic, "irg");
+        assert_eq!(spellings(&tag.writes), ["sp"], "{tag:?}");
+        assert_eq!(spellings(&tag.reads), ["sp"], "{tag:?}");
+        // `9ac203e0  subp x0,sp,x2` and the flag-setting form beside it: both sources are
+        // stack-pointer capable and the destination is not.
+        for (word, flags) in [(0x9ac2_03e0_u32, false), (0xbac2_03e0, true)] {
+            let one = shapes(word);
+            assert_eq!(spellings(&one.writes), ["x0"], "{one:?}");
+            assert_eq!(spellings(&one.reads), ["sp", "x2"], "{one:?}");
+            assert_eq!(one.writes_flags, flags, "{one:?}");
+        }
+        // `irg`'s third operand is **not** stack-pointer capable, so a 31 there is the zero
+        // register and is dropped: `9adf1000  irg x0,x0`.
+        let ordinary = shapes(0x9adf_1000);
+        assert_eq!(spellings(&ordinary.writes), ["x0"]);
+        assert_eq!(spellings(&ordinary.reads), ["x0"]);
+        // And the class's other members read a 31 as the zero register throughout:
+        // `9adf0800  udiv x0,x0,xzr`.
+        let divide = shapes(0x9adf_0800);
+        assert_eq!(divide.mnemonic, "udiv");
+        assert_eq!(spellings(&divide.reads), ["x0"], "{divide:?}");
+        // The other site the audit found: a tag store's transfer register, which a prologue uses
+        // to tag the frame it just made. `d9200bff  stg sp,[sp]` -- the offset form, `op2` zero
+        // being the granule-group one.
+        let frame = shapes(0xd920_0bff);
+        assert_eq!(frame.mnemonic, "stg");
+        assert_eq!(spellings(&frame.reads), ["sp", "sp"], "{frame:?}");
+        // A tag *load*'s is an ordinary register: `d96003ff  ldg xzr,[sp]`.
+        assert_eq!(spellings(&shapes(0xd960_03ff).reads), ["sp"]);
+    }
+
+    /// `st2g` and `stz2g` reach two granules, which is what the `2` in them is.
+    ///
+    /// A caller reading [`MemoryOperand::size`] to bound an affected range misses half of a
+    /// `stz2g`'s zeroing without it. The granule-group forms reach a number of granules
+    /// `GMID_EL1.BS` decides, which is a run-time fact and not an encoded one, so they claim no
+    /// size rather than a plausible wrong one. Raised on dbgscope#171.
+    #[test]
+    fn test_a_two_granule_tag_store_reports_both_granules() {
+        let size = |word: u32| {
+            let one = shapes(word);
+            let Operand::Memory(memory) = &one.operands[1] else {
+                panic!("{one:?}");
+            };
+            (one.mnemonic.clone(), memory.size)
+        };
+        // `d9e00862  stz2g x2,[x3]` and `d9200862  stg x2,[x3]`.
+        assert_eq!(size(0xd9e0_0862), ("stz2g".to_string(), Some(32)));
+        assert_eq!(size(0xd920_0862), ("stg".to_string(), Some(16)));
+        // `d9a00128  stgm x8,[x9]` -- a group whose size the encoding does not carry.
+        assert_eq!(size(0xd9a0_0128), ("stgm".to_string(), None));
+    }
+
+    /// `fmov` copies where everything else in its class converts, and the effect is the field that
+    /// distinguishes them.
+    ///
+    /// `fmov x0,d1` and `fcvtzs x0,d1` name the same two registers and leave different numbers, so
+    /// a consumer propagating values must follow one and not the other. Raised on dbgscope#171.
+    #[test]
+    fn test_a_cross_register_file_move_is_a_move_and_a_conversion_is_not() {
+        // `9e660020  fmov x0,d1`, `1e260043  fmov w3,s2`, `9e670020  fmov d0,x1`.
+        for word in [0x9e66_0020_u32, 0x1e26_0043, 0x9e67_0020] {
+            let one = shapes(word);
+            assert_eq!(one.mnemonic, "fmov");
+            assert_eq!(one.effect, Effect::Move, "{word:#010x}: {one:?}");
+        }
+        // `1e380000  fcvtzs w0,s0` -- the same shape, a different number.
+        let convert = shapes(0x1e38_0000);
+        assert_eq!(convert.mnemonic, "fcvtzs");
+        assert_eq!(convert.effect, Effect::Other);
+        // The upper-lane forms part company: into a general-purpose register the whole value
+        // arrives, and out of one only half of the destination is replaced.
+        assert_eq!(shapes(0x9eae_0020).effect, Effect::Move);
+        assert_eq!(
+            shapes(0x9eaf_0062).effect,
+            Effect::Other,
+            "what it holds afterwards is the source beside the lane it kept"
         );
     }
 
