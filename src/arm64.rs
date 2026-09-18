@@ -1,13 +1,19 @@
-//! ARM64 (A64) control flow, decoded from the encoding.
+//! ARM64 (A64), decoded from the encoding.
 //!
-//! This is deliberately **not** a disassembler. The engine already renders every instruction, and
+//! This is deliberately **not** a disassembler. The engine already renders every instruction and
 //! [`crate::dbgeng::Instruction::text`] carries that rendering verbatim; what no engine call
-//! answers is where control goes, which is the one thing a caller following a call graph cannot
-//! recover from a rendering without parsing symbols out of it. So this decodes
-//! [`Flow`](crate::dbgeng::Flow) and nothing else: no operands, no registers, no privilege. The
-//! honest tell for "operands were not read here" is
-//! [`InstructionSet::operands_are_read`](crate::dbgeng::InstructionSet::operands_are_read), which
-//! answers `false` for ARM64 and will keep doing so until somebody decodes them.
+//! answers is what an instruction *is* — where control goes, which registers it leaves changed,
+//! whether it needs privilege — and recovering any of that from a rendering means parsing symbols
+//! out of it.
+//!
+//! **Two halves, and they landed a release apart.** This file is the flow: six branch classes
+//! discriminated by a mask on the top bits of a word, which unblocked a reachability walk on its
+//! own (dbgscope#148). [`operand`] is the rest — operands, registers, effect, condition and
+//! privilege — which two static analyses in `windbg-mcp` were waiting on (dbgscope#170). They are
+//! separate functions over the same word because they answer separate questions, and
+//! [`InstructionSet::flow_is_read`](crate::dbgeng::InstructionSet::flow_is_read) and
+//! [`operands_are_read`](crate::dbgeng::InstructionSet::operands_are_read) are the two gates that
+//! still ask them separately.
 //!
 //! # Why the flow half is small enough to write by hand
 //!
@@ -44,6 +50,10 @@
 //! the word with [`u32::from_be_bytes`] and one decoding *memory* with [`u32::from_le_bytes`], and
 //! this module takes the word rather than the bytes so that the choice is made where the bytes came
 //! from and cannot be made twice.
+
+mod operand;
+
+pub(crate) use operand::decode;
 
 use crate::dbgeng::Flow;
 

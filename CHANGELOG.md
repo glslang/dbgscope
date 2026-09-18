@@ -24,6 +24,35 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **ARM64 operands, registers, effect, condition and privilege are decoded**, so
+  `InstructionSet::operands_are_read` answers `true` there and every `Instruction` field is a real
+  answer on that architecture rather than an empty one. A64's flow landed on its own (#148); this
+  is the half two static analyses in `windbg-mcp` were waiting on (#170) — an IOCTL map, which
+  needs the immediate a compare holds, and a hazard scan, which needs `privileged`.
+
+  What is decoded is the general-purpose architecture in full, with the aliases a compiler emits
+  resolved out of their base forms (`cmp` from `subs`, `mov` from `orr`, `lsr` from `ubfm`) because
+  an alias changes the operand *list* and not only the spelling. The Advanced SIMD, SVE and scalar
+  floating-point spaces are named rather than shaped — as a single `Operand::Other` carrying the
+  space's name — except for every encoding in them that reaches a general-purpose register or the
+  flags, which is decoded: the floating-point conversions, `fmov` between the register files,
+  `umov`/`smov`/`ins`/`dup`, `fcmp` and its conditional relatives, and a vector load's
+  base-register writeback.
+
+  Measured against the engine's own rendering of all 1,233,502 words of a 26100 ARM64 kernel's
+  `nt` (`.text` and `PAGE`): 5,021 instructions — 0.42% of the 1,189,047 the engine could render —
+  are left unshaped, all of them in those vector spaces; every register a rendering names is in the
+  decode's reads or writes but one, whose `Rn` field the engine prints as `sp` where the encoding
+  says the zero register; all 42,244 resolved addresses match the engine's; and thirty mnemonics
+  differ, each of them the debugger's own spelling rather than the architecture's.
+
+  Two shapes worth knowing about before reading A64 fields with an x64 habit. A **store names its
+  source first**, so `operands[0]` is not the destination there — `writes` is the field that
+  answers what changed. And a **shift or extension folded into an arithmetic operand** is named as
+  an `Operand::Other` and drops the effect to `Effect::Other`, rather than being reported as an
+  immediate a consumer would add: `add x8,x9,x10,lsl #3` is not `x9 + 3`. A shifted *immediate* is
+  folded into its value instead, `sub w0,w0,#0x222,lsl #12` carrying `0x222000`, since that is a
+  number the operand can hold.
 - `VsSemanticFamily::AffinitySlotsSelfRelative` (`affinity_slot_vs_offset`), reported apart from
   `AffinitySlots` because the two are *checked* differently — an address against the context, a
   displacement against `slot - context` — and reading one as the other rejects every slot silently
