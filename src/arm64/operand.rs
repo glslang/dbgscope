@@ -1621,7 +1621,7 @@ fn memory_operations(word: u32) -> Out {
             return Out::undecoded("unallocated");
         };
         let suffix = ["", "t", "n", "tn"][(op2 & 0b11) as usize];
-        return Out::new(&format!(
+        let out = Out::new(&format!(
             "set{}{which}{suffix}",
             if tagged { "g" } else { "" }
         ))
@@ -1629,12 +1629,16 @@ fn memory_operations(word: u32) -> Out {
         .writes_only(gpr(rd, true, false))
         .inout_reg(gpr(rn, true, false))
         .in_reg(gpr(other, true, false));
+        return match *which == "p" {
+            true => out.flags(),
+            false => out,
+        };
     }
     // A copy names a destination, a source and a count, and advances all three.
     let which = stage[op1 as usize];
     let read = ["", "wt", "rt", "t"][(op2 & 0b11) as usize];
     let write = ["", "wn", "rn", "n"][(op2 >> 2) as usize];
-    Out::new(&format!(
+    let out = Out::new(&format!(
         "cpy{}{which}{read}{write}",
         if tagged { "" } else { "f" }
     ))
@@ -1642,7 +1646,18 @@ fn memory_operations(word: u32) -> Out {
     .writes_only(gpr(rd, true, false))
     .mem(through(other))
     .writes_only(gpr(other, true, false))
-    .inout_reg(gpr(rn, true, false))
+    .inout_reg(gpr(rn, true, false));
+    // **The prologue writes the flags the other two stages run on**, which is the protocol the
+    // three of them share: it chooses a direction and an option and leaves them in `NZCV` for the
+    // main body and the epilogue to read. So a caller asking what set the flags after a copy has
+    // to stop at the prologue rather than walk past it to an earlier compare.
+    //
+    // That the main and epilogue *read* them is a fact this type has no field for, as it has none
+    // for `ccmp`'s or `fccmp`'s reads. Raised on dbgscope#171.
+    match op1 == 0b00 {
+        true => out.flags(),
+        false => out,
+    }
 }
 
 /// The memory-tagging accesses: `stg` and its relatives, `ldg`, and the whole-granule forms.
@@ -2121,6 +2136,15 @@ fn load_store_exclusive(word: u32) -> Out {
 /// mode wrote it back.
 fn vector_structures(word: u32) -> Out {
     let post_index = field(word, 23, 1) != 0;
+    // **Without a post-index there is no `Rm`, and the field it would occupy is reserved.** An
+    // extension may carve an instruction out of that reserved space and one has: RCPC3's `ldap1`
+    // and `stl1` are these encodings with a nonzero `Rm`, and reading the field as "absent" rather
+    // than "must be zero" shaped them as ordinary `ld1`/`st1` and lost their ordering. This
+    // decodes no RCPC3, so they are refused by name rather than mis-shaped.
+    // Raised on dbgscope#171.
+    if !post_index && field(word, 16, 5) != 0 {
+        return Out::undecoded("unallocated");
+    }
     let load = field(word, 22, 1) != 0;
     let single = word & 0x3f00_0000 == 0x0d00_0000;
     let rn = field(word, 5, 5);
@@ -4004,6 +4028,19 @@ mod tests {
         assert_eq!(whole.mnemonic, "ld1r");
         assert_eq!(spellings(&whole.writes), ["v16"]);
         assert_eq!(spellings(&whole.reads), ["x8"]);
+        // **Without a post-index the `Rm` field is reserved**, and an extension has been carved
+        // out of it: `0d018774` and `0d418774` are RCPC3's `stl1` and `ldap1`, which this does not
+        // decode. Reading the field as absent shaped them as ordinary `st1`/`ld1` and lost the
+        // ordering that is the whole point of them.
+        for word in [0x0d01_8774_u32, 0x0d41_8774] {
+            assert_eq!(
+                shapes(word).operands,
+                [Operand::Undecoded("unallocated".to_string())],
+                "{word:#010x}"
+            );
+        }
+        // The legacy forms have it zero, which is why every one above still decodes.
+        assert_eq!(shapes(0x0d00_2140).mnemonic, "st3");
     }
 
     /// The two halves of the vector boundary a name on an operand hides: an upper-lane `fmov`
@@ -4404,6 +4441,14 @@ mod tests {
             shapes(0x19c0_c400).operands,
             [Operand::Undecoded("unallocated".to_string())]
         );
+        // **The prologue writes the flags the other two stages run on**, and only the prologue:
+        // the three share a protocol through `NZCV`, so a caller asking what set the flags after a
+        // copy stops at `cpyfp` rather than walking past it.
+        assert!(shapes(0x1901_0440).writes_flags, "cpyfp");
+        assert!(shapes(0x19c2_0420).writes_flags, "setp");
+        assert!(!shapes(0x1941_0440).writes_flags, "cpyfm");
+        assert!(!shapes(0x1981_0440).writes_flags, "cpyfe");
+        assert!(!shapes(0x19c2_4420).writes_flags, "setm");
     }
 
     /// CSSC's minimum and maximum against a literal, which share the tagged add's slot and were
