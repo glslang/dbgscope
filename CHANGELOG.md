@@ -32,12 +32,19 @@ All notable changes to this project are documented here. The format follows
 
   What is decoded is the general-purpose architecture in full, with the aliases a compiler emits
   resolved out of their base forms (`cmp` from `subs`, `mov` from `orr`, `lsr` from `ubfm`) because
-  an alias changes the operand *list* and not only the spelling. The Advanced SIMD, SVE and scalar
-  floating-point spaces are named rather than shaped — as a single `Operand::Other` carrying the
-  space's name — except for every encoding in them that reaches a general-purpose register or the
-  flags, which is decoded: the floating-point conversions, `fmov` between the register files,
-  `umov`/`smov`/`ins`/`dup`, `fcmp` and its conditional relatives, and a vector load's
-  base-register writeback.
+  an alias changes the operand *list* and not only the spelling. The vector spaces are named rather
+  than shaped — as a single `Operand::Other` carrying the space's name, which is a caller's tell
+  that nothing was read — with one exception: in **Advanced SIMD and scalar floating-point**, every
+  encoding that reaches a general-purpose register or the flags is decoded, and the list is short
+  enough to give in full (the floating-point conversions, `fmov` between the register files
+  including its upper-lane form, `umov`/`smov`/`ins`/`dup`, `fcmp`/`fccmp` and `fjcvtzs`, and a
+  vector load's base-register writeback).
+
+  **SVE and SME have no such exception**, so an `incb x0` there comes back claiming nothing about
+  `x0`. That is deliberate rather than an oversight: a partial decode of that space would remove
+  the `Other` marker from the encodings it shaped while leaving the gather loads and `ctermeq`'s
+  flags unshaped, handing back an access list that looks complete and is not. Closing it means
+  enumerating that space's general-purpose surface and shaping all of it at once.
 
   Measured against the engine's own rendering of all 1,233,502 words of a 26100 ARM64 kernel's
   `nt` (`.text` and `PAGE`): 5,021 instructions — 0.42% of the 1,189,047 the engine could render —
