@@ -90,6 +90,14 @@ All notable changes to this project are documented here. The format follows
   operations the exception is the whole set, so that arm now reads no `op1` at all rather than
   growing a second list a round at a time.
 
+- **Three more A64 encodings read the field they were actually given.** `isb`'s `CRm` is an option
+  and shared `dsb`'s shareability table, so `isb #7` was spelled `isb nsh` — a domain `isb` has no
+  concept of. `dsb #0` and `dsb #4` are `ssbb` and `pssbb`, the speculative-store-bypass barriers,
+  which a caller matching mnemonics for a speculation mitigation could not find and which take no
+  operand. And `casp` built each pair's second register with `rs | 1`, which is the successor only
+  where the field is even — an odd one came back as a pair of a register with itself, where the
+  architecture makes it CONSTRAINED UNPREDICTABLE and there is nothing to read.
+
 - **`Operand::Undecoded`**, which is how an instruction says its fields are defaults rather than
   answers. `InstructionSet::operands_are_read` answers for a *set*, and that was enough while every
   decoder here was complete over its own; A64's is the first that is not, and the distinction

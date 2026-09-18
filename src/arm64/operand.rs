@@ -34,6 +34,27 @@
 //! re-counted, which is the point: the next one to be added is a row that moves rather than a round
 //! of review.
 //!
+//! # What is over-accepted, which is the other direction and is deliberate
+//!
+//! That table counts encodings this decoder does not read. The opposite question — encodings it
+//! reads that the architecture does not allocate — was measured once the review rounds kept
+//! reaching it, by decoding all 4,294,967,296 words twice and keeping every one this shapes and
+//! the generated table refuses. **86 mnemonics, 94,371,456 words, 2.2% of the encoding space.**
+//!
+//! What is left is one kind of thing: a *reserved field nobody constrained*. The exclusive and
+//! atomic family ignores the `Rs`/`Rt2` values the architecture fixes at `11111`, `crc32` does not
+//! check that `sf` matches its variant, `smulh` ignores `Ra`, and the vector-structure forms
+//! ignore the bit that must be zero without a post-index. **No real image contains any of them** —
+//! the corpus is unmoved by every fix in this space — so what it costs is that `decode_range`
+//! walking data reports a plausible instruction where [`Operand::Undecoded`] is the honest answer.
+//!
+//! It is left open on purpose. Closing it means a fixed-field check in most of the functions here,
+//! which is a large change whose own risk is demonstrated in this file's history: two of the four
+//! bugs the sizeless-access audit found were *introduced* by tightening a neighbouring guard. The
+//! measurement is the deliverable, and the command that produces it is the same differential the
+//! family table above comes from — so this paragraph is a number to re-run rather than a claim to
+//! trust.
+//!
 //! The Advanced SIMD, scalar floating-point, SVE and SME spaces are **not** shaped, and an
 //! instruction in them comes back as a single [`Operand::Undecoded`] naming the space —
 //! `advanced-simd`, `floating-point`, `sve`, `unallocated`, `reserved`. (The last of those covers
@@ -1457,9 +1478,30 @@ fn barrier(crm: u32, op2: u32) -> Out {
     };
     match op2 {
         0b010 => Out::new("clrex").imm(crm as u64),
-        0b100 => named("dsb"),
+        // **`dsb` has two aliases that are whole instructions**, and they are the architecture's
+        // preferred spelling rather than a nicety: `ssbb` and `pssbb` are the speculative-store-
+        // bypass barriers, and a caller matching mnemonics for a speculation mitigation cannot
+        // find them under `dsb #0`. They also take no operand, which is this decoder's stated test
+        // for resolving an alias -- it changes the operand *list* and not only the spelling.
+        // Raised on dbgscope#171. The engine renders neither, having no instance of either in the
+        // image this was measured against, so nothing in the corpus check speaks to it.
+        0b100 => match crm {
+            0b0000 => Out::new("ssbb"),
+            0b0100 => Out::new("pssbb"),
+            _ => named("dsb"),
+        },
         0b101 => named("dmb"),
-        0b110 => named("isb"),
+        // **`isb`'s `CRm` is an option field, not a shareability domain**, and sharing the table
+        // above with `dsb`/`dmb` gave it that domain's names: `d50337df` is `isb #7` and was
+        // reported as `isb nsh`, a domain `isb` has no concept of. `sy` is the one option the
+        // architecture defines and is kept, because it is that option's own name and is what the
+        // engine renders (`d5033fdf  isb sy`) -- the architecture's preferred spelling omits it,
+        // which is a spelling question rather than one about what the field says. Raised on
+        // dbgscope#171.
+        0b110 => match crm {
+            0b1111 => Out::new("isb").other("sy".to_string()),
+            _ => Out::new("isb").imm(crm as u64),
+        },
         0b111 => Out::new("sb"),
         _ => Out::undecoded("unallocated"),
     }
@@ -2242,6 +2284,17 @@ fn load_store_exclusive(word: u32) -> Out {
                 .mem(memory(bytes * 2)),
         },
         (0, _) => {
+            // **A pair names its even half and the architecture supplies the odd one**, so an odd
+            // `Rs` or `Rt` is CONSTRAINED UNPREDICTABLE -- not an encoding whose second register is
+            // the first again, which is what `rs | 1` produced: `0x482b7c0c` came back as
+            // `casp x11,x11,x12,x13,[x0]`, with `x11` listed as both halves of one pair. The
+            // generated table renders that second register `<undefined>`, which is the same fact
+            // said another way. Refusing is the honest answer for a word whose behaviour the
+            // architecture does not pin: [`Operand::Undecoded`] means nothing was read, and here
+            // there is nothing to read. Raised on dbgscope#171.
+            if rs & 1 != 0 || rt & 1 != 0 {
+                return Out::undecoded("unallocated");
+            }
             let pair_wide = size & 1 != 0;
             let element = if pair_wide { 8 } else { 4 };
             Out::new(&format!(
@@ -4392,6 +4445,67 @@ mod tests {
         assert_eq!(width(0x4c40_a020), [Some(32)]);
         // A plain load is the ordinary case the other two are measured against.
         assert_eq!(width(0xf940_0021), [Some(8)]);
+    }
+
+    /// The barrier options, where one shared table was answering for three different fields.
+    ///
+    /// `isb`'s `CRm` is an option and not a shareability domain, so `d50337df` -- `isb #7` -- was
+    /// being spelled `isb nsh` with a name from `dsb`'s table. And `dsb`'s own `CRm` zero and four
+    /// are whole instructions rather than numbered forms. Raised on dbgscope#171.
+    #[test]
+    fn test_a_barrier_option_is_read_from_its_own_field() {
+        // `d5033fdf  isb sy` -- the one option the architecture defines, and the engine's own
+        // spelling of it.
+        let sync = shapes(0xd503_3fdf);
+        assert_eq!(sync.mnemonic, "isb");
+        assert_eq!(sync.operands, [Operand::Other("sy".to_string())]);
+        // **Every other value is a number, not a domain.** This is the assertion that fails
+        // against the shared table.
+        let numbered = shapes(0xd503_37df);
+        assert_eq!(numbered.mnemonic, "isb");
+        assert_eq!(numbered.operands, [Operand::Immediate(7)]);
+        // The speculative-store-bypass barriers, which take no operand at all.
+        for (word, mnemonic) in [(0xd503_309f_u32, "ssbb"), (0xd503_349f, "pssbb")] {
+            let barrier = shapes(word);
+            assert_eq!(barrier.mnemonic, mnemonic, "{word:#010x}");
+            assert!(barrier.operands.is_empty(), "{barrier:?}");
+        }
+        // **And the domains `dsb` and `dmb` really do take are untouched**, which is what says the
+        // split was a split rather than a deletion: `d5033f9f  dsb sy` and `d5033bbf  dmb ish`.
+        assert_eq!(shapes(0xd503_3f9f).mnemonic, "dsb");
+        assert_eq!(
+            shapes(0xd503_3f9f).operands,
+            [Operand::Other("sy".to_string())]
+        );
+        assert_eq!(
+            shapes(0xd503_3bbf).operands,
+            [Operand::Other("ish".to_string())]
+        );
+    }
+
+    /// A register pair names its even half, and an odd one is not a pair of a register with itself.
+    ///
+    /// `casp` supplies the second register of each pair by adding one, which `rs | 1` does only
+    /// where `rs` is even -- `0x482b7c0c` came back as `casp x11,x11,x12,x13,[x0]`. The generated
+    /// table renders that operand `<undefined>`, the architecture making an odd field CONSTRAINED
+    /// UNPREDICTABLE, so there is nothing to read and [`Operand::Undecoded`] says exactly that.
+    /// Raised on dbgscope#171.
+    #[test]
+    fn test_a_compare_and_swap_pair_refuses_an_odd_register() {
+        // `482a7c0c  casp x10,x11,x12,x13,[x0]` -- both fields even, and the successors supplied.
+        let pair = shapes(0x482a_7c0c);
+        assert_eq!(pair.mnemonic, "casp");
+        assert_eq!(spellings(&pair.writes), ["x10", "x11"]);
+        assert_eq!(spellings(&pair.reads), ["x10", "x11", "x12", "x13", "x0"]);
+        // **Both fields, not just the first.** An odd `Rs` and an odd `Rt` are separate encodings
+        // and a check of one would pass the other.
+        for word in [0x482b_7c0c_u32, 0x482a_7c0d] {
+            assert_eq!(
+                shapes(word).operands,
+                [Operand::Undecoded("unallocated".to_string())],
+                "{word:#010x}"
+            );
+        }
     }
 
     /// A register-branch form fixes every field it does not use, and nothing enforced it.
