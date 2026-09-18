@@ -93,6 +93,36 @@
 //! overflow checks on, at addresses spread across the whole 64-bit space so that the
 //! relative-branch and page arithmetic wraps as well. Seventy-two seconds, no panic.
 //!
+//! # Where register 31 is the stack pointer, in full
+//!
+//! A64 spells the stack pointer and the zero register with the same five bits, and which one a 31
+//! means is decided **per operand position** rather than per instruction. Getting it wrong is not a
+//! mislabelled operand: the zero register is dropped from the access lists by design, so an `irg
+//! sp,sp` read as `irg xzr,xzr` comes back touching nothing at all.
+//!
+//! This produced a review finding on dbgscope#171 in two consecutive rounds, the second of them
+//! against an audit done from recollection. So here is the list, derived rather than remembered,
+//! and `test_register_thirty_one_is_the_stack_pointer_in_exactly_these_positions` pins every row
+//! of it against a real encoding:
+//!
+//! | form | positions where 31 is `sp` |
+//! |---|---|
+//! | any addressing mode | the base, `Rn` |
+//! | `add`/`sub` immediate and extended-register | `Rn`; `Rd` too where it sets no flags |
+//! | `and`/`orr`/`eor` immediate | `Rd` — but not `ands`, which is why `tst` exists |
+//! | `addg`/`subg` | `Rd`, `Rn` |
+//! | `irg` | `Rd`, `Rn` |
+//! | `gmi` | `Rn` |
+//! | `subp`/`subps` | `Rn`, `Rm` |
+//! | `pacga` | `Rm` |
+//! | `pacia` and the rest of its family | `Rn`, the modifier |
+//! | `braa`/`brab`/`blraa`/`blrab` | `op4`, the modifier |
+//! | `stg`/`stzg`/`st2g`/`stz2g` | `Rt` *and* `Rn` |
+//! | `ldg`/`ldgm`/`stgm`/`stzgm` | `Rn` only |
+//!
+//! Everywhere else — the shifted-register arithmetic, the bitfields, the moves, the conditionals,
+//! the multiplies, every transfer register that is not a tag store's — a 31 is the zero register.
+//!
 //! # Two shapes a caller coming from x64 will read wrongly
 //!
 //! **A store names its source first.** `str x8,[x9]` is `[Register(x8), Memory(…)]`, where x64's
@@ -885,7 +915,15 @@ fn conditional_branch(word: u32, address: u64) -> Out {
         return Out::undecoded("unallocated");
     }
     let code = field(word, 0, 4);
-    Out::new(&format!("b.{}", condition_suffix(code)))
+    // `o0` picks FEAT_HBC's `bc.cond`, a conditional branch the processor is told not to speculate
+    // past. [`super::flow`] does not read it, both forms having the same two edges; the mnemonic
+    // does, because they are different instructions. The engine on this bench refuses the encoding
+    // outright rather than rendering it as a `b.cond`, which is the clearest evidence of that.
+    let stem = match field(word, 4, 1) {
+        0 => "b",
+        _ => "bc",
+    };
+    Out::new(&format!("{stem}.{}", condition_suffix(code)))
         .target(super::relative(address, field(word, 5, 19), 19))
         .cond(condition(code))
 }
@@ -1253,14 +1291,19 @@ fn pstate(op1: u32, crm: u32, op2: u32) -> Out {
         (0b011, 0b111) => "daifclr",
         _ => return Out::undecoded("unallocated"),
     };
+    // **The three FlagM members are instructions rather than fields**, written `cfinv` with no
+    // operands at all rather than `msr cfinv,#0` -- which the engine confirms, rendering `cfinv`
+    // for `d500401f`. They rewrite the condition flags themselves, and their `CRm` is reserved
+    // rather than an immediate. Raised on dbgscope#171.
+    if matches!((op1, op2), (0b000, 0b000..=0b010)) {
+        return match crm {
+            0 => Out::new(field_name).flags(),
+            _ => Out::undecoded("unallocated"),
+        };
+    }
     let out = Out::new("msr")
         .other(field_name.to_string())
         .imm(crm as u64);
-    // `cfinv`, `xaflag` and `axflag` rewrite the condition flags themselves.
-    let out = match (op1, op2) {
-        (0b000, 0b000..=0b010) => out.flags(),
-        _ => out,
-    };
     // **`op1` decides this everywhere else and cannot decide it here**, because the immediate form
     // addresses a processor-state *field* rather than a system register, and `op1` zero holds two
     // kinds of them: `uao`, `pan` and `spsel`, which are EL1, and the three FlagM instructions
@@ -2411,7 +2454,11 @@ fn data_processing_two_source(word: u32) -> Out {
             wide,
             matches!(mnemonic, "irg" | "gmi" | "subp"),
         ),
-        gpr(field(word, 16, 5), wide, matches!(mnemonic, "subp")),
+        gpr(
+            field(word, 16, 5),
+            wide,
+            matches!(mnemonic, "subp" | "pacga"),
+        ),
     );
     // The CRC accumulators take a 32-bit accumulator and a source whose width the mnemonic names,
     // which is the one place in this class where the two operands are not the same width.
@@ -3689,13 +3736,27 @@ mod tests {
     /// driver hazard report, which is the field's whole consumer. Raised on dbgscope#171.
     #[test]
     fn test_the_flag_manipulation_fields_are_not_privileged() {
-        // `d500401f  msr cfinv,#0`, `d500403f  xaflag`, `d500405f  axflag`.
-        for word in [0xd500_401f_u32, 0xd500_403f, 0xd500_405f] {
+        // `d500401f  cfinv`, `d500403f  xaflag`, `d500405f  axflag` -- standalone instructions
+        // rather than fields, which the engine confirms by rendering `cfinv` for the first.
+        for (word, mnemonic) in [
+            (0xd500_401f_u32, "cfinv"),
+            (0xd500_403f, "xaflag"),
+            (0xd500_405f, "axflag"),
+        ] {
             let flags = shapes(word);
-            assert_eq!(flags.mnemonic, "msr");
+            assert_eq!(flags.mnemonic, mnemonic);
+            assert!(
+                flags.operands.is_empty(),
+                "{mnemonic} takes none: {flags:?}"
+            );
             assert!(!flags.privileged, "{word:#010x} is EL0: {flags:?}");
             assert!(flags.writes_flags, "{word:#010x}: {flags:?}");
         }
+        // Their `CRm` is reserved rather than an immediate: `d5004c1f` is not a `cfinv`.
+        assert_eq!(
+            shapes(0xd500_4c1f).operands,
+            [Operand::Undecoded("unallocated".to_string())]
+        );
         // Their neighbours under the same `op1` are EL1, and so are the interrupt masks under the
         // `op1` that otherwise names EL0.
         for (word, field) in [
@@ -3970,6 +4031,97 @@ mod tests {
             Effect::Other,
             "what it holds afterwards is the source beside the lane it kept"
         );
+    }
+
+    /// Every position in this decoder where register 31 is the stack pointer, and three where it
+    /// is not.
+    ///
+    /// **This test is the audit.** The question produced a review finding on dbgscope#171 in two
+    /// consecutive rounds — the second against an audit done by recalling the list rather than
+    /// deriving it, which is how `pacga`'s modifier survived it — so the list now lives in the
+    /// module header and every row of it is pinned here. A form added without its `|SP` positions
+    /// fails this rather than waiting for a round five.
+    #[test]
+    fn test_register_thirty_one_is_the_stack_pointer_in_exactly_these_positions() {
+        let touched = |word: u32| {
+            let one = shapes(word);
+            let mut names: Vec<String> = one
+                .reads
+                .iter()
+                .chain(one.writes.iter())
+                .map(|register| register.name.clone())
+                .collect();
+            names.sort();
+            names.dedup();
+            (one.mnemonic.clone(), names)
+        };
+        // Each row: the encoding, what it is, and that `sp` is among what it touches.
+        for (word, what) in [
+            (0xf940_03ff_u32, "ldr xzr,[sp] — any addressing mode's base"),
+            (0x9100_03ff, "mov sp,sp — add immediate, both ends"),
+            (
+                0xb100_03ff,
+                "cmn sp,#0 — add immediate's source when it sets flags",
+            ),
+            (0x8b3f_63ff, "add sp,sp,xzr — the extended-register form"),
+            (
+                0x9240_03ff,
+                "and sp,xzr,#1 — a logical immediate's destination",
+            ),
+            (0x9180_03ff, "addg sp,sp,#0,#0"),
+            (0x9adf_13ff, "irg sp,sp"),
+            (0x9ac1_17e0, "gmi x0,sp,x1"),
+            (0x9ac2_03e0, "subp x0,sp,x2 — the left source"),
+            (0x9adf_0020, "subp x0,x1,sp — and the right one"),
+            (0x9adf_3020, "pacga x0,x1,sp — the modifier"),
+            (0xdac1_03e0, "pacia x0,sp — the modifier again"),
+            (0xd71f_083f, "braa x1,sp — and once more"),
+            (0xd920_0bff, "stg sp,[sp] — a tag store's transfer register"),
+            (0xd960_03ff, "ldg xzr,[sp] — but not a tag load's"),
+        ] {
+            let (mnemonic, names) = touched(word);
+            assert!(
+                names.iter().any(|name| name == "sp"),
+                "{word:#010x} `{what}`: {mnemonic} touched {names:?}"
+            );
+        }
+        // And three where a 31 is the zero register, so nothing is recorded at all.
+        for (word, what) in [
+            (
+                0xeb1f_03ff_u32,
+                "cmp xzr,xzr — the shifted-register arithmetic",
+            ),
+            (
+                0xf240_03ff,
+                "tst xzr,#1 — `ands`, which is why the alias exists",
+            ),
+            (0xaa1f_03ff, "mov xzr,xzr — a logical shifted register"),
+        ] {
+            let (mnemonic, names) = touched(word);
+            assert!(
+                names.is_empty(),
+                "{word:#010x} `{what}`: {mnemonic} touched {names:?}"
+            );
+        }
+    }
+
+    /// `bc.cond` is a different instruction from `b.cond`, not a spelling of it.
+    ///
+    /// The bit that picks it is one [`super::flow`] deliberately does not read, both forms having
+    /// the same two edges — and the mnemonic must, because a caller matching one is not asking
+    /// about the other. The engine on this bench refuses the encoding outright rather than
+    /// rendering it as a `b.cond`, which is what settled it. Raised on dbgscope#171.
+    #[test]
+    fn test_a_consistency_hinted_branch_keeps_its_own_mnemonic() {
+        // `54000000  beq .` and `54000010`, the same branch with `o0` set.
+        let ordinary = decode(0x5400_0000, 0x1000);
+        assert_eq!(ordinary.mnemonic, "b.eq");
+        let hinted = decode(0x5400_0010, 0x1000);
+        assert_eq!(hinted.mnemonic, "bc.eq");
+        // Everything else about them is the same, which is why the flow does not read the bit.
+        assert_eq!(hinted.condition, ordinary.condition);
+        assert_eq!(hinted.flow, ordinary.flow);
+        assert_eq!(hinted.operands, ordinary.operands);
     }
 
     /// The flow comes from [`super::flow`] unchanged, so one word has one answer whichever field
