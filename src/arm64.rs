@@ -55,15 +55,20 @@ pub(crate) fn flow(word: u32, address: u64) -> Flow {
             false => Flow::Call(Some(target)),
         };
     }
-    // Conditional branch (immediate): `0101010 o1 imm19 o0 cond`. `o1` must be zero; `o0` picks
-    // `bc.cond` (FEAT_HBC) from `b.cond`, and both are conditional, so it is not read.
+    // Conditional branch (immediate): `0101010 o1 imm19 o0 cond`. `o0` picks `bc.cond` (FEAT_HBC)
+    // from `b.cond`, and both are conditional, so it is not read. `o1` is the third class with
+    // unallocated space, and it gets the same treatment as the two below: only `0` is allocated,
+    // so `1` is UNDEFINED and stops rather than falling through.
     //
     // **`al` and `nv` are unconditional and are reported as such.** A64 gives condition `1110` and
     // `1111` the meaning "always", so `b.al` never falls through. Calling it `Branch` would hand a
     // reachability walk a fall-through edge that the processor does not have — and an edge that is
     // not there is exactly what a sound `REACHABLE` verdict must never rest on. No compiler emits
     // the form; that is a reason to expect the arm to be cold, not a reason to get it wrong.
-    if word & 0xff00_0000 == 0x5400_0000 {
+    if word & 0xfe00_0000 == 0x5400_0000 {
+        if word & 0x0100_0000 != 0 {
+            return Flow::Trap;
+        }
         let target = relative(address, (word >> 5) & 0x0007_ffff, 19);
         return match word & 0xe == 0xe {
             true => Flow::Jmp(Some(target)),
@@ -134,7 +139,8 @@ pub(crate) fn flow(word: u32, address: u64) -> Flow {
     // and every unallocated encoding among them, UNDEFINED being an exception too.
     //
     // **The default inside a class is the opposite of this function's**, deliberately, and it is
-    // why both this class and the register branches above end in `Trap`. Outside them a word
+    // why this class, the register branches above and the conditional branch above them all end
+    // in `Trap` for what they do not allocate. Outside them a word
     // nothing matched is almost always an ordinary instruction from an extension this does not
     // enumerate, so falling through is the accurate answer; inside them the encoding space is
     // fully spoken for and what is left over is UNDEFINED. Where the two readings of a rare
@@ -342,6 +348,11 @@ mod tests {
         assert_eq!(flow(0xd63f_0800, 0x1000), Flow::Call(None));
         // An unallocated `opc` inside the class, which used to fall through.
         assert_eq!(flow(0xd67f_0000, 0x1000), Flow::Trap);
+
+        // The conditional-branch class has the same hole, and it is not one review found: `o1` is
+        // bit 24 and only `0` is allocated, so `0x55000000` is in the class and is not a branch.
+        assert_eq!(flow(0x5500_0020, 0x1000), Flow::Trap);
+        assert_eq!(flow(0x5400_0020, 0x1000), Flow::Branch(Some(0x1004)));
 
         // The system-call family is `opc` `000`, `op2` `000`, and one of three `LL` values.
         assert_eq!(flow(0xd400_0000, 0x1000), Flow::Trap);
