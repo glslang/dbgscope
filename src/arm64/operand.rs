@@ -613,6 +613,8 @@ pub(crate) fn decode(word: u32, address: u64) -> Decoded {
         writes_flags: out.writes_flags,
         writes: out.writes,
         reads: out.reads,
+        // Fixed-width, which is the whole of A64's answer to the question.
+        length: Some(super::INSTRUCTION_BYTES),
     }
 }
 
@@ -1102,10 +1104,28 @@ fn branch_register(word: u32) -> Out {
         _ => return Out::undecoded("unallocated"),
     };
     let rn = field(word, 5, 5);
+    // **A form that does not use a field is one the architecture fixes**, and the paragraph above
+    // has said so since it was written while nothing enforced it: `0xd61f0001` decoded as `br x0`,
+    // and an authenticated return with a stray `Rn` reported reads of the link register and the
+    // stack pointer that the word does not name. That matters where `decode_range` walks data or a
+    // malformed image, which is the case the marker exists for -- a consumer sees a complete
+    // branch instead of [`Operand::Undecoded`], and a walker follows it. Raised on dbgscope#171
+    // and settled by differencing this whole space against the generated table rather than by
+    // deriving eleven forms from memory.
+    //
+    // `op4` is a register only in the modifier forms; otherwise it is zero without authentication
+    // and `11111` with it, that being where the key's own `Zm` would sit.
+    let op4_fixed = match key.is_empty() {
+        true => 0b00000,
+        false => 0b11111,
+    };
     match field(word, 21, 4) {
         // `br`/`braaz`/`brabz`, then `braa`/`brab`, which name a modifier register.
         opc @ (0b0000 | 0b1000) => {
             let modifier = opc == 0b1000;
+            if !modifier && op4 != op4_fixed {
+                return Out::undecoded("unallocated");
+            }
             let out = Out::new(&match (key, modifier) {
                 ("", _) => "br".to_string(),
                 (key, false) => format!("bra{key}z"),
@@ -1119,6 +1139,9 @@ fn branch_register(word: u32) -> Out {
         }
         opc @ (0b0001 | 0b1001) => {
             let modifier = opc == 0b1001;
+            if !modifier && op4 != op4_fixed {
+                return Out::undecoded("unallocated");
+            }
             let out = Out::new(&match (key, modifier) {
                 ("", _) => "blr".to_string(),
                 (key, false) => format!("blra{key}z"),
@@ -1134,6 +1157,9 @@ fn branch_register(word: u32) -> Out {
         // `ret`, whose operand is omitted where it is the link register -- which is every `ret` a
         // compiler emits, and is why the engine prints the mnemonic alone.
         0b0010 => {
+            if op4 != op4_fixed || (!key.is_empty() && rn != 0b11111) {
+                return Out::undecoded("unallocated");
+            }
             let out = Out::new(&match key {
                 "" => "ret".to_string(),
                 key => format!("reta{key}"),
@@ -1148,6 +1174,9 @@ fn branch_register(word: u32) -> Out {
         }
         // `eret` and `drps` return from an exception and from debug state. Both are EL1 and above.
         0b0100 => {
+            if rn != 0b11111 || op4 != op4_fixed {
+                return Out::undecoded("unallocated");
+            }
             let out = Out::new(&match key {
                 "" => "eret".to_string(),
                 key => format!("ereta{key}"),
@@ -1162,7 +1191,7 @@ fn branch_register(word: u32) -> Out {
                 false => out.reads_only(stack_pointer()),
             }
         }
-        0b0101 => Out::new("drps").privileged(),
+        0b0101 if key.is_empty() && rn == 0b11111 && op4 == 0 => Out::new("drps").privileged(),
         _ => Out::undecoded("unallocated"),
     }
 }
@@ -1258,10 +1287,22 @@ fn system(word: u32) -> Out {
                 (false, _) => out.in_reg(gpr(rt, true, false)),
                 (true, _) => out,
             };
-            match privileged_level(op1) {
-                true => out.privileged(),
-                false => out,
-            }
+            // **A system operation is privileged whatever its `op1` says**, because the
+            // architecture has no unconditionally-EL0 member of this family: every encoding under
+            // `op1` three is reached only through a privileged enable bit. `SCTLR_EL1.UCI` gates
+            // the by-address cache maintenance -- `dc cvau`, `dc civac`, `dc cvac`, `dc cvap`,
+            // `dc cvadp` and `ic ivau` -- `SCTLR_EL1.DZE` gates `dc zva` and the MTE zeroing forms
+            // beside it, and `GCSCRE0_EL1` gates the guarded-stack pushes. The rest of the family
+            // is EL1 and above by `op1` alone.
+            //
+            // So this reads *nothing*, where it used to read `op1` and carve `DAIF` back out one
+            // encoding at a time. That carve-out is still right for a system **register**
+            // ([`interrupt_mask`], below) -- most of EL0's registers really are EL0's, and `NZCV`
+            // sits one `op2` away from `DAIF` -- but for an operation the exception is the whole
+            // set, and a rule with no exceptions is the one that stops generating them. Raised on
+            // dbgscope#171, whose reviewer reached `dc cvau` by the same argument that reached
+            // `DAIF` two rounds earlier; the third time it would have been `dc zva`.
+            out.privileged()
         }
         // `msr`/`mrs` against a named system register. `op0` is 2 or 3 and is part of the name.
         (_, load) => {
@@ -1290,17 +1331,25 @@ fn system(word: u32) -> Out {
     }
 }
 
-/// Whether a system encoding's `op1` names an exception level above EL0.
+/// Whether a system *register* encoding's `op1` names an exception level above EL0.
+///
+/// **Registers only.** The system *operation* family reads no `op1` at all, every member of it
+/// needing privilege one way or another -- see the arm that builds `sys`/`dc`/`ic`/`tlbi`.
 const fn privileged_level(op1: u32) -> bool {
     op1 != 0b011
 }
 
 /// Whether a system *register* encoding is `DAIF`, the interrupt masks.
 ///
-/// The one register under EL0's `op1` that EL0 may not reach freely: `SCTLR_EL1.UMA` gates it,
+/// The one *register* under EL0's `op1` that EL0 may not reach freely: `SCTLR_EL1.UMA` gates it,
 /// which is a run-time fact the encoding does not carry, so it is named here as its
 /// processor-state counterpart is named in [`pstate`]. The two together are the whole of the
-/// carve-out, and they are the same instruction reached two ways.
+/// register carve-out, and they are the same instruction reached two ways.
+///
+/// **A system operation needs no such list**, though it was nearly given one: the same argument
+/// that reaches `DAIF` reaches `dc cvau` under `SCTLR_EL1.UCI` and `dc zva` under
+/// `SCTLR_EL1.DZE`, and there the exception turned out to be the entire family. So that arm reads
+/// nothing rather than carrying a second table this one's shape would have suggested.
 const fn interrupt_mask(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> bool {
     op0 == 0b11 && op1 == 0b011 && crn == 0b0100 && crm == 0b0010 && op2 == 0b001
 }
@@ -3862,12 +3911,24 @@ mod tests {
         let tlb = shapes(0xd508_871f);
         assert_eq!(tlb.mnemonic, "tlbi");
         assert!(tlb.privileged);
-        // `d50b7a29  dc CVAC,x9` -- `op1` three, so cleaning by virtual address is not privileged,
-        // and that is right: EL0 may do it.
+        // `d50b7a29  dc CVAC,x9` -- `op1` three, which **is not EL0's to execute** however much
+        // the field suggests it. This assertion read `!clean.privileged` and its comment said "EL0
+        // may do it", and EL0 may do it only where `SCTLR_EL1.UCI` says so. There is no
+        // unconditionally-EL0 system operation, which is why the arm reads no `op1` at all now.
         let clean = shapes(0xd50b_7a29);
         assert_eq!(clean.mnemonic, "dc");
-        assert!(!clean.privileged);
+        assert!(clean.privileged);
         assert_eq!(spellings(&clean.reads), ["x9"]);
+        // The rest of the gated set, which the same reasoning reaches and one round at a time
+        // would not have: `d50b7b20  dc CVAU,x0` and `d50b7521  ic IVAU,x1` under `SCTLR_EL1.UCI`,
+        // and `d50b7420  dc ZVA,x0` under `SCTLR_EL1.DZE`.
+        for word in [0xd50b_7b20_u32, 0xd50b_7521, 0xd50b_7420] {
+            assert!(shapes(word).privileged, "{word:#010x}");
+        }
+        // **And the barriers and hints beside them are untouched**, being a different `op0`:
+        // `d5033fdf  isb` and `d503201f  nop` really are EL0's.
+        assert!(!shapes(0xd503_3fdf).privileged);
+        assert!(!shapes(0xd503_201f).privileged);
         // `d508751f  ic IALLU` and `d5087855  at S1E0R,x21`.
         assert_eq!(shapes(0xd508_751f).mnemonic, "ic");
         assert!(shapes(0xd508_751f).privileged);
@@ -4100,14 +4161,18 @@ mod tests {
         let b_key = shapes(0xd71f_0c43);
         assert_eq!(b_key.mnemonic, "brab", "not `brba`: {b_key:?}");
         assert_eq!(b_key.flow, Flow::Jmp(None));
-        // The zero-modifier forms, which take no second register.
-        assert_eq!(shapes(0xd61f_0840).mnemonic, "braaz");
-        assert_eq!(shapes(0xd61f_0c40).mnemonic, "brabz");
+        // The zero-modifier forms, which take no second register -- and therefore fix `op4` at
+        // `11111` rather than leaving it free. **This line used to read `0xd61f_0840`**, which is
+        // not an encoding: it was accepted only because nothing checked the field, and the
+        // generated table calls it unallocated. `test_an_addressing_mode_constrains_which_
+        // transfers_it_allows` is where that now fails.
+        assert_eq!(shapes(0xd61f_085f).mnemonic, "braaz");
+        assert_eq!(shapes(0xd61f_0c5f).mnemonic, "brabz");
         // And the same through the three other opcodes in the class.
         let call = shapes(0xd73f_0c43);
         assert_eq!(call.mnemonic, "blrab");
         assert_eq!(spellings(&call.writes), ["lr"]);
-        assert_eq!(shapes(0xd63f_0840).mnemonic, "blraaz");
+        assert_eq!(shapes(0xd63f_085f).mnemonic, "blraaz");
         assert_eq!(shapes(0xd65f_0bff).mnemonic, "retaa");
         assert_eq!(shapes(0xd65f_0fff).mnemonic, "retab");
         assert_eq!(shapes(0xd69f_0fff).mnemonic, "eretab");
@@ -4319,6 +4384,48 @@ mod tests {
         assert_eq!(width(0x4c40_a020), [Some(32)]);
         // A plain load is the ordinary case the other two are measured against.
         assert_eq!(width(0xf940_0021), [Some(8)]);
+    }
+
+    /// A register-branch form fixes every field it does not use, and nothing enforced it.
+    ///
+    /// The comment in [`branch_register`] has stated this rule since it was written, which is the
+    /// same shape as the `udf` finding two rounds earlier: the prose knew and the code did not.
+    /// `0xd61f0001` came back as `br x0`, and an authenticated return with a stray `Rn` reported
+    /// reads of the link register and the stack pointer that its word does not name -- both of
+    /// them complete answers where [`Operand::Undecoded`] is the honest one, which matters when
+    /// `decode_range` walks data. Raised on dbgscope#171, and every expectation below is the
+    /// generated table's own reading of the same word.
+    #[test]
+    fn test_a_branch_form_fixes_the_fields_it_does_not_use() {
+        let unallocated = |word: u32| {
+            assert_eq!(
+                shapes(word).operands,
+                [Operand::Undecoded("unallocated".to_string())],
+                "{word:#010x}"
+            );
+        };
+        // `br`/`blr`/`ret` fix `op4` at zero and leave `Rn` free.
+        assert_eq!(shapes(0xd61f_0000).mnemonic, "br");
+        unallocated(0xd61f_0001);
+        // The zero-modifier authenticated forms fix it at `11111` instead -- the opposite value,
+        // so a single check of "is it zero" would have passed half of these and failed the rest.
+        assert_eq!(shapes(0xd61f_085f).mnemonic, "braaz");
+        unallocated(0xd61f_0840);
+        // `retaa` names neither register, so both are fixed.
+        assert_eq!(shapes(0xd65f_0bff).mnemonic, "retaa");
+        unallocated(0xd65f_0801);
+        // `eret` names nothing at all, and its `Rn` is fixed even in the plain form.
+        assert_eq!(shapes(0xd69f_03e0).mnemonic, "eret");
+        unallocated(0xd69f_0000);
+        // `drps` has **no** authenticated form, which the key match alone let through: `op3` two
+        // spelled it `drps` rather than refusing it.
+        assert_eq!(shapes(0xd6bf_03e0).mnemonic, "drps");
+        unallocated(0xd6bf_0be0);
+        // **And the modifier forms still take a register there**, which is the half that says
+        // these guards are narrow: `d71f0843  braa x2,x3`.
+        let modifier = shapes(0xd71f_0843);
+        assert_eq!(modifier.mnemonic, "braa");
+        assert_eq!(spellings(&modifier.reads), ["x2", "x3"]);
     }
 
     /// The encodings the access-width audit found shaped here and unallocated in the architecture,

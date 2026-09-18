@@ -70,6 +70,25 @@ All notable changes to this project are documented here. The format follows
   review or by either existing harness — a corpus contains none of these encodings, and the family
   enumeration compares *definitions* and so cannot see a field nobody constrained. Each was then
   settled against the generated instruction table rather than a recalled one.
+- **A register-branch form now refuses the words that leave its fixed fields set**, `0xd61f0001`
+  having decoded as `br x0` and an authenticated return with a stray `Rn` having reported reads of
+  the link register and the stack pointer its word does not name. The rule was already written in
+  the comment above the code that did not apply it. Settled by differencing that whole encoding
+  space against a generated instruction table, which now agrees with it exactly but for `texit`,
+  an extension this declines.
+
+- **Every A64 system operation is reported privileged**, where `sys`, `dc`, `ic` and `tlbi`
+  previously took their answer from `op1` alone and so called the `op1`-three encodings EL0's.
+  They are not: there is no unconditionally-EL0 member of that family. `SCTLR_EL1.UCI` gates
+  `dc cvau`, `dc civac`, `dc cvac`, `dc cvap`, `dc cvadp` and `ic ivau`; `SCTLR_EL1.DZE` gates
+  `dc zva` and the MTE zeroing forms; `GCSCRE0_EL1` gates the guarded-stack pushes. A hazard scan
+  was seeing none of the 74 by-address cache maintenance instructions in this bench's kernel.
+
+  The same argument had already carved `DAIF` out of the system *register* space one round
+  earlier. That carve-out stays, registers under `op1` three being mostly EL0's own; for
+  operations the exception is the whole set, so that arm now reads no `op1` at all rather than
+  growing a second list a round at a time.
+
 - **`Operand::Undecoded`**, which is how an instruction says its fields are defaults rather than
   answers. `InstructionSet::operands_are_read` answers for a *set*, and that was enough while every
   decoder here was complete over its own; A64's is the first that is not, and the distinction
@@ -95,7 +114,11 @@ All notable changes to this project are documented here. The format follows
   folded into its value instead, `sub w0,w0,#0x222,lsl #12` carrying `0x222000`, since that is a
   number the operand can hold.
 - **`decode_instruction`**, which decodes one instruction from bytes a caller already has, with no
-  debug session anywhere. Everything else here reaches an instruction through a target;
+  debug session anywhere. `Instruction::bytes` carries the bytes the instruction **occupies**
+  rather than the buffer it was handed — an x86 caller cannot know an instruction's length before
+  decoding it, so `[0x90, 0xcc]` answers `nop` with `90`, and a walker may step by that length.
+  Bytes that decode to nothing report the whole input, there being no extent to report and
+  `Flow::Unknown` beside them saying so. Everything else here reaches an instruction through a target;
   this is the same decoding for a caller holding the encoding — bytes out of a file, an image
   mapped by something else, or a word under test. `Instruction::text` is empty, nothing having
   rendered it.
