@@ -3005,9 +3005,19 @@ pub struct BreakpointInfo {
 /// caller with a `u32` word passes `word.to_be_bytes()` and one with memory reverses first.
 pub fn decode_instruction(bytes: &[u8], address: u64, set: InstructionSet) -> Instruction {
     let decoded = decode_operation(bytes, address, set);
+    // **Only the bytes this instruction occupies**, not the whole buffer the caller offered. An
+    // x86 caller cannot know an instruction's length before decoding it -- that is most of why
+    // they are calling -- so they pass what they have, and `[0x90, 0xcc]` decoded as `nop` used to
+    // answer `90cc`. A stream walker stepping by `bytes.len()` then skipped whatever followed.
+    // Where nothing decoded there is no extent to report and the caller's own buffer is the
+    // honest answer, which is what `Flow::Unknown` beside it already says. Raised on dbgscope#171.
+    let occupies = match decoded.length {
+        Some(length) => &bytes[..length.min(bytes.len())],
+        None => bytes,
+    };
     Instruction {
         address,
-        bytes: hex::encode(bytes),
+        bytes: hex::encode(occupies),
         text: String::new(),
         mnemonic: decoded.mnemonic,
         operands: decoded.operands,
@@ -3124,6 +3134,13 @@ pub(crate) struct Decoded {
     pub(crate) writes_flags: bool,
     pub(crate) writes: Vec<RegisterOperand>,
     pub(crate) reads: Vec<RegisterOperand>,
+    /// How many of the bytes offered this instruction occupies, or `None` where nothing decoded.
+    ///
+    /// Only [`decode_instruction`] reads it, and only because its caller supplies the buffer: the
+    /// engine-backed paths are handed exactly one instruction's bytes already. It is carried here
+    /// rather than recomputed because this is where it is known -- recomputing it for x86 means
+    /// decoding twice and deciding the same thing in two places.
+    pub(crate) length: Option<usize>,
 }
 
 impl Decoded {
@@ -3140,6 +3157,7 @@ impl Decoded {
             writes_flags: false,
             writes: Vec::new(),
             reads: Vec::new(),
+            length: None,
         }
     }
 }
@@ -3203,6 +3221,7 @@ fn decode_operation(bytes: &[u8], address: u64, set: InstructionSet) -> Decoded 
         writes_flags: decoded.rflags_written() != 0,
         writes,
         reads,
+        length: Some(decoded.len()),
     }
 }
 
@@ -8699,6 +8718,50 @@ mod tests {
     };
 
     use super::*;
+
+    /// [`decode_instruction`] reports the bytes the instruction occupies, not the buffer it was
+    /// handed.
+    ///
+    /// An x86 caller cannot know an instruction's length before decoding it -- that is most of why
+    /// they are calling -- so they pass whatever they have. `[0x90, 0xcc]` came back as a `nop`
+    /// carrying `90cc`, and a walker stepping by that length stepped over the `int3` behind it.
+    /// Raised on dbgscope#171; every length below is iced's own reading of the same bytes.
+    #[test]
+    fn test_a_standalone_decode_reports_only_the_bytes_it_consumed() {
+        // One `nop`, then an `int3` that is not part of it.
+        let nop = decode_instruction(&[0x90, 0xcc], 0x1000, InstructionSet::Amd64);
+        assert_eq!(nop.mnemonic, "nop");
+        assert_eq!(nop.bytes, "90");
+        // And stepping by that length reaches the second one rather than past it, which is the
+        // property the field exists to support.
+        let int3 = decode_instruction(&[0xcc], 0x1001, InstructionSet::Amd64);
+        assert_eq!(int3.mnemonic, "int3");
+        // **Not "always the first byte"**: `48 8b 05 <disp32>` is a seven-byte
+        // `mov rax,[rip+disp]`, with a trailing `nop` here that is again not part of it.
+        let load = decode_instruction(
+            &[0x48, 0x8b, 0x05, 0x00, 0x00, 0x00, 0x00, 0x90],
+            0x1000,
+            InstructionSet::Amd64,
+        );
+        assert_eq!(load.mnemonic, "mov");
+        assert_eq!(load.bytes, "488b0500000000");
+        // A64 is fixed-width, so a caller with two words gets the first.
+        // `a9bf7bfd  stp fp,lr,[sp,#-0x10]!` followed by `d503201f  nop`.
+        let stp = decode_instruction(
+            &[0xa9, 0xbf, 0x7b, 0xfd, 0xd5, 0x03, 0x20, 0x1f],
+            0x1000,
+            InstructionSet::Arm64,
+        );
+        assert_eq!(stp.mnemonic, "stp");
+        assert_eq!(stp.bytes, "a9bf7bfd");
+        // **Bytes nothing decoded still report what the caller passed.** There is no extent to
+        // report, the caller's buffer is the only honest answer, and `Flow::Unknown` beside it
+        // already says nothing was claimed -- so this is a deliberate exception rather than the
+        // rule leaking.
+        let unknown = decode_instruction(&[0x0f, 0x0b], 0x1000, InstructionSet::Other(0x1234));
+        assert_eq!(unknown.bytes, "0f0b");
+        assert_eq!(unknown.flow, Flow::Unknown);
+    }
 
     /// **An arrival is delivered to one open, in registration order, and claimed.**
     ///
