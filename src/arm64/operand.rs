@@ -831,18 +831,26 @@ fn bitfield(word: u32) -> Out {
     let source = gpr(field(word, 5, 5), wide, false);
     // The extending aliases read a *narrow* source: `sxtb x0,w0` names `w0` whatever `sf` says,
     // the byte being taken from the low end either way.
+    //
+    // **Only the word-width ones carry a move effect**, and the difference is whether an operand's
+    // width says how much was extended. `uxtw x0,w0` extends exactly the four bytes `w0` names, so
+    // a consumer propagating the value is right; `uxtb x0,w0` extends *one* byte of a register
+    // named as four, and the narrowness is in the mnemonic where no operand expresses it -- so
+    // [`Effect::Move`] there would invite a copy that is only correct when the value happens to
+    // fit in a byte. It is the same reason `bic` is not [`Effect::BitAnd`]: the operands do not
+    // carry the whole operation. Review on dbgscope#171 raised the mnemonic; this is what was
+    // underneath it.
+    //
+    // The mnemonics themselves stay as the engine spells them, `uxtb x0,w1` for a 64-bit `ubfm`
+    // included, which the architecture's alias table reserves for the 32-bit form and calls
+    // `ubfx`. That is the same deviation the `uxtw` arm below records, and with the effect no
+    // longer claiming more than the operands do it costs a spelling rather than a reading.
     let narrow_source = gpr(field(word, 5, 5), false, false);
     match opc {
         // SBFM.
         0b00 => match (immr, imms) {
-            (0, 7) => Out::new("sxtb")
-                .out_reg(destination)
-                .in_reg(narrow_source)
-                .effect(Effect::MoveSigned),
-            (0, 15) => Out::new("sxth")
-                .out_reg(destination)
-                .in_reg(narrow_source)
-                .effect(Effect::MoveSigned),
+            (0, 7) => Out::new("sxtb").out_reg(destination).in_reg(narrow_source),
+            (0, 15) => Out::new("sxth").out_reg(destination).in_reg(narrow_source),
             (0, 31) if wide => Out::new("sxtw")
                 .out_reg(destination)
                 .in_reg(narrow_source)
@@ -882,14 +890,8 @@ fn bitfield(word: u32) -> Out {
         },
         // UBFM.
         _ => match (immr, imms) {
-            (0, 7) => Out::new("uxtb")
-                .out_reg(destination)
-                .in_reg(narrow_source)
-                .effect(Effect::Move),
-            (0, 15) => Out::new("uxth")
-                .out_reg(destination)
-                .in_reg(narrow_source)
-                .effect(Effect::Move),
+            (0, 7) => Out::new("uxtb").out_reg(destination).in_reg(narrow_source),
+            (0, 15) => Out::new("uxth").out_reg(destination).in_reg(narrow_source),
             // A 64-bit extract of the low thirty-two bits is a zero-extending copy, and the
             // engine names it `uxtw`. That is **not** one of the architecture's aliases — ARM
             // leaves it as `ubfx`, there being a `mov Wd,Wn` that does the same — and it is
@@ -2128,6 +2130,31 @@ fn load_store_exclusive(word: u32) -> Out {
     }
 }
 
+/// How many bytes one register's share of a structure transfer moves.
+///
+/// The whole-register forms move the register: eight bytes or sixteen, as `Q` says. A
+/// single-structure form moves one *element*, whose width the opcode's top two bits give directly
+/// except where they say `10`, which is a single-precision element unless `size`'s low bit makes
+/// it a double. The replicate forms take the width from `size` alone, an element of every lane
+/// being the same width as one.
+///
+/// Checked against the engine's own rendering of the amount it prints: `ld1 {v0.8b},[x1],#8`,
+/// `ld1 {v0.16b,v1.16b,v2.16b,v3.16b},[x1],#0x40`, `ld2 {v0.b,v1.b}[0],[x1],#2` and
+/// `st1 {v0.s}[0],[x1],#4`.
+fn structure_element(word: u32, single: bool, replicate: &str) -> i64 {
+    if !single {
+        return 8 << field(word, 30, 1);
+    }
+    if !replicate.is_empty() {
+        return 1 << field(word, 10, 2);
+    }
+    match field(word, 14, 2) {
+        0b00 => 1,
+        0b01 => 2,
+        _ => 4 << field(word, 10, 1),
+    }
+}
+
 /// Advanced SIMD's structure loads and stores.
 ///
 /// The register *list* is an operand kind [`Operand`] has no shape for -- `{v0.16b, v1.16b}` is
@@ -2205,13 +2232,17 @@ fn vector_structures(word: u32) -> Out {
     // instruction never makes — so it is a read of its own, as the engine prints it, and the
     // memory operand keeps only the base. Raised on dbgscope#171.
     //
-    // `11111` there is the immediate form instead, whose amount is the transfer's own size and is
-    // not named: it is implied by the register list and the element width rather than encoded, and
-    // computing it would be a second reading of fields this does not otherwise decode.
+    // `11111` there is the immediate form instead, whose amount is the transfer's own size:
+    // implied by how many registers are named and how wide each transfer is, rather than encoded.
+    // It is computed rather than left out, because the base still moves by it and a caller with
+    // only the writeback knows *that* and not *how far*. Raised on dbgscope#171.
     let rm = field(word, 16, 5);
-    let out = match post_index && rm != 0b11111 {
-        true => out.in_reg(gpr(rm, true, false)),
-        false => out,
+    let out = match (post_index, rm) {
+        (true, 0b11111) => out.other(post_index_amount(
+            (count as i64) * structure_element(word, single, replicate),
+        )),
+        (true, rm) => out.in_reg(gpr(rm, true, false)),
+        (false, _) => out,
     };
     match post_index {
         true => out.writes_only(gpr(rn, true, true)),
@@ -2297,7 +2328,12 @@ fn logical_shifted_register(word: u32) -> Out {
     );
     // `mov Rd,Rm` is `orr` from the zero register with nothing shifted -- the commonest
     // instruction in the image, and invisible to anything reading the base mnemonic.
-    if opc == 0b01 && !negated && rn == 31 && modifier.is_none() {
+    //
+    // **A zero amount is not enough: the shift type has to be `lsl`.** A `lsr #0` is the same
+    // no-op arithmetically, which is why [`shift_modifier`] reports no modifier for it and why the
+    // effect below is sound either way -- but it is not the alias, and both the engine and a
+    // generated table spell it `orr x0,xzr,x1,lsr #0`. Raised on dbgscope#171.
+    if opc == 0b01 && !negated && rn == 31 && field(word, 22, 2) == 0b00 && modifier.is_none() {
         return Out::new("mov")
             .out_reg(destination)
             .in_reg(right)
@@ -3249,10 +3285,16 @@ mod tests {
         // `53001d00  uxtb w0,w8` and `93407c59  sxtw x25,w2`.
         let uxtb = shapes(0x5300_1d00);
         assert_eq!(uxtb.mnemonic, "uxtb");
-        assert_eq!(uxtb.effect, Effect::Move);
+        // **Not a move**: it extends one byte of a register named as four, and no operand's width
+        // says so, exactly as `bic`'s mask is not in its operands. The word-width pair is, their
+        // source naming precisely what they extend.
+        assert_eq!(uxtb.effect, Effect::Other);
+        assert_eq!(shapes(0xd340_1c20).effect, Effect::Other, "and at 64 bits");
+        assert_eq!(shapes(0x5300_3c00).effect, Effect::Other, "uxth");
         let sxtw = shapes(0x9340_7c59);
         assert_eq!(sxtw.mnemonic, "sxtw");
         assert_eq!(sxtw.effect, Effect::MoveSigned);
+        assert_eq!(shapes(0xd340_7c08).effect, Effect::Move, "uxtw");
         assert_eq!(sxtw.operands[1], register("w2", "x2", 4));
         // `b374cd28  bfi x8,x9,#0xC,#0x34` -- an insert keeps the bits it does not replace, so
         // the destination is a read too.
@@ -3563,6 +3605,15 @@ mod tests {
         let plain = shapes(0xaa05_0085);
         assert_eq!(plain.effect, Effect::BitOr);
         assert_eq!(plain.operands.len(), 3);
+        // **The `mov` alias needs `lsl` and not merely a zero amount.** `aa0103e0` is
+        // `mov x0,x1`; `aa4103e0` is the same registers shifted `lsr #0`, which is the same no-op
+        // arithmetically and is not the alias -- the engine and a generated table both spell it
+        // `orr x0,xzr,x1,lsr #0`.
+        assert_eq!(shapes(0xaa01_03e0).mnemonic, "mov");
+        let not_a_move = shapes(0xaa41_03e0);
+        assert_eq!(not_a_move.mnemonic, "orr");
+        assert_eq!(not_a_move.effect, Effect::BitOr);
+        assert_eq!(not_a_move.operands.len(), 3);
         // `eb47311f  cmp x8,x7,lsr #0xC` -- a compare with a modifier is not one either.
         let compare = shapes(0xeb47_311f);
         assert_eq!(compare.mnemonic, "cmp");
@@ -4041,6 +4092,29 @@ mod tests {
         }
         // The legacy forms have it zero, which is why every one above still decodes.
         assert_eq!(shapes(0x0d00_2140).mnemonic, "st3");
+        // **An immediate post-index still moves the base, and by how much is computable** from how
+        // many registers are named and how wide each transfer is. Every amount below is the one
+        // the engine prints for the same word.
+        let amount = |word: u32| match shapes(word).operands.last() {
+            Some(Operand::Other(text)) => text.clone(),
+            other => panic!("{word:#010x}: {other:?}"),
+        };
+        assert_eq!(amount(0x0dff_0020), "#0x2", "ld2 of one byte each");
+        assert_eq!(
+            amount(0x0cdf_7020),
+            "#0x8",
+            "ld1 of one eight-byte register"
+        );
+        assert_eq!(
+            amount(0x4cdf_2020),
+            "#0x40",
+            "ld1 of four sixteen-byte registers"
+        );
+        assert_eq!(
+            amount(0x0d9f_8020),
+            "#0x4",
+            "st1 of one single-precision lane"
+        );
     }
 
     /// The two halves of the vector boundary a name on an operand hides: an upper-lane `fmov`
