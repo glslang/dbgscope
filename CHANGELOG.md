@@ -33,12 +33,19 @@ All notable changes to this project are documented here. The format follows
   What is decoded is the general-purpose architecture in full, with the aliases a compiler emits
   resolved out of their base forms (`cmp` from `subs`, `mov` from `orr`, `lsr` from `ubfm`) because
   an alias changes the operand *list* and not only the spelling. The vector spaces are named rather
-  than shaped — as a single `Operand::Other` carrying the space's name, which is a caller's tell
-  that nothing was read — with one exception: in **Advanced SIMD and scalar floating-point**, every
+  than shaped — as a single `Operand::Undecoded` carrying the space's name, which is a caller's
+  tell that nothing was read — with one exception: in **Advanced SIMD and scalar floating-point**, every
   encoding that reaches a general-purpose register or the flags is decoded, and the list is short
   enough to give in full (the floating-point conversions, `fmov` between the register files
   including its upper-lane form, `umov`/`smov`/`ins`/`dup`, `fcmp`/`fccmp` and `fjcvtzs`, and a
-  vector load's base-register writeback).
+  vector load's base-register writeback). The Reserved space's one allocated member, `udf #imm16`,
+  is decoded too — the engine renders that whole space `???`, so this is one of the few places the
+  decode says more than the rendering it was checked against.
+
+  A **vector-structure access carries the width it transfers** on its memory operand, that being
+  the one thing its register list does not give a caller: `ld1 {v0.16b},[x1]` reports 16 bytes,
+  `ld2 {v0.b,v1.b}[0],[x1]` reports 2, and a replicating `ld1r {v3.4s},[x4]` reports **4** — one
+  element read and splatted, rather than the sixteen bytes it writes.
 
   **SVE and SME have no such exception**, so an `incb x0` there comes back claiming nothing about
   `x0`. That is deliberate rather than an oversight: a partial decode of that space would remove
@@ -56,7 +63,7 @@ All notable changes to this project are documented here. The format follows
   lose a finding than invent one stops at it.
 
   Measured against the engine's own rendering of all 1,233,502 words of a 26100 ARM64 kernel's
-  `nt` (`.text` and `PAGE`): 5,021 instructions — 0.42% of the 1,189,047 the engine could render —
+  `nt` (`.text` and `PAGE`): 5,019 instructions — 0.42% of the 1,189,047 the engine could render —
   are left unshaped, all of them in those vector spaces; every register a rendering names is in the
   decode's reads or writes but one, whose `Rn` field the engine prints as `sp` where the encoding
   says the zero register; all 42,244 resolved addresses match the engine's; and thirty mnemonics
