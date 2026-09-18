@@ -36,7 +36,9 @@
 //!
 //! The Advanced SIMD, scalar floating-point, SVE and SME spaces are **not** shaped, and an
 //! instruction in them comes back as a single [`Operand::Undecoded`] naming the space —
-//! `advanced-simd`, `floating-point`, `sve`, `unallocated`. That variant exists because this is
+//! `advanced-simd`, `floating-point`, `sve`, `unallocated`, `reserved`. (The last of those covers
+//! the part of the Reserved space that is *not* `udf #imm16`, that one member being decoded.) That
+//! variant exists because this is
 //! the first decoder here that reads most of an instruction set rather than all of it, and the
 //! distinction had nowhere to live: an *empty* operand list means "this instruction takes none",
 //! the same thing it means on x64, so saying "nothing was read" needed a shape of its own rather
@@ -542,9 +544,20 @@ const fn mask_of(bits: u32) -> u64 {
 /// and the groups this does not decode are named rather than defaulted.
 pub(crate) fn decode(word: u32, address: u64) -> Decoded {
     let out = match field(word, 25, 4) {
-        // The Reserved space, whose one allocated member is `udf`. Inter-function padding is a
-        // zero word and lands here, which is why `super::flow` stops on it.
-        0b0000 => Out::undecoded("reserved"),
+        // The Reserved space, whose one allocated member is `udf #imm16` -- everything above its
+        // immediate being zero. Inter-function padding is a zero word and is therefore a `udf #0`,
+        // which is why `super::flow` stops on it.
+        //
+        // **Naming it costs nothing and saying nothing was misleading**, because
+        // [`super::flow`] already reads this space and stops there: reporting
+        // [`Operand::Undecoded`] claimed the word had not been read when its meaning was the one
+        // thing about it that was certain. The rest of the space is reserved and *is* unread.
+        // Raised on dbgscope#171, where the standalone `decode_instruction` made it visible --
+        // there being no rendering to borrow a mnemonic from.
+        0b0000 => match word & 0xffff_0000 {
+            0 => Out::new("udf").imm((word & 0xffff) as u64),
+            _ => Out::undecoded("reserved"),
+        },
         // SME, SVE, and the space between them. Vector state, and nothing in them writes a
         // general-purpose register that a Windows kernel image has been seen to use — measured on
         // the 26100 ARM64 `nt`, where the whole of the three is 1,800 words of which 1,673 are
@@ -2237,7 +2250,13 @@ fn vector_structures(word: u32) -> Out {
             out = out.writes_only(register);
         }
     }
+    // **The width is encoded here and was already being computed**, for the post-index amount
+    // below: how many registers are named, times how wide each transfer is. Reporting it on the
+    // memory operand as well is what lets a caller bound the read or the write, which for this
+    // family is the one thing the register list does not tell them. Raised on dbgscope#171.
+    let transferred = (count as i64) * structure_element(word, single, replicate);
     let out = out.mem(MemoryOperand {
+        size: Some(transferred as u32),
         base: Some(gpr(rn, true, true)),
         scale: 1,
         ..MemoryOperand::default()
@@ -2254,9 +2273,7 @@ fn vector_structures(word: u32) -> Out {
     // only the writeback knows *that* and not *how far*. Raised on dbgscope#171.
     let rm = field(word, 16, 5);
     let out = match (post_index, rm) {
-        (true, 0b11111) => out.other(post_index_amount(
-            (count as i64) * structure_element(word, single, replicate),
-        )),
+        (true, 0b11111) => out.other(post_index_amount(transferred)),
         (true, rm) => out.in_reg(gpr(rm, true, false)),
         (false, _) => out,
     };
@@ -3884,13 +3901,17 @@ mod tests {
             "the rendering's token is better"
         );
         assert!(vector.writes.is_empty());
-        // `a5e0a01f  ld1d {z31.d},p0/z,[x0]` and the zero word, which is `udf`.
+        // `a5e0a01f  ld1d {z31.d},p0/z,[x0]`, and a reserved word from the same image.
         assert_eq!(
             shapes(0xa5e0_a01f).operands,
             [Operand::Undecoded("sve".to_string())]
         );
+        // **Not the zero word**, which this line used to use and which is `udf #0` -- as the
+        // comment above it said while the assertion beneath said otherwise. The reserved *space*
+        // is still unread and is what belongs here;
+        // `test_the_reserved_spaces_one_allocated_member_is_decoded` has both halves.
         assert_eq!(
-            shapes(0x0000_0000).operands,
+            shapes(0x8000_0005).operands,
             [Operand::Undecoded("reserved".to_string())]
         );
     }
@@ -4149,6 +4170,76 @@ mod tests {
             "#0x4",
             "st1 of one single-precision lane"
         );
+    }
+
+    /// **The width of a vector-structure access is the one thing its register list does not say**,
+    /// and this decoder was computing it for the post-index amount above while reporting `None` on
+    /// the memory operand beside it. A caller bounding a read or a write therefore lost the range
+    /// for precisely the family whose transfer size cannot be inferred from the mnemonic.
+    ///
+    /// Every word below is one the engine rendered in the 26100 kernel, and the post-indexed ones
+    /// pin the arithmetic against the amount the engine itself prints. Raised on dbgscope#171.
+    #[test]
+    fn test_a_vector_structure_access_reports_how_much_it_transfers() {
+        let transferred = |word: u32| {
+            let shaped = shapes(word);
+            let memory = shaped.operands.iter().find_map(|operand| match operand {
+                Operand::Memory(memory) => Some(memory.clone()),
+                _ => None,
+            });
+            memory
+                .unwrap_or_else(|| panic!("{word:#010x}: {shaped:?}"))
+                .size
+        };
+        // Multiple structures: registers named, times the bytes each holds.
+        // `4c402020  ld1 {v0.16b,v1.16b,v2.16b,v3.16b},[x1]`.
+        assert_eq!(transferred(0x4c40_2020), Some(64));
+        // `0c407020  ld1 {v0.8b},[x1]` -- a half-width register is half the transfer.
+        assert_eq!(transferred(0x0c40_7020), Some(8));
+        // `4c40a020  ld1 {v0.16b,v1.16b},[x1]`.
+        assert_eq!(transferred(0x4c40_a020), Some(32));
+        // A single structure moves one element per register, whatever the registers hold.
+        // `0dff0020  ld2 {v0.b,v1.b}[0],[x1],#2`, whose own post-index amount is 2.
+        assert_eq!(transferred(0x0dff_0020), Some(2));
+        // `4d207972  st4 {v18.h,v19.h,v20.h,v21.h}[7],[x11]` -- four halfwords.
+        assert_eq!(transferred(0x4d20_7972), Some(8));
+        // **The replicate forms are the case that separates the transfer from the registers**, and
+        // a size read off the register list would get exactly these wrong: `4d40c110
+        // ld1r {v16.16b},[x8]` fills all sixteen bytes of `v16` from **one** byte of memory.
+        assert_eq!(transferred(0x4d40_c110), Some(1));
+        assert_eq!(spellings(&shapes(0x4d40_c110).writes), ["v16"]);
+        // `4dcaefb2  ld3r {v18.2d,v19.2d,v20.2d},[fp], x10` -- three doublewords read, 48 bytes
+        // written.
+        assert_eq!(transferred(0x4dca_efb2), Some(24));
+    }
+
+    /// The **Reserved** top-level space has one allocated member, `udf #imm16`, and reporting it as
+    /// unread claimed this decoder had not read a word whose meaning was the one certain thing
+    /// about it -- [`super::flow`] already stops on it. The engine renders the whole space `???`,
+    /// so nothing in the corpus check could have caught this; it took the standalone
+    /// `decode_instruction`, where there is no rendering to borrow a mnemonic from, to make it
+    /// visible. Raised on dbgscope#171.
+    #[test]
+    fn test_the_reserved_spaces_one_allocated_member_is_decoded() {
+        let trap = shapes(0x0000_1234);
+        assert_eq!(trap.mnemonic, "udf");
+        assert_eq!(trap.operands, [Operand::Immediate(0x1234)]);
+        assert_eq!(trap.flow, Flow::Trap);
+        // Inter-function padding, which is 25,157 words of that kernel's `.text` and `PAGE`.
+        let padding = shapes(0x0000_0000);
+        assert_eq!(padding.mnemonic, "udf");
+        assert_eq!(padding.operands, [Operand::Immediate(0)]);
+        // **And the rest of the space stays unread**, which is the half that keeps the claim
+        // honest: `udf` is `0x0000_0000` through `0x0000_ffff` and nothing above it. `80000005`
+        // is a real word from the same image -- data the engine also rendered `???`.
+        let reserved = shapes(0x8000_0005);
+        assert_eq!(reserved.mnemonic, "");
+        assert_eq!(
+            reserved.operands,
+            [Operand::Undecoded("reserved".to_string())]
+        );
+        // Either way the space traps, and that was already true before it was named.
+        assert_eq!(reserved.flow, Flow::Trap);
     }
 
     /// The two halves of the vector boundary a name on an operand hides: an upper-lane `fmov`
