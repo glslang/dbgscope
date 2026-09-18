@@ -69,6 +69,18 @@ All notable changes to this project are documented here. The format follows
   immediate a consumer would add: `add x8,x9,x10,lsl #3` is not `x9 + 3`. A shifted *immediate* is
   folded into its value instead, `sub w0,w0,#0x222,lsl #12` carrying `0x222000`, since that is a
   number the operand can hold.
+- **`decode_instruction`**, which decodes one instruction from bytes a caller already has, with no
+  debug session anywhere. Everything else here reaches an instruction through a target;
+  this is the same decoding for a caller holding the encoding — bytes out of a file, an image
+  mapped by something else, or a word under test. `Instruction::text` is empty, nothing having
+  rendered it.
+- `examples/undecoded_families.rs`, which decodes every 32-bit word twice — once with this crate's
+  A64 decoder and once with tables generated from the architecture — and lists the instruction
+  families the second knows and the first does not. Seven review rounds each found one or two of
+  those by hand, because a corpus finds only what a target contains and no Windows ARM64 image
+  contains memory tagging, `brab`, `subps` or `cpyfp`; this answers the whole question in fifty
+  seconds. It is what found MOPS' guarded forms and CSSC's literal minimum and maximum, and what
+  turned this crate's coverage claim from a sentence into a table.
 - `examples/decode_against_rendering.rs`, which decodes every word of an image's executable
   sections and cross-checks each one against the engine's own rendering of the same bytes. The
   rendering is the only independent reading of those bytes this crate has, and a corpus of a
