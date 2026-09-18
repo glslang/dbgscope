@@ -53,6 +53,13 @@ All notable changes to this project are documented here. The format follows
   immediate a consumer would add: `add x8,x9,x10,lsl #3` is not `x9 + 3`. A shifted *immediate* is
   folded into its value instead, `sub w0,w0,#0x222,lsl #12` carrying `0x222000`, since that is a
   number the operand can hold.
+- `examples/decode_against_rendering.rs`, which decodes every word of an image's executable
+  sections and cross-checks each one against the engine's own rendering of the same bytes. The
+  rendering is the only independent reading of those bytes this crate has, and a corpus of a
+  million real instructions finds shapes a hand-written fixture never contains: it found seven
+  defects in the A64 decoder above, including a no-allocate pair load decoded out of an `opc` that
+  form does not allocate, which only a sweep past `.text` reaches. Nothing in it is a pass or a
+  fail — every count has a floor that is not a defect, so the run prints *what* each one was.
 - `VsSemanticFamily::AffinitySlotsSelfRelative` (`affinity_slot_vs_offset`), reported apart from
   `AffinitySlots` because the two are *checked* differently — an address against the context, a
   displacement against `slot - context` — and reading one as the other rejects every slot silently
