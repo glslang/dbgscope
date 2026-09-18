@@ -153,12 +153,25 @@ pub(crate) fn flow(word: u32, address: u64) -> Flow {
             _ => Flow::Trap,
         };
     }
-    // `udf #imm16` — the permanently undefined encoding, `0000000000000000 imm16`. It is what a
-    // zero word is, and a zero word is what sits between functions: the engine renders those `???`
-    // even though it read them perfectly well, which is a different fact from the `??` it prints
-    // for bytes it could not read at all. Trapping stops a walk at the end of a function; falling
-    // through would run it into whatever the linker put next.
-    if word >> 16 == 0 {
+    // A64's **Reserved** top-level space, `op0` (bits 28..25) zero. Its one defined member is
+    // `udf #imm16` (`0000000000000000 imm16`), which is what a zero word is, and a zero word is
+    // what sits between functions: the engine renders those `???` even though it read them
+    // perfectly well, which is a different fact from the `??` it prints for bytes it could not
+    // read at all. Trapping stops a walk at the end of a function; falling through would run it
+    // into whatever the linker put next.
+    //
+    // **The whole space rather than the `udf` pattern**, because the rest of it is unallocated and
+    // UNDEFINED is an exception either way — the same rule the two classes above apply inside
+    // themselves, and the reason `0x00010000` is not a fall-through. It is one mask and needs no
+    // per-form knowledge, which is what makes it worth doing; the classes are disjoint from it, so
+    // it reads last without that being load-bearing.
+    //
+    // **`op0` `0001` and `0011` are left falling through**, and that is the line rather than an
+    // omission. This space is *Reserved* — permanently undefined by construction, which is what
+    // `udf` means — while those two are merely *unallocated today*, and ARM allocates into them.
+    // A decoder that trapped there would truncate a walk the first time an extension landed, on
+    // instructions that carry no control flow at all.
+    if (word >> 25) & 0xf == 0 {
         return Flow::Trap;
     }
     Flow::Fallthrough
@@ -384,11 +397,21 @@ mod tests {
     }
 
     #[test]
-    fn test_a_zero_word_is_the_undefined_instruction() {
-        // Inter-function padding, which the engine renders `???` while still reporting the four
-        // zero bytes it read. Falling through it walks into the next function.
+    fn test_the_reserved_top_level_space_is_the_undefined_instruction() {
+        // `udf`, of which the zero word is the one that matters: inter-function padding, which the
+        // engine renders `???` while still reporting the four zero bytes it read. Falling through
+        // it walks into the next function.
         assert_eq!(flow(0x0000_0000, 0x1000), Flow::Trap);
         assert_eq!(flow(0x0000_ffff, 0x1000), Flow::Trap);
+        // And the rest of the Reserved space, which is not the `udf` pattern and is undefined all
+        // the same. `op0` is bits 28..25 and this is every word with it zero.
+        assert_eq!(flow(0x0001_0000, 0x1000), Flow::Trap);
+        assert_eq!(flow(0x01ff_ffff, 0x1000), Flow::Trap);
+        assert_eq!(flow(0xe1ff_ffff, 0x1000), Flow::Trap);
+        // The neighbouring top-level spaces are **not** trapped: unallocated today is not reserved
+        // for ever, and they carry no control flow to get wrong either way.
+        assert_eq!(flow(0x0200_0000, 0x1000), Flow::Fallthrough);
+        assert_eq!(flow(0x0600_0000, 0x1000), Flow::Fallthrough);
     }
 
     #[test]
