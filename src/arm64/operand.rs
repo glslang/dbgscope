@@ -1231,7 +1231,13 @@ fn system(word: u32) -> Out {
                 (false, 0b11, 0b011, 0b0100, 0b0010, 0b000) => out.flags(),
                 _ => out,
             };
-            match privileged_level(op1) {
+            // **`DAIF` reached as a register is the same gate as `daifset` reached as a field**,
+            // and only the second of the two was carved out. `SCTLR_EL1.UMA` traps EL0 accesses to
+            // it in *both* directions, so a `mrs x8,DAIF` is as privileged as the `msr daifset` a
+            // few lines above -- and there are 241 of them in this bench's kernel, which a hazard
+            // scan was seeing none of. Raised on dbgscope#171; the `NZCV` beside it, one `op2`
+            // away, really is EL0's to read and write.
+            match privileged_level(op1) || interrupt_mask(op0, op1, crn, crm, op2) {
                 true => out.privileged(),
                 false => out,
             }
@@ -1242,6 +1248,16 @@ fn system(word: u32) -> Out {
 /// Whether a system encoding's `op1` names an exception level above EL0.
 const fn privileged_level(op1: u32) -> bool {
     op1 != 0b011
+}
+
+/// Whether a system *register* encoding is `DAIF`, the interrupt masks.
+///
+/// The one register under EL0's `op1` that EL0 may not reach freely: `SCTLR_EL1.UMA` gates it,
+/// which is a run-time fact the encoding does not carry, so it is named here as its
+/// processor-state counterpart is named in [`pstate`]. The two together are the whole of the
+/// carve-out, and they are the same instruction reached two ways.
+const fn interrupt_mask(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> bool {
+    op0 == 0b11 && op1 == 0b011 && crn == 0b0100 && crm == 0b0010 && op2 == 0b001
 }
 
 /// The `hint` space, by the seven bits of `CRm:op2`.
@@ -3724,9 +3740,14 @@ mod tests {
         assert!(flags.writes_flags, "{flags:?}");
     }
 
-    /// The interrupt-mask fields encode `op1` as EL0's value and are still privileged, which is
-    /// the one carve-out in the rule above -- and the direct counterpart of the `cli`/`sti` that
-    /// x64 counts as privileged for exactly the same reason.
+    /// The interrupt masks encode `op1` as EL0's value and are still privileged, which is the one
+    /// carve-out in the rule above -- and the direct counterpart of the `cli`/`sti` that x64
+    /// counts as privileged for exactly the same reason.
+    ///
+    /// **They are one register reached two ways**, as a processor-state field and as a system
+    /// register, and only the first was carved out until review found the second: `SCTLR_EL1.UMA`
+    /// traps EL0 accesses to `DAIF` in both directions, and this bench's kernel makes 241 of them.
+    /// Raised on dbgscope#171.
     #[test]
     fn test_the_interrupt_mask_is_privileged_though_its_field_names_el0() {
         // `d50341df  msr daifset,#1` and `d50342ff  msr daifclr,#2`.
@@ -3738,6 +3759,19 @@ mod tests {
         assert!(shapes(0xd503_42ff).privileged);
         // `d50040bf  msr spsel,#0` -- `op1` zero, so the general rule catches it.
         assert!(shapes(0xd500_40bf).privileged);
+        // The same masks as a system register: `d51b4220  msr DAIF,x0` and `d53b4221  mrs x1,DAIF`,
+        // both gated and both under EL0's `op1`.
+        assert!(shapes(0xd51b_4220).privileged, "msr DAIF");
+        assert!(shapes(0xd53b_4221).privileged, "mrs DAIF");
+        // `NZCV` is one `op2` away and really is EL0's, in both directions -- which is what makes
+        // this a carve-out for a register rather than for the `CRm` it sits in.
+        assert!(!shapes(0xd53b_4208).privileged, "mrs NZCV");
+        let restore = shapes(0xd51b_4208);
+        assert!(!restore.privileged, "msr NZCV");
+        assert!(
+            restore.writes_flags,
+            "and it is the one that sets the flags"
+        );
     }
 
     /// The cache, TLB and address-translation operations are named from the register space they
