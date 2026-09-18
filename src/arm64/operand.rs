@@ -1707,6 +1707,14 @@ fn load_store_register(word: u32) -> Out {
             if option & 0b010 == 0 {
                 return Out::undecoded("unallocated");
             }
+            // **Measured, because review read this arm as swallowing FEAT_RPRFM's range
+            // prefetches.** `f8a659fe` was offered as one; the engine renders it
+            // `prfm #0x1E,[x15,w6 uxtw #3]`, which is what this produces field for field -- the
+            // same operation number, base, index width and scale. So that example is an ordinary
+            // prefetch and not evidence of an overlap. Whether some *other* word in this space is
+            // a range prefetch is not answerable on a bench whose engine renders none, and
+            // carving one out of a wrong example would refuse valid prefetches, so nothing is
+            // carved out here. Reopen it with a target that renders an `rprfm`.
             let shift = match field(word, 12, 1) {
                 1 => access.bytes.trailing_zeros(),
                 _ => 0,
@@ -1725,7 +1733,12 @@ fn load_store_register(word: u32) -> Out {
         // split across the word. `op4` is `W:1`, so **both** `01` and `11` are this form -- reading
         // only the second loses every one of them that does not write its base back.
         (1, mode) if mode & 1 == 1 => {
-            if vector || size != 0b11 || opc & 0b01 != 0 {
+            // **`opc` is not an opcode in this form**, which is what made the guard that used to
+            // stand here reject half of these: bit 23 is the key and bit 22 is the top bit of the
+            // displacement, so requiring bit 22 clear refused every `ldraa` with a negative
+            // offset. The form is constrained by `size` and `V` and by nothing else.
+            // Raised on dbgscope#171.
+            if vector || size != 0b11 {
                 return Out::undecoded("unallocated");
             }
             let displacement = sign_extend((field(word, 22, 1) << 9) | field(word, 12, 9), 10) * 8;
@@ -4122,6 +4135,38 @@ mod tests {
         assert_eq!(hinted.condition, ordinary.condition);
         assert_eq!(hinted.flow, ordinary.flow);
         assert_eq!(hinted.operands, ordinary.operands);
+    }
+
+    /// `ldraa`/`ldrab` are constrained by `size` and `V` and by nothing else, and the field a
+    /// guard here used to treat as an opcode is the top bit of the displacement.
+    ///
+    /// **The corpus caught this in round one and it was explained away**, which is the more useful
+    /// half of the story: `f8fcfcf6` showed up as an unallocated encoding the engine rendered
+    /// `ldrab`, and a hand check of its bits said the fixed bit was wrong. The hand check was
+    /// wrong. Raised again on dbgscope#171, and the encoding below is that same word.
+    #[test]
+    fn test_an_authenticated_load_is_constrained_by_its_size_and_nothing_else() {
+        // `f86c24a2  ldraa x2,[x5,#-0x13E]` as the engine renders it -- a **negative**
+        // displacement, which is the half a guard on bit 22 refused.
+        let negative = shapes(0xf86c_24a2);
+        assert_eq!(negative.mnemonic, "ldraa");
+        assert_eq!(spellings(&negative.writes), ["x2"]);
+        let Operand::Memory(memory) = &negative.operands[1] else {
+            panic!("{negative:?}");
+        };
+        // Scaled by eight, which is the architecture's answer; the engine prints the raw field,
+        // and that divergence is one of the residues the whole-image sweep reports.
+        assert_eq!(memory.displacement, -318 * 8);
+        // The same instruction with the bit clear, which used to be the only half that decoded.
+        let positive = shapes(0xf82c_24a2);
+        assert_eq!(positive.mnemonic, "ldraa");
+        // `f8fcfcf6  ldrab x22,[x7,#-0x31]!` -- the b-key, writing its base back.
+        let key = shapes(0xf8fc_fcf6);
+        assert_eq!(key.mnemonic, "ldrab");
+        assert_eq!(spellings(&key.writes), ["x22", "x7"]);
+        assert_eq!(spellings(&key.reads), ["x7"]);
+        // And the base is stack-pointer capable, as every addressing mode's is.
+        assert_eq!(spellings(&shapes(0xf82b_9fff).writes), ["sp"]);
     }
 
     /// The flow comes from [`super::flow`] unchanged, so one word has one answer whichever field
