@@ -45,13 +45,31 @@ All notable changes to this project are documented here. The format follows
   A **vector-structure access carries the width it transfers** on its memory operand, that being
   the one thing its register list does not give a caller: `ld1 {v0.16b},[x1]` reports 16 bytes,
   `ld2 {v0.b,v1.b}[0],[x1]` reports 2, and a replicating `ld1r {v3.4s},[x4]` reports **4** — one
-  element read and splatted, rather than the sixteen bytes it writes.
+  element read and splatted, rather than the sixteen bytes it writes. More generally, **every
+  access whose width is encoded reports it**, and the four positions that report none each have a
+  reason the module documents: `adr`/`adrp` perform no access, a prefetch has no architectural
+  width, and the MOPS copies and the whole-granule tag forms move an amount only a register holds
+  at run time.
 
   **SVE and SME have no such exception**, so an `incb x0` there comes back claiming nothing about
   `x0`. That is deliberate rather than an oversight: a partial decode of that space would remove
   the marker from the encodings it shaped while leaving the gather loads and `ctermeq`'s flags
   unread, handing back an access list that looks complete and is not. Closing it means enumerating
   that space's general-purpose surface and shaping all of it at once.
+- **Four A64 encodings that the architecture does not allocate no longer decode as though it did**,
+  and one that it does allocate is no longer refused. A prefetch exists only in the unscaled form,
+  so the post-indexed and pre-indexed rows of its slot were instructions this decoder invented and
+  the unprivileged row came back as `sttr` — a real mnemonic wearing a prefetch's semantics, with
+  no transfer width, `Effect::Other` for a store and its `Rt` rendered as a prefetch operation. The
+  unprivileged mode has no vector form either, where `ldtr b0,[x0]` and `sttr b0,[x0]` were being
+  produced. In the other direction, every `ldg` with a nonzero displacement was refused as
+  unallocated, and the one that survived reported no access width, because the flag separating the
+  whole-granule tag forms from their neighbours was reading the wrong field.
+
+  All five were found by auditing which memory operands report no access width, rather than by
+  review or by either existing harness — a corpus contains none of these encodings, and the family
+  enumeration compares *definitions* and so cannot see a field nobody constrained. Each was then
+  settled against the generated instruction table rather than a recalled one.
 - **`Operand::Undecoded`**, which is how an instruction says its fields are defaults rather than
   answers. `InstructionSet::operands_are_read` answers for a *set*, and that was enough while every
   decoder here was complete over its own; A64's is the first that is not, and the distinction

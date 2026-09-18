@@ -57,7 +57,7 @@
 //!
 //! **SVE and SME have no such exception, and that is a real gap rather than a claim.** `incb x0`
 //! increments a general-purpose register by the vector length and `whilelt p0.s,x3,x4` reads two,
-//! and both come back as `Operand::Other("sve")` with empty access lists — so a consumer that
+//! and both come back as `Operand::Undecoded("sve")` with empty access lists — so a consumer that
 //! read those lists as "touches nothing" would keep a value `incb` had changed. Raised on
 //! dbgscope#171.
 //!
@@ -121,6 +121,38 @@
 //! read or a hostile image. All 4,294,967,296 encodings were decoded with the dev profile's
 //! overflow checks on, at addresses spread across the whole 64-bit space so that the
 //! relative-branch and page arithmetic wraps as well. Seventy-two seconds, no panic.
+//!
+//! # How much a memory operand says it touches
+//!
+//! [`MemoryOperand::size`] is the width of the access, and a caller bounding a read or a write has
+//! only this. So **every access whose width is encoded reports it**, including the two families
+//! where the width is arithmetic rather than a field: a load/store pair reports both registers,
+//! and a vector-structure access reports the registers named times the width each transfers —
+//! which for a replicating `ld1r` is the *one element it reads*, not the sixteen bytes it writes.
+//!
+//! Four positions report nothing, and each is a different reason rather than an omission:
+//!
+//! | reports no size | why |
+//! |---|---|
+//! | `adr`, `adrp` | no access happens. The operand carries the `address` it computes and nothing reads it — [`Effect::LoadAddress`] is the tell |
+//! | `prfm`, `prfum` | the architecture defines no transfer width. `size` in the encoding scales the *offset*, and a range derived from it would be one that does not exist; what is touched is a cache line, which is an implementation's business |
+//! | the MOPS copies and fills | the amount moved is a **register's value** at run time, not an encoded field. This is the largest memory effect the architecture has and its size is genuinely not a decode-time fact |
+//! | `ldgm`, `stgm`, `stzgm` | the whole-granule tag forms reach as many granules as `GMID_EL1.BS` says, which is again a run-time fact. Their neighbours are *not* in this row: `stg` and `ldg` are one granule and `st2g`/`stz2g` are two, and all four say so |
+//!
+//! **That list is a measurement rather than a reading of the code**, which is the only reason it is
+//! worth stating: every one of the 4,294,967,296 encodings is decoded and every memory operand's
+//! size checked, and what comes back is those four and nothing else. Two tests pin the rows, and
+//! neither can pin the *closure* — the sweep is what does that, and it lives beside the ones in
+//! `examples/`.
+//!
+//! **Asking the question found three decoding bugs before it found a missing row**, all of them
+//! encodings shaped here that the architecture does not allocate, and all of them invisible to
+//! both the corpus and the family enumeration: a post-indexed and a pre-indexed `prfm`, an
+//! unprivileged prefetch slot decoded as `sttr`, a vector `ldtr`/`sttr`, and — in the other
+//! direction — every `ldg` with a nonzero displacement refused as unallocated. A sizeless access
+//! turned out to be a good smell for an encoding nobody had constrained, which is the gap the
+//! family enumeration explicitly could not reach: it finds a family nobody decoded, not a field
+//! nobody checked.
 //!
 //! # Where register 31 is the stack pointer, in full
 //!
@@ -1707,9 +1739,18 @@ fn memory_tags(word: u32) -> Out {
     let (opc, index) = (field(word, 22, 2), field(word, 10, 2));
     let (rn, rt) = (field(word, 5, 5), field(word, 0, 5));
     let displacement = sign_extend(field(word, 12, 9), 9) * 16;
-    // `op2` zero is the whole-granule form, which takes no index mode and no displacement.
-    let granule = index == 0b00;
-    let mnemonic = match (opc, granule) {
+    // `op2` zero is where the whole-granule forms live -- **but `ldg` lives there too**, and it is
+    // an ordinary tagged access with a displacement rather than one of them. So `op2` picks the
+    // *spelling* below and is not the question "is this a whole-granule form"; `opc` settles that,
+    // and the flag is taken from the mnemonic afterwards so the two cannot drift apart.
+    //
+    // Reading `op2` alone as "whole granule" took `ldg`'s displacement away twice over: the guard
+    // further down refused every `ldg` with a nonzero one as unallocated -- the generated table
+    // has `ldg x0,[x1,#240]` -- and the size arm reported no width for the one form that survived,
+    // though `ldg` reads the tag of a single sixteen-byte granule like the stores beside it. Found
+    // by the sizeless-access audit in the module header rather than by review.
+    let at_index_zero = index == 0b00;
+    let mnemonic = match (opc, at_index_zero) {
         (0b00, true) => "stzgm",
         (0b00, false) => "stg",
         (0b01, true) => "ldg",
@@ -1719,6 +1760,7 @@ fn memory_tags(word: u32) -> Out {
         (0b11, true) => "ldgm",
         _ => "stz2g",
     };
+    let granule = matches!(mnemonic, "stzgm" | "stgm" | "ldgm");
     if granule && displacement != 0 {
         return Out::undecoded("unallocated");
     }
@@ -1966,6 +2008,26 @@ fn load_store_register(word: u32) -> Out {
             let Some(access) = access_of(size, opc, vector) else {
                 return Out::undecoded("unallocated");
             };
+            // **The `size`/`opc`/`V` table is shared across all four addressing modes, and two of
+            // its rows are not allocated in all four.** `access_of` answers for the shape of the
+            // transfer and has no `mode` to consult, so the two exceptions are made here.
+            //
+            // A **prefetch** exists only unscaled, as `prfum`: there is no post-indexed,
+            // pre-indexed or unprivileged one, and the two writeback modes could not have one --
+            // a prefetch has no transfer register, so a `prfm x0,[x1],#8` would be an encoding
+            // whose only effect is its own writeback. And the **unprivileged** mode has no vector
+            // form at all; `ldtr`/`sttr` are general-purpose only.
+            //
+            // Unguarded, each decoded as something that does not exist: the writeback modes as a
+            // `prfm` the architecture does not define, the unprivileged prefetch slot as `sttr` --
+            // an allocated mnemonic wearing a prefetch's semantics, reporting no transfer width
+            // and `Effect::Other` for a store, with its `Rt` rendered as a prefetch operation --
+            // and the vector rows as `sttr b0,[x0]` and `ldtr b0,[x0]`. Found by the audits in the
+            // module header rather than by review, and each confirmed against the generated table
+            // (`examples/undecoded_families.rs`), which leaves all of them unallocated.
+            if (access.prefetch && mode != 0b00) || (mode == 0b10 && vector) {
+                return Out::undecoded("unallocated");
+            }
             let displacement = sign_extend(field(word, 12, 9), 9);
             let stem = match (mode, access.prefetch, access.stem) {
                 (0b00, true, _) => "prfum".to_string(),
@@ -4211,6 +4273,99 @@ mod tests {
         // `4dcaefb2  ld3r {v18.2d,v19.2d,v20.2d},[fp], x10` -- three doublewords read, 48 bytes
         // written.
         assert_eq!(transferred(0x4dca_efb2), Some(24));
+    }
+
+    /// The three positions that report no access width, pinned against the ones that do.
+    ///
+    /// The module header states this as a closed list, and a closed list is only worth stating if
+    /// something fails when it stops being true. Each row is a different reason rather than an
+    /// omission, and two of the three were review findings on dbgscope#171 — the third would have
+    /// been, which is why the audit was done in one pass rather than waited out.
+    #[test]
+    fn test_an_access_reports_its_width_unless_it_genuinely_has_none() {
+        let width = |word: u32| {
+            let shaped = shapes(word);
+            let sizes: Vec<_> = shaped
+                .operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    Operand::Memory(memory) => Some(memory.size),
+                    _ => None,
+                })
+                .collect();
+            assert!(!sizes.is_empty(), "{word:#010x}: {shaped:?}");
+            sizes
+        };
+        // `f000187e  adrp lr,nt!...` -- an address is computed and nothing reads it.
+        assert_eq!(width(0xf000_187e), [None]);
+        assert_eq!(shapes(0xf000_187e).effect, Effect::LoadAddress);
+        // `f9800021  prfm PLDL1STRM,[x1]` -- the encoding's `size` scales the offset and no
+        // architectural width is moved.
+        assert_eq!(width(0xf980_0021), [None]);
+        // `19410440  cpyfm` -- both pointers are memory operands and the amount is `Xn`'s value.
+        assert_eq!(width(0x1941_0440), [None, None]);
+        // `d9a00000  stgm` -- as many granules as `GMID_EL1.BS` says.
+        assert_eq!(width(0xd9a0_0000), [None]);
+        // **Its neighbours are not in that row**, which is the distinction the flag behind it used
+        // to lose: `d9600020  ldg x0,[x1]` reads one granule and `d9a00020`'s `st2g` reaches two.
+        assert_eq!(width(0xd960_0020), [Some(16)]);
+        assert_eq!(shapes(0xd960_0020).mnemonic, "ldg");
+        assert_eq!(width(0xd9e0_0420), [Some(32)]);
+        assert_eq!(shapes(0xd9e0_0420).mnemonic, "stz2g");
+        // And the widths that *are* encoded, including the two that are arithmetic rather than a
+        // field. `a9427bfd  ldp fp,lr,[sp,#0x20]` moves two eight-byte registers...
+        assert_eq!(width(0xa942_7bfd), [Some(16)]);
+        // ...and `4c40a020  ld1 {v0.16b,v1.16b},[x1]` moves two sixteen-byte ones.
+        assert_eq!(width(0x4c40_a020), [Some(32)]);
+        // A plain load is the ordinary case the other two are measured against.
+        assert_eq!(width(0xf940_0021), [Some(8)]);
+    }
+
+    /// The encodings the access-width audit found shaped here and unallocated in the architecture,
+    /// plus the one it found refused here and allocated there.
+    ///
+    /// All four are the same root: a table keyed on the *shape of the transfer* consulted from a
+    /// context that also constrains which shapes exist. `access_of` has no addressing mode and
+    /// `memory_tags` read `op2` as though it answered a question it does not. Each was settled
+    /// against the generated table rather than a recalled one, this branch having already been
+    /// wrong once from memory about an ARM table.
+    #[test]
+    fn test_an_addressing_mode_constrains_which_transfers_it_allows() {
+        let unallocated = |word: u32| {
+            assert_eq!(
+                shapes(word).operands,
+                [Operand::Undecoded("unallocated".to_string())],
+                "{word:#010x}"
+            );
+        };
+        // A prefetch exists only unscaled. `f8800000` is `prfum` and is kept; the post-indexed,
+        // pre-indexed and unprivileged rows of the same slot are not encodings.
+        assert_eq!(shapes(0xf880_0000).mnemonic, "prfum");
+        unallocated(0xf880_0400);
+        unallocated(0xf880_0800);
+        unallocated(0xf880_0c00);
+        // The unprivileged mode is general-purpose only, so the vector rows go too -- these were
+        // `sttr b0,[x0]` and `ldtr b0,[x0]`.
+        unallocated(0x3c00_0800);
+        unallocated(0x3c40_0800);
+        // **And the neighbours each of those sat beside still decode**, which is the half that
+        // says the guards are narrow rather than merely quiet.
+        assert_eq!(shapes(0x3c00_0000).mnemonic, "stur");
+        assert_eq!(shapes(0xf800_0800).mnemonic, "sttr");
+        assert_eq!(shapes(0xf840_0800).mnemonic, "ldtr");
+        assert_eq!(shapes(0xb880_0800).mnemonic, "ldtrsw");
+        // The other direction: `ldg` takes a displacement, and every nonzero one was refused.
+        // `d960f020  ldg x0,[x1,#240]` -- the generated table's own rendering.
+        for word in [0xd960_0020_u32, 0xd960_1020, 0xd960_f020] {
+            assert_eq!(shapes(word).mnemonic, "ldg", "{word:#010x}");
+        }
+        let Operand::Memory(memory) = &shapes(0xd960_f020).operands[1] else {
+            panic!("{:?}", shapes(0xd960_f020));
+        };
+        assert_eq!(memory.displacement, 240);
+        // The whole-granule forms beside it genuinely take none, and that guard is unchanged.
+        assert_eq!(shapes(0xd9a0_0020).mnemonic, "stgm");
+        unallocated(0xd9a0_1020);
     }
 
     /// The **Reserved** top-level space has one allocated member, `udf #imm16`, and reporting it as
