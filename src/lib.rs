@@ -117,6 +117,10 @@
 //! ```
 
 pub mod allocator;
+/// ARM64 control-flow decoding, which [`dbgeng`] uses to answer [`dbgeng::Flow`] on that
+/// architecture. Private: it decodes flow and nothing else, so it is an implementation detail of
+/// the one type that has a use for it rather than a decoder to build on.
+mod arm64;
 pub mod dbgeng;
 pub mod heap;
 pub mod object;

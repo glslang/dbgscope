@@ -209,10 +209,16 @@ fn main() {
                         continue;
                     };
                     compared += 1;
-                    if one.bytes != other.bytes
-                        || one.mnemonic != other.mnemonic
-                        || one.flow != other.flow
-                    {
+                    // **The mnemonic is only compared where it is decoded.** On a set whose
+                    // operands are not read, `disassemble` takes it from the rendering's first
+                    // token and `decode_range` has no rendering to take it from, so the two differ
+                    // on every instruction by construction — which on ARM64 reported thirty
+                    // disagreements over a thirty-instruction routine and would have hidden a real
+                    // one. What is left compared there is what both paths really decode: the
+                    // encoding and the flow.
+                    let mnemonics_differ =
+                        set.operands_are_read() && one.mnemonic != other.mnemonic;
+                    if one.bytes != other.bytes || mnemonics_differ || one.flow != other.flow {
                         disagreed += 1;
                         println!(
                             "  DISAGREE {:#x}  ranged {} {:?}  walked {} {:?}",
