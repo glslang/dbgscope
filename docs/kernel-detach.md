@@ -29,7 +29,17 @@ against an image target also showed the frontend's passive cleanup after `qd`.
 These observations motivate this implementation; they do **not** validate it against a live
 hypervisor. A later diagnostic stalled during initial KDNET synchronization, before reaching any
 detach experiment. Its explicit-target native-KD recovery attempt crashed, and passive reconnection
-did not establish a session. Further live validation requires recovery of that lab target.
+did not establish a session. The owner subsequently recovered the guest. Repeated ordinary MCP
+attach/detach then reproduced a frozen guest despite an acknowledged continue; additional native
+recovery stops had to be released. This candidate is still not validated for that workflow.
+
+Later comparisons changed the attach timing instead of teardown: connecting without the persistent
+initial-break option, requesting one break after synchronization, and calling this same typed
+teardown passed three independent guest-health checks across three runs. A further automatic
+announcement-trigger comparison passed four runs (two local prototypes and two runs of the
+retained example). The [attach timing probe](kernel-attach-probe.md) preserves the implementation,
+callback measurements, and limitations. Its text-based trigger remains diagnostic; it is not a
+new library attach policy or proof of cross-version safety.
 
 The new local tests cover the no-debuggee guard, rejection of a target that remains present,
 breakpoint removal, and quit/detach leaving a disposable attached user-mode process alive. The
