@@ -10,9 +10,10 @@ execute the ordinary attach helper's artifact-absorption `g`.
 
 Use one controller on the lab endpoint. Verify guest identity, debugger host address, endpoint,
 and key before starting. Arrange independent console/management access and a native-KD recovery
-path. Do not use this example on a production target. **Its kernel wait can block indefinitely**;
-there is no watchdog, and a missing announcement or unreachable target does not become a clean
-timeout. Do not kill a probe holding a broken-in target or reset the guest as routine cleanup.
+path. Do not use this example on a production target. **Its kernel wait can block indefinitely**.
+The three diagnostic modes have no watchdog; the `production` mode described below attempts to
+exit its wait at a deadline, but does not promise cancellation of an unconnected transport.
+Do not kill a probe holding a broken-in target or reset the guest as routine cleanup.
 
 Load `DBGSCOPE_KERNEL_CONNECTION` from an existing local secret/profile without printing it.
 It is the complete DbgEng connection string. Do not pass it as an argument or commit it. Install
@@ -38,6 +39,7 @@ cargo run --example kernel_attach_probe -- announcement .\target\attach-control-
 | `manual` | A reader waits for the new control file to contain exactly `break` |
 | `early` | One `InterruptHandle::interrupt` before the first wait; the control file remains a manual fallback |
 | `announcement` | KDNET only: one request when normal output begins a line with `Connected to target` followed by a space; the control file remains a manual fallback |
+| `production` | Exercise `attach_kernel_announcement_begin().wait()`, the explicitly experimental library path; the control file remains a manual fallback |
 
 For a manual request, observe synchronization and independently verify guest responsiveness first,
 then create that control file containing `break`. Never run a second debugger against the same
@@ -55,11 +57,34 @@ cargo test --example kernel_attach_probe
 The five matcher tests also passed `cargo +nightly miri test --example kernel_attach_probe` on
 this bench. They do not invoke DbgEng: this checks the parser, not foreign calls or target safety.
 
-The output callback only signals a channel. The reader uses the existing `InterruptHandle`; the
+The diagnostic announcement callback only signals a channel. The reader uses the existing `InterruptHandle`; the
 engine and every call other than `SetInterrupt` stay on the engine thread. Session/engine-state
 callbacks only log their arguments and do not change execution status.
 
 ## Measurement on 2026-09-19
+
+### Experimental library integration
+
+`DebugEngine::attach_kernel_announcement_begin` is explicit opt-in, KDNET-only, and intended for
+a known-running lab hypervisor. It installs a scoped wide output observer, forwarding the prior
+callback's output mask and restoring that callback and mask after the wait or guard drop. The
+observer requests `SetInterrupt(ACTIVE)` once on the engine callback thread. Duplicate/reconnect
+announcements do not request another break. Each new attach gets a fresh observer.
+
+There is no persistent initial-break option or artifact-absorption resume. At the 60-second
+deadline the watchdog requests `SetInterrupt(EXIT)`, not another target break. Missing output,
+failed interrupt, interrupted wait, or unconfirmed stopped status fails the attach. This is not
+a hard transport-cancellation guarantee, does not prove safe teardown after failure, and does
+not validate attaching to an already-halted target. Dropping the pending guard removes its break
+observer but does not cancel the transport; call `wait()` directly instead of replacing it with
+an output-capturing operation.
+
+The first integration probe on this bench recorded one break-in send, stopped on CPU 2, and
+returned `KernelRunning` then `NO_DEBUGGEE`. Independent WinRM checks confirmed the same boot
+and uptime advancing from 8886.065 to 8889.403 seconds. No reboot or configuration change was
+made. Local tests cover missing/repeated announcements, fresh attach state, bounded matching,
+and callback/mask restoration with both ANSI and wide callbacks. Miri exercises the parser and
+failure classification, not DbgEng. The deadline failure path has not been live-validated.
 
 Engine: DbgEng 10.0.29617.1000. Target: four-processor Hyper-V 29671, guest OS 29671.1000. Typed
 teardown: dbgscope `16403fa`. All comparisons retained the same boot; no reset or host configuration
@@ -81,7 +106,7 @@ change was made.
 The announcement was normal output (mask `0x1`), not the internal protocol trace. It was emitted
 before the synchronization-complete message; the requested break-in send appeared afterward.
 This is an **observed ordering**, not a documented transport-readiness contract. It is why the
-matcher remains in an example rather than becoming the library's default. Engines with different
+matcher is not the library's default. Engines with different
 output, localization, reconnect behavior, or timing need separate measurement. Do not replace
 the missing contract with a fixed sleep or a fixed number of resumes.
 

@@ -38,8 +38,9 @@ initial-break option, requesting one break after synchronization, and calling th
 teardown passed three independent guest-health checks across three runs. A further automatic
 announcement-trigger comparison passed four runs (two local prototypes and two runs of the
 retained example). The [attach timing probe](kernel-attach-probe.md) preserves the implementation,
-callback measurements, and limitations. Its text-based trigger remains diagnostic; it is not a
-new library attach policy or proof of cross-version safety.
+callback measurements, and limitations. The explicitly experimental
+`attach_kernel_announcement_begin` now offers that trigger as an opt-in typed attach path.
+It does not change the ordinary attach default or establish cross-version safety.
 
 The new local tests cover the no-debuggee guard, rejection of a target that remains present,
 breakpoint removal, and quit/detach leaving a disposable attached user-mode process alive. The
