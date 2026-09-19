@@ -6,6 +6,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod kernel_attach;
+
 use thiserror::Error;
 use windows::Win32::Foundation::{
     E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_UNEXPECTED, S_FALSE, S_OK,
@@ -91,6 +93,9 @@ pub enum DbgEngError {
         "kernel target did not break in within the attach timeout — is it reachable and in debug mode?"
     )]
     KernelBreakTimeout,
+
+    #[error("experimental kernel attach failed: {0}; target state is unconfirmed")]
+    ExperimentalKernelAttach(&'static str),
 
     /// A user-mode open whose process never joined the session.
     ///
@@ -1287,6 +1292,9 @@ enum Bound {
     /// `timeout_ms`, no return. So [`WaitOutcome::Deadline`] can only ever be reported for a target
     /// that connected; an unreachable one hangs instead of timing out.
     Watchdog(u32),
+    /// Abandon an experimental attach wait without requesting another target break.
+    /// This is not a guarantee that an unconnected transport can be cancelled.
+    WatchdogExit(u32),
 }
 
 /// What a command produced, and whether it finished — the same shape as [`RunToResult`], and for
@@ -5423,16 +5431,27 @@ impl DebugEngine {
                 // "no event arrived", which is the direction that records nothing.
                 (result, hr == S_OK, false)
             }
-            Bound::Watchdog(timeout_ms) => {
+            Bound::Watchdog(timeout_ms) | Bound::WatchdogExit(timeout_ms) => {
                 let handle = self.interrupt_handle();
                 // Ctrl+Break a connected target so the engine thread's WaitForEvent returns with a
                 // stop. `break_in_only`, so the deadline is *not* also filed as a request against
                 // this operation: `watchdog.disarm()` already says it fired, and one event with two
                 // representations is what every classify site used to have to reconcile.
-                let watchdog =
-                    Watchdog::arm(Duration::from_millis(u64::from(timeout_ms)), move || {
-                        let _ = handle.break_in_only();
-                    });
+                let watchdog = Watchdog::arm(
+                    Duration::from_millis(u64::from(timeout_ms)),
+                    move || {
+                        if matches!(bound, Bound::WatchdogExit(_)) {
+                            // SetInterrupt remains the only off-thread DbgEng call.
+                            let _ = unsafe {
+                                handle.control.SetInterrupt(
+                                    windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_INTERRUPT_EXIT,
+                                )
+                            };
+                        } else {
+                            let _ = handle.break_in_only();
+                        }
+                    },
+                );
                 let result = unsafe { self.control.WaitForEvent(0, WAIT_INFINITE) };
                 // Disarmed before anything is read, so the watchdog cannot fire *into* the reads
                 // below and be missed by them.
@@ -8270,6 +8289,8 @@ enum WaitKind<'a> {
     Live(Registered<'a>),
     /// Kernel attach: the bounded INFINITE wait plus its INITIAL_BREAK bookkeeping.
     KernelBreakIn,
+    /// Explicit opt-in; the observer is removed when this pending attach is dropped.
+    KernelAnnouncement(kernel_attach::AnnouncementGuard<'a>),
 }
 
 /// One open's entry in the session's arrival register, live for as long as this exists.
@@ -8444,6 +8465,10 @@ enum TargetInput {
 /// as asked, but a later `go`/step can immediately re-break until something clears the
 /// option. Abandoning a kernel attach is a poor way to change your mind; prefer `wait()` and
 /// then `end_session`.
+///
+/// **Experimental announcement attach is an exception:** its scoped observer is removed when
+/// this guard is dropped. The transport claim is not cancelled, but an abandoned guard no longer
+/// requests a break. Call `wait()` directly; do not substitute another output-capturing operation.
 #[must_use = "the target was created but never waited for; call `wait()` to reach the initial break"]
 pub struct PendingTarget<'a> {
     engine: &'a DebugEngine,
@@ -8479,6 +8504,7 @@ impl<'a> PendingTarget<'a> {
         match &self.kind {
             WaitKind::Live(registered) => self.engine.wait_for_live_target(registered),
             WaitKind::KernelBreakIn => self.engine.wait_for_kernel_break_in(),
+            WaitKind::KernelAnnouncement(observer) => observer.wait(),
         }
     }
 }

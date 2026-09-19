@@ -1,7 +1,7 @@
 //! Disposable-lab measurement, not a production attach policy.
 //!
 //! Set DBGSCOPE_KERNEL_CONNECTION locally; never put a KDNET key on the command line.
-//! Usage: kernel_attach_probe <manual|early|announcement> <new-control-file>
+//! Usage: kernel_attach_probe <manual|early|announcement|production> <new-control-file>
 //! Manual fallback: create the control file containing exactly "break" after synchronization.
 //! Install matching DbgEng DLLs beside this executable. See docs/kernel-attach-probe.md.
 use dbgscope::dbgeng::{DebugEngine, TargetLeft};
@@ -133,8 +133,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = args
         .next()
         .ok_or("mode required: manual, early, announcement")?;
-    if !matches!(mode.as_str(), "manual" | "early" | "announcement") {
-        return Err("mode must be manual, early, or announcement".into());
+    if !matches!(
+        mode.as_str(),
+        "manual" | "early" | "announcement" | "production"
+    ) {
+        return Err("mode must be manual, early, announcement, or production".into());
     }
     let control_file = PathBuf::from(args.next().ok_or("new control file required")?);
     if args.next().is_some() {
@@ -173,10 +176,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.SetOutputCallbacks(&trace)?;
         client.SetOutputMask(u32::MAX)?;
         control.RemoveEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK)?;
-        client.AttachKernel(
-            DEBUG_ATTACH_KERNEL_CONNECTION,
-            PCSTR(connection.as_ptr().cast()),
-        )?;
+        if mode != "production" {
+            client.AttachKernel(
+                DEBUG_ATTACH_KERNEL_CONNECTION,
+                PCSTR(connection.as_ptr().cast()),
+            )?;
+        }
     }
     let handle = engine.interrupt_handle();
     if mode == "early" {
@@ -201,7 +206,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     println!("PROBE mode={mode}; manual fallback available through the new control file");
-    let waited = engine.wait_for_event(u32::MAX);
+    let waited = if mode == "production" {
+        engine
+            .attach_kernel_announcement_begin(connection.to_str()?)?
+            .wait()
+    } else {
+        engine.wait_for_event(u32::MAX).map(|_| ())
+    };
     finished.store(true, Ordering::Release);
     let _ = reader.join();
     println!("PROBE wait={waited:?}");
