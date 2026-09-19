@@ -84,6 +84,9 @@ pub enum DbgEngError {
     )]
     NoDebuggee,
 
+    #[error("quit-and-detach returned without releasing the target; resume is unconfirmed")]
+    IncompleteKernelDetach,
+
     #[error(
         "kernel target did not break in within the attach timeout — is it reachable and in debug mode?"
     )]
@@ -219,9 +222,6 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DEBUG_ATTACH_DEFAULT: u32 = 0x0000_0000;
 /// `EndSession` flag used on teardown: detach passively without resuming.
 const DEBUG_END_PASSIVE: u32 = 0x0000_0000;
-/// `EndSession` flag: actively detach — the engine talks to the target to resume it
-/// before disconnecting, so a live kernel is left running instead of frozen at a break.
-const DEBUG_END_ACTIVE_DETACH: u32 = 0x0000_0002;
 /// How long to wait for a freshly launched/attached target to reach its initial
 /// break before giving up (ms).
 const LIVE_WAIT_MS: u32 = 30_000;
@@ -3826,7 +3826,8 @@ impl Default for DebugEngine {
 /// previously tell that from a kernel left running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetLeft {
-    /// A live kernel that was told to run and then actively detached. It is running.
+    /// A live kernel whose quit-and-detach completed and released the target.
+    /// This does not establish subsequent guest health: it may encounter another stop.
     KernelRunning,
     /// A live kernel the resume did not take on, detached anyway so that nothing holds it.
     ///
@@ -3837,6 +3838,14 @@ pub enum TargetLeft {
     /// Nothing this can speak for: a dump, a trace, or user-mode processes, whose disposition is
     /// [`DebugEngine::attached_to_a_live_process`] read before the teardown clears it.
     Unspoken,
+}
+
+fn require_detached(has_target: bool) -> Result<(), DbgEngError> {
+    if has_target {
+        Err(DbgEngError::IncompleteKernelDetach)
+    } else {
+        Ok(())
+    }
 }
 
 impl DebugEngine {
@@ -8068,25 +8077,44 @@ impl DebugEngine {
         ended.map(|()| left)
     }
 
-    /// Detaches from a live kernel leaving it **running**, not frozen at the last break.
-    /// Clears breakpoints (restoring their patched `int3` bytes), sets the target to run,
-    /// then does an *active* detach — which, unlike a passive one, communicates with the
-    /// target to resume it before disconnecting.
-    /// Returns the resume's answer and the detach's, separately, because they mean different
-    /// things to a caller and only one of them is about the *target*.
+    /// Uses the engine's quit path before releasing the session. `SetExecutionStatus(GO)` only
+    /// requests execution; following it with `EndSession(ACTIVE_DETACH)` is not the same path as
+    /// native KD's `qd`. The former left a 29671 hypervisor unresponsive while reporting success;
+    /// the latter recovered it. Keep the fixed command here, behind the typed teardown, rather
+    /// than making callers drive execution-control text themselves.
     ///
-    /// **The resume used to be `let _ =`**, so a kernel that was never told to run was reported as
-    /// released: the detach succeeds whether or not the resume did, and its answer was the only one
-    /// kept. A kernel detached while still halted stays halted -- one CPU stopped, the rest
-    /// spinning -- which is the state this whole function exists to avoid, and it was the one state
-    /// the result could not express.
+    /// No event wait: a finite kernel wait is unsupported and an infinite one can park forever.
+    /// On failure, passive cleanup releases the session without a second, unverified resume.
+    /// The caller then gets `KernelHalted`, even if cleanup itself succeeded.
     fn resume_and_detach_live_kernel(&self) -> (Result<(), DbgEngError>, Result<(), DbgEngError>) {
-        let _ = self.execute_command("bc *");
-        let resumed = unsafe { self.control.SetExecutionStatus(DEBUG_STATUS_GO) }
-            .map_err(DbgEngError::OperationFailed);
-        let detached = unsafe { self.client.EndSession(DEBUG_END_ACTIVE_DETACH) }
+        let resumed = self.quit_and_detach_target();
+        let detached = unsafe { self.client.EndSession(DEBUG_END_PASSIVE) }
             .map_err(DbgEngError::OperationFailed);
         (resumed, detached)
+    }
+
+    fn quit_and_detach_target(&self) -> Result<(), DbgEngError> {
+        self.refuse_without_a_debuggee()?;
+        self.clear_all_breakpoints()?;
+        // A fixed literal, but still use the guarded command path: this can reach execution.
+        self.execute_command("qd")?;
+        require_detached(self.has_target()?)
+    }
+
+    fn clear_all_breakpoints(&self) -> Result<(), DbgEngError> {
+        let count = unsafe { self.control.GetNumberBreakpoints() }
+            .map_err(DbgEngError::BreakpointFailed)?;
+        for _ in 0..count {
+            // Removal compacts the indices. These interfaces are borrowed, and removal destroys
+            // the object, so never Release one afterwards (see `remove_breakpoint`).
+            let breakpoint = std::mem::ManuallyDrop::new(
+                unsafe { self.control.GetBreakpointByIndex2(0) }
+                    .map_err(DbgEngError::BreakpointFailed)?,
+            );
+            unsafe { self.control.RemoveBreakpoint2(&*breakpoint) }
+                .map_err(DbgEngError::BreakpointFailed)?;
+        }
+        Ok(())
     }
 
     /// Detaches from every user-mode process this engine **attached** to, leaving each running,
@@ -8728,6 +8756,64 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_quit_must_release_the_target_before_reporting_resume() {
+        assert!(require_detached(false).is_ok());
+        assert!(matches!(
+            require_detached(true),
+            Err(DbgEngError::IncompleteKernelDetach)
+        ));
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn test_quit_detach_refuses_an_engine_without_a_target() {
+        let _debuggee = one_debuggee();
+        let engine = DebugEngine::new();
+        assert!(matches!(
+            engine.quit_and_detach_target(),
+            Err(DbgEngError::NoDebuggee)
+        ));
+    }
+
+    // Exercises the fixed command and breakpoint cleanup on a disposable local process.
+    // It does not establish hypervisor resume; that needs an independent guest-health check.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_quit_detach_removes_breakpoints_and_leaves_an_attached_process_alive() {
+        let _debuggee = one_debuggee();
+        let mut target = a_process_to_attach_to();
+        let pid = target.id();
+        let result = std::panic::catch_unwind(|| {
+            let engine = DebugEngine::new();
+            engine.attach_process(pid).expect("attach failed");
+            let pc = engine
+                .instruction_pointer()
+                .expect("no instruction pointer");
+            for _ in 0..2 {
+                engine
+                    .set_breakpoint(&BreakpointSpec::code(BreakpointAt::Address(pc)))
+                    .expect("set breakpoint failed");
+            }
+            assert_eq!(engine.breakpoints().expect("list failed").len(), 2);
+            engine.clear_all_breakpoints().expect("clear failed");
+            assert!(engine.breakpoints().expect("list failed").is_empty());
+            engine
+                .set_breakpoint(&BreakpointSpec::code(BreakpointAt::Address(pc)))
+                .expect("set breakpoint failed");
+            engine.quit_and_detach_target().expect("quit failed");
+            assert!(!engine.has_target().expect("status failed"));
+            assert_eq!(exit_code_of(pid), Some(STILL_RUNNING));
+            engine.end_session().expect("cleanup failed");
+            assert_eq!(exit_code_of(pid), Some(STILL_RUNNING));
+        });
+        let _ = target.kill();
+        let _ = target.wait();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
 
     /// [`decode_instruction`] reports the bytes the instruction occupies, not the buffer it was
     /// handed.
