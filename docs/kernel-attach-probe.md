@@ -11,7 +11,7 @@ execute the ordinary attach helper's artifact-absorption `g`.
 Use one controller on the lab endpoint. Verify guest identity, debugger host address, endpoint,
 and key before starting. Arrange independent console/management access and a native-KD recovery
 path. Do not use this example on a production target. **Its kernel wait can block indefinitely**.
-The three diagnostic modes have no watchdog; the `production` mode described below attempts to
+The three original diagnostic modes have no watchdog; `production` and `timeout` attempt to
 exit its wait at a deadline, but does not promise cancellation of an unconnected transport.
 Do not kill a probe holding a broken-in target or reset the guest as routine cleanup.
 
@@ -40,10 +40,20 @@ cargo run --example kernel_attach_probe -- announcement .\target\attach-control-
 | `early` | One `InterruptHandle::interrupt` before the first wait; the control file remains a manual fallback |
 | `announcement` | KDNET only: one request when normal output begins a line with `Connected to target` followed by a space; the control file remains a manual fallback |
 | `production` | Exercise `attach_kernel_announcement_begin().wait()`, the explicitly experimental library path; the control file remains a manual fallback |
+| `timeout` | Replace the attach observer with the passive trace to inject a missing announcement; use the real 60-second watchdog, then hold for explicit cleanup |
 
 For a manual request, observe synchronization and independently verify guest responsiveness first,
 then create that control file containing `break`. Never run a second debugger against the same
 endpoint while the first is waiting. No mode automatically resets the target.
+
+`timeout` intentionally violates the normal pending-attach callback contract, **only in this
+diagnostic executable**, by replacing the observer before `wait()`. It does not change library
+defaults or the timeout constant. If the wait remains blocked past its deadline, an operator may
+write `break` once after checking independent guest health. If the wait returns, the probe prints
+the status/event and holds until `detach` is written. It issues no second interrupt at that stage
+and refuses cleanup unless a first-chance break-in exception and `BREAK` status are present.
+Neither a deadline nor status alone proves guest health. A stalled recovery must not be followed
+by repeated breaks or a competing controller.
 
 The announcement matcher is a bounded, line-anchored, one-shot stream matcher. It accepts only
 `DEBUG_OUTPUT_NORMAL`, handles a prefix split across callbacks, ignores other output masks,
@@ -100,6 +110,24 @@ regressions do not assert it. Microsoft documents that
 but these tests are not a KDNET delivery or recovery measurement. The hypervisor deadline and
 already-halted reconnect cases remain unvalidated. No lab guest was attached or reconfigured for
 these local-process tests.
+
+### Live timeout experiment
+
+On the same DbgEng 10.0.29617.1000 / Hyper-V 29671 bench, the first `timeout` run synchronized
+but did not return from its attach wait by 143 seconds, despite the 60-second exit-only watchdog.
+No break-in send was logged. WinRM still answered immediately before the waiting probe was
+terminated. After termination, the endpoint was free and guest uptime advanced from 11414.365
+to 11417.691 seconds with unchanged boot time. A fresh experimental MCP attach/detach then
+passed the independent guest-health wrapper. This is a measured process-reclamation recovery
+for a verified-running target, not proof that terminating a debugger is safe after a break.
+
+The second run again synchronized and remained blocked past 60 seconds. The guest answered
+before one explicit manual interrupt. That request logged one break-in send, but the attach
+wait still did not return and WinRM subsequently timed out. At this checkpoint there was no
+reported stop, detach, or second controller: the probe remained held pending console inspection.
+Same-controller recovery is **not validated** by this attempt. Neither run rebooted the guest or
+changed host configuration. The exit-only watchdog is not a reliable cancellation bound even
+after this transport's synchronization announcement.
 
 Engine: DbgEng 10.0.29617.1000. Target: four-processor Hyper-V 29671, guest OS 29671.1000. Typed
 teardown: dbgscope `16403fa`. All comparisons retained the same boot; no reset or host configuration

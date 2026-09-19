@@ -1,7 +1,7 @@
 //! Disposable-lab measurement, not a production attach policy.
 //!
 //! Set DBGSCOPE_KERNEL_CONNECTION locally; never put a KDNET key on the command line.
-//! Usage: kernel_attach_probe <manual|early|announcement|production> <new-control-file>
+//! Usage: kernel_attach_probe <manual|early|announcement|production|timeout> <new-control-file>
 //! Manual fallback: create the control file containing exactly "break" after synchronization.
 //! Install matching DbgEng DLLs beside this executable. See docs/kernel-attach-probe.md.
 use dbgscope::dbgeng::{DebugEngine, TargetLeft};
@@ -132,12 +132,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mode = args
         .next()
-        .ok_or("mode required: manual, early, announcement")?;
+        .ok_or("mode required: manual, early, announcement, production, timeout")?;
     if !matches!(
         mode.as_str(),
-        "manual" | "early" | "announcement" | "production"
+        "manual" | "early" | "announcement" | "production" | "timeout"
     ) {
-        return Err("mode must be manual, early, announcement, or production".into());
+        return Err("mode must be manual, early, announcement, production, or timeout".into());
     }
     let control_file = PathBuf::from(args.next().ok_or("new control file required")?);
     if args.next().is_some() {
@@ -176,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.SetOutputCallbacks(&trace)?;
         client.SetOutputMask(u32::MAX)?;
         control.RemoveEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK)?;
-        if mode != "production" {
+        if !matches!(mode.as_str(), "production" | "timeout") {
             client.AttachKernel(
                 DEBUG_ATTACH_KERNEL_CONNECTION,
                 PCSTR(connection.as_ptr().cast()),
@@ -190,6 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let finished = Arc::new(AtomicBool::new(false));
     let done = Arc::clone(&finished);
     let automatic = mode == "announcement";
+    let recovery_control = control_file.clone();
     let reader = std::thread::spawn(move || {
         while !done.load(Ordering::Acquire) {
             if automatic && readiness.recv_timeout(Duration::from_millis(100)).is_ok() {
@@ -206,17 +207,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     println!("PROBE mode={mode}; manual fallback available through the new control file");
-    let waited = if mode == "production" {
-        engine
-            .attach_kernel_announcement_begin(connection.to_str()?)?
-            .wait()
+    let started = std::time::Instant::now();
+    let mut waited = if matches!(mode.as_str(), "production" | "timeout") {
+        let pending = engine.attach_kernel_announcement_begin(connection.to_str()?)?;
+        if mode == "timeout" {
+            // Deliberate example-only fault injection: hide announcements from the library's
+            // observer, retaining this passive trace. Production code and deadline are unchanged.
+            unsafe { client.SetOutputCallbacks(&trace)? };
+            println!("PROBE injected missing announcement; real 60-second attach deadline armed");
+        }
+        pending.wait()
     } else {
         engine.wait_for_event(u32::MAX).map(|_| ())
     };
     finished.store(true, Ordering::Release);
     let _ = reader.join();
     println!("PROBE wait={waited:?}");
+    println!("PROBE elapsed={:?}", started.elapsed());
     println!("PROBE status={:?}", unsafe { control.GetExecutionStatus() });
+    if mode == "timeout" {
+        println!("PROBE timeout stage complete; holding controller, NOT detaching");
+        let status = unsafe { control.GetExecutionStatus() };
+        let event = engine.last_event();
+        println!("PROBE held status={status:?} event={event:?}");
+        println!("PROBE after inspecting the stop, write detach; this sends NO second interrupt");
+        wait_for_control(&recovery_control, "detach");
+        let break_in = event
+            .as_ref()
+            .ok()
+            .and_then(|e| e.as_ref())
+            .is_some_and(|e| {
+                e.first_chance && e.exception.as_ref().is_some_and(|e| e.code == 0x80000003)
+            });
+        if status != Ok(DEBUG_STATUS_BREAK) || !break_in {
+            println!("PROBE refusing detach without a confirmed break-in; controller remains held");
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        // The attach failed as intended. This explicit cleanup is not a successful attach.
+        waited = Ok(());
+    }
     if waited.is_ok()
         && matches!(
             unsafe { control.GetExecutionStatus() },
@@ -243,6 +274,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     waited?;
     Ok(())
+}
+
+fn wait_for_control(path: &std::path::Path, expected: &str) {
+    while !std::fs::read_to_string(path).is_ok_and(|s| s.trim() == expected) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 // A bounded, one-shot stream matcher for this experiment's English DbgEng announcement.
