@@ -194,10 +194,14 @@ impl<'a> AnnouncementGuard<'a> {
     }
 
     pub(super) fn wait(&self) -> Result<(), DbgEngError> {
+        self.wait_with_timeout(KERNEL_ATTACH_WAIT_MS)
+    }
+
+    fn wait_with_timeout(&self, timeout_ms: u32) -> Result<(), DbgEngError> {
         let operation = self.engine.begin_operation();
         let result = self
             .engine
-            .pump(Bound::WatchdogExit(KERNEL_ATTACH_WAIT_MS), &operation);
+            .pump(Bound::WatchdogExit(timeout_ms), &operation);
         self.restore()?;
         let observation = self.observation.lock().unwrap_or_else(|e| e.into_inner());
         validate_observation(observation.requested)?;
@@ -256,6 +260,7 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn test_ansi_callback_is_forwarded_only_its_original_mask_and_restored() {
+        let _debuggee = super::super::tests::one_debuggee();
         use windows::Win32::System::Diagnostics::Debug::Extensions::DebugCreate;
         let client: IDebugClient6 = unsafe { DebugCreate().unwrap() };
         let engine = DebugEngine::try_from_client_interface(client.clone()).unwrap();
@@ -326,6 +331,7 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn test_observer_restores_existing_callback_and_mask_without_a_target() {
+        let _debuggee = super::super::tests::one_debuggee();
         use windows::Win32::System::Diagnostics::Debug::Extensions::DebugCreate;
         let client: IDebugClient6 = unsafe { DebugCreate().unwrap() };
         let engine = DebugEngine::try_from_client_interface(client.clone()).unwrap();
@@ -367,5 +373,47 @@ mod tests {
                 .unwrap()
         };
         assert!(raw.is_null());
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn test_missing_announcement_deadline_fails_and_restores_the_callback() {
+        let _debuggee = super::super::tests::one_debuggee();
+        let engine = DebugEngine::new();
+        engine
+            .launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink: IDebugOutputCallbacks = AnsiSink(received.clone()).into();
+        unsafe {
+            engine.client.SetOutputCallbacks(&sink).unwrap();
+            engine.client.SetOutputMask(DEBUG_OUTPUT_WARNING).unwrap();
+            engine.control.SetExecutionStatus(DEBUG_STATUS_GO).unwrap();
+        }
+        let guard = AnnouncementGuard::install(&engine).unwrap();
+        let result = guard.wait_with_timeout(100);
+        assert!(matches!(
+            result,
+            Err(DbgEngError::ExperimentalKernelAttach(
+                "connection announcement was not observed"
+            ))
+        ));
+        assert_eq!(guard.observation.lock().unwrap().requested, None);
+        assert!(
+            *guard.restored.borrow(),
+            "restore must happen before guard drop"
+        );
+        unsafe {
+            assert_eq!(engine.client.GetOutputMask().unwrap(), DEBUG_OUTPUT_WARNING);
+            engine
+                .client
+                .GetOutputCallbacksWide()
+                .unwrap()
+                .Output(DEBUG_OUTPUT_WARNING, windows::core::w!("after deadline\n"))
+                .unwrap();
+        }
+        assert_eq!(received.lock().unwrap().last(), Some(&DEBUG_OUTPUT_WARNING));
+        drop(guard);
+        engine.end_session().expect("test process cleanup failed");
     }
 }
