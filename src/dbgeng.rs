@@ -8792,6 +8792,26 @@ mod tests {
         ));
     }
 
+    /// An exit deadline is not an observed stop, regardless of GetExecutionStatus afterward.
+    /// This measures a local process, not KDNET or the target's independent liveness.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_exit_watchdog_reports_a_deadline_not_an_observed_stop() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        e.launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        unsafe { e.control.SetExecutionStatus(DEBUG_STATUS_GO) }.unwrap();
+        {
+            let operation = e.begin_operation();
+            assert_eq!(
+                e.pump(Bound::WatchdogExit(100), &operation).unwrap(),
+                WaitOutcome::Deadline
+            );
+        }
+        e.end_session().expect("test process cleanup failed");
+    }
+
     #[test]
     #[cfg(not(miri))]
     fn test_quit_detach_refuses_an_engine_without_a_target() {
@@ -13034,7 +13054,7 @@ mod tests {
     static ONE_DEBUGGEE: Mutex<()> = Mutex::new(());
 
     #[cfg(not(miri))]
-    fn one_debuggee() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn one_debuggee() -> std::sync::MutexGuard<'static, ()> {
         // A test that panics while holding this poisons it. The next test still needs the
         // lock, and its own assertion is a better failure message than a poison error.
         ONE_DEBUGGEE.lock().unwrap_or_else(|e| e.into_inner())

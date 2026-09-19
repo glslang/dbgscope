@@ -86,6 +86,21 @@ made. Local tests cover missing/repeated announcements, fresh attach state, boun
 and callback/mask restoration with both ANSI and wide callbacks. Miri exercises the parser and
 failure classification, not DbgEng. The deadline failure path has not been live-validated.
 
+A subsequent local-process regression runs the same observer wait with no connection announcement
+and a 100 ms exit-only watchdog. It requires the missing-announcement error, no announcement
+interrupt recorded, and the previous callback and output mask restored **before** the guard is
+dropped. Removing that restoration call makes the test fail. A separate real-engine test requires
+the exit watchdog's result to be `Deadline`, not an observed stop. The callback tests share the
+library's single-debuggee test lock so plain `cargo test` cannot race another engine session.
+
+The initial local probe expected execution status `GO` after the exit deadline and instead read
+`BREAK` on this engine. Neither value independently establishes target liveness; the passing
+regressions do not assert it. Microsoft documents that
+[an exit interrupt does not force a target break](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugcontrol-setinterrupt),
+but these tests are not a KDNET delivery or recovery measurement. The hypervisor deadline and
+already-halted reconnect cases remain unvalidated. No lab guest was attached or reconfigured for
+these local-process tests.
+
 Engine: DbgEng 10.0.29617.1000. Target: four-processor Hyper-V 29671, guest OS 29671.1000. Typed
 teardown: dbgscope `16403fa`. All comparisons retained the same boot; no reset or host configuration
 change was made.
