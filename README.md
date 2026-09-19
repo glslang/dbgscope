@@ -44,7 +44,7 @@ see [Unknown, not absent](docs/unknown-not-absent.md).
   one flag for the whole session, so provenance is tracked per pid: a process this engine
   *attached* to is detached individually before the session ends, or a passive end kills somebody
   else's service. A live kernel is resumed and actively detached, or it stays frozen at its last
-  break.
+  break. See [kernel teardown](docs/kernel-detach.md) for the quit path and its validation limits.
 - **Scope save/restore** (`scope`, `set_scope`, `scope_guard`) for running a command that moves
   the debugger's scope — measured: `!analyze -v` discards a frame or `.ecxr` context the caller
   had selected — without the session ending up somewhere else. A `Scope` carries the target it
