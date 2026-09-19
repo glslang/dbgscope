@@ -12,7 +12,7 @@ Use one controller on the lab endpoint. Verify guest identity, debugger host add
 and key before starting. Arrange independent console/management access and a native-KD recovery
 path. Do not use this example on a production target. **Its kernel wait can block indefinitely**.
 The three original diagnostic modes have no watchdog; `production` and `timeout` attempt to
-exit its wait at a deadline, but does not promise cancellation of an unconnected transport.
+exit the wait at a deadline, but do not guarantee cancellation, even after synchronization.
 Do not kill a probe holding a broken-in target or reset the guest as routine cleanup.
 
 Load `DBGSCOPE_KERNEL_CONNECTION` from an existing local secret/profile without printing it.
@@ -94,7 +94,8 @@ returned `KernelRunning` then `NO_DEBUGGEE`. Independent WinRM checks confirmed 
 and uptime advancing from 8886.065 to 8889.403 seconds. No reboot or configuration change was
 made. Local tests cover missing/repeated announcements, fresh attach state, bounded matching,
 and callback/mask restoration with both ANSI and wide callbacks. Miri exercises the parser and
-failure classification, not DbgEng. The deadline failure path has not been live-validated.
+failure classification, not DbgEng. The later live timeout experiment below found a blocked wait;
+safe automatic deadline recovery remains unvalidated.
 
 A subsequent local-process regression runs the same observer wait with no connection announcement
 and a 100 ms exit-only watchdog. It requires the missing-announcement error, no announcement
@@ -107,9 +108,9 @@ The initial local probe expected execution status `GO` after the exit deadline a
 `BREAK` on this engine. Neither value independently establishes target liveness; the passing
 regressions do not assert it. Microsoft documents that
 [an exit interrupt does not force a target break](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugcontrol-setinterrupt),
-but these tests are not a KDNET delivery or recovery measurement. The hypervisor deadline and
-already-halted reconnect cases remain unvalidated. No lab guest was attached or reconfigured for
-these local-process tests.
+but these tests are not a KDNET delivery or recovery measurement. They do not validate the
+hypervisor deadline or already-halted reconnect cases. No lab guest was attached or reconfigured
+for these local-process tests.
 
 ### Live timeout experiment
 
@@ -123,11 +124,24 @@ for a verified-running target, not proof that terminating a debugger is safe aft
 
 The second run again synchronized and remained blocked past 60 seconds. The guest answered
 before one explicit manual interrupt. That request logged one break-in send, but the attach
-wait still did not return and WinRM subsequently timed out. At this checkpoint there was no
-reported stop, detach, or second controller: the probe remained held pending console inspection.
-Same-controller recovery is **not validated** by this attempt. Neither run rebooted the guest or
-changed host configuration. The exit-only watchdog is not a reliable cancellation bound even
-after this transport's synchronization announcement.
+wait still did not return and WinRM subsequently timed out. The owner confirmed a black/frozen
+console. The original probe never reported a stop or performed teardown.
+
+After verifying that probe's process identity and exclusive endpoint ownership, the operator
+terminated only that stalled probe and verified the endpoint was free. Native KD then attached
+without `-bonc` or an explicit target-address poke. Its trace contained no break-in send and
+reached CPU 0 at a first-chance `0x80000003`, `hv+0x404a60`. `.lastevent;bl` confirmed the exception
+and listed no breakpoints. One `qd` advanced the PC by one byte, received an acknowledged
+`DbgKdContinue(10002)`, and exited successfully. Independent WinRM checks then reported the same
+boot and uptime advancing from 12612.9890683 to 12616.3650664 seconds; the endpoint was free.
+
+This is **one successful manual native-KD recovery of the frozen target**, not a successful
+same-controller timeout recovery or permission to kill a stopped debugger as routine cleanup.
+It is consistent with a pending stop that the original wait did not surface; the cause of that
+blocked wait remains unresolved. Neither run rebooted the guest or changed host configuration.
+The exit-only watchdog is not a reliable cancellation bound even after this transport's
+synchronization announcement. Do not automate repeated breaks or assume a fixed number of
+continues will recover another run.
 
 Engine: DbgEng 10.0.29617.1000. Target: four-processor Hyper-V 29671, guest OS 29671.1000. Typed
 teardown: dbgscope `16403fa`. All comparisons retained the same boot; no reset or host configuration
