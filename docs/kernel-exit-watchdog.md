@@ -2,7 +2,9 @@
 
 This is a diagnostic checkpoint from 2026-09-20, not a cancellation implementation. It follows
 the [live timeout and manual recovery experiment](kernel-attach-probe.md#live-timeout-experiment).
-That guest had recovered; these follow-up runs did not attach to it or use its credentials.
+That guest had recovered. The initial follow-up runs used only a synthetic endpoint; the later
+[synchronized measurement](#synchronized-live-measurement) used the responsive guest without
+sending a target break.
 
 ## Question and scope
 
@@ -31,7 +33,8 @@ KDNET attach has unwound. The measurements below examine that distinction in thi
 - Microsoft's symbol server returned 404 for that identity during this investigation. Native
   addresses below were derived from the COM call and image disassembly, not guessed symbol names.
 
-The diagnostic executable retained the real library wait and 60-second watchdog. A local CDB
+The diagnostic executable retained the real library wait and 60-second watchdog. For the initial
+local-only runs, CDB
 launched it in `timeout` mode with an unused UDP port, the deliberately synthetic key `1.2.3.4`,
 and no target address. No announcement or manual ACTIVE break was supplied. CDB's breakpoints
 observed the caller and native implementation; no engine state was patched to force cancellation.
@@ -87,12 +90,47 @@ patch recipe**. Do not reuse them against a different engine image.
 | `0x177b24` | Transport synchronization loop tests the exit bit between backend calls |
 | `0x1778e9` | Another receive-path exit-bit check |
 | `0x5a8fb0` | Backend routine on the captured stack, below that synchronization-loop check |
+| `0x5a5a90` | Packet receiver on the later synchronized stack |
+| `0x5a3d10` | Receive helper called by that packet receiver |
 
 The stack passed through the backend's receive calls at `0x5a9044` / `0x5a9085`. Its disassembly
 contains socket retry handling; the stack snapshots landed deeper in `recvfrom`. This supports
 an interruption-observation boundary below the outer exit check, corroborated by the longer
-run's unvisited check sites. It does not yet prove the same boundary caused the earlier
-**synchronized** hypervisor wait to hang.
+run's unvisited check sites. The later synchronized measurement below reached a different
+backend receive path. Also, `0x1778e9` is a conditional check: some backend returns bypass it.
+For example, the outer function handles `0x80020001` on a separate branch. An absent poll marker
+alone therefore cannot establish that a backend call never returned. The live trace did not
+capture backend return codes or identify which such branch was taken.
+
+## Synchronized live measurement
+
+A subsequent run used the same engine and the approved diagnostic executable against the live
+hypervisor endpoint. Guest identity, boot time, advancing uptime, endpoint ownership, and binary
+hashes were checked first. The example's `timeout` mode replaced the announcement observer with
+its passive trace, deliberately suppressing the automatic ACTIVE interrupt. No manual break was
+requested. The production wait and 60-second EXIT watchdog remained unchanged.
+
+The probe reported transport synchronization before the deadline. Three consecutive native
+EXIT calls then returned `S_OK`; each took the bit-11 branch, with the flags changing from `0x1`
+to `0x801` on the first call and remaining set. Neither instrumented exit-check marker nor the
+native wait-return marker appeared. After the third return, the outer user-mode debugger held
+the local probe for inspection. The engine thread was still inside `WaitForEvent`, through
+the packet receiver at `0x5a5a90`, helper `0x5a3d10`, and `WS2_32!recvfrom`. This differs from the
+unconnected synchronization backend at `0x5a8fb0`.
+
+This supplies native evidence of accepted-but-not-yet-acted-on EXIT requests **after reported
+synchronization**, not merely on an unused endpoint. It excludes a missing watchdog or rejected
+interrupt in this run. It does not prove an indefinite wait: the held checkpoint was only about
+0.4 seconds after the first deadline request, and tracing perturbs timing. The earlier 143-second
+synchronized wait is separate evidence without native HRESULT tracing. Nor does this no-break
+measurement reproduce or fully explain the earlier freeze after ACTIVE.
+
+Before reclaiming the probe, a fresh independent check found the same responsive guest and boot,
+with uptime 65045.803 seconds. Only then did `q` in the **outer user-mode CDB** terminate its held
+probe. This was not target `qd`, a returning attach wait, or successful cancellation/detach.
+Both local processes exited, the UDP endpoint was free, and two further guest checks on the
+same boot showed uptime advancing from 65070.157 to 65072.473 seconds. No ACTIVE interrupt,
+native-KD recovery, reboot/reset, installed-server replacement, or outer-host change was made.
 
 ## Reproducing the diagnostic safely
 
@@ -126,10 +164,13 @@ independently confirmed `10.0.29617.1000` for the exit-deadline comparison. Thes
 local `ping.exe` debuggee, not KDNET, and do not establish live-target liveness.
 
 Do not replace EXIT with repeated ACTIVE interrupts, add another cross-thread DbgEng method,
-or patch the private flags. The next live measurement must record the watchdog HRESULT, actual
-exit branch, and engine-thread stack **after synchronization**, with one endpoint owner and a
-prepared recovery path. Until then, the local mechanism must not be presented as the proven
-cause of the synchronized hypervisor failure or as a safe automatic-recovery fix.
+or patch the private flags. The synchronized trace now records the watchdog HRESULT, actual exit
+branch, and engine-thread stack, but does not establish a safe automatic-recovery procedure.
+The evidence points to a DbgEng/KDNET cancellation limitation or defect in this specific image,
+not a documented general API restriction or proof of the complete post-ACTIVE failure mechanism.
+A minimal direct-COM comparison and a second engine build would help separate library interaction
+from engine-version behavior. Until the native wait returns, a deadline remains a cancellation
+request, not permission to abandon a controller whose target may be stopped.
 
 ## Local evidence index
 
@@ -148,3 +189,11 @@ These filenames identify retained bench artifacts, not portable inputs or commit
   local-process deadline test under CDB.
 - `trace-exit-watchdog-unconnected.ps1` and `trace-exit-watchdog-unconnected.txt`: local bounded
   harness and debugger commands; executable-specific wrapper offsets must be re-derived.
+- `exit-watchdog-live-20260920-080437.log`: synchronized no-ACTIVE trace, three accepted EXIT
+  calls, packet-receive stack, fresh guest health, and verified local-probe reclamation.
+- `exit-watchdog-live-health-20260920.md`: independent post-reclamation health and process checks.
+- `trace-exit-watchdog-live.ps1` and `trace-exit-watchdog-live.txt`: guarded live harness and
+  debugger commands; no automatic process kill, target break, or reset.
+- `exit-watchdog-synchronized-image_11f4_2026-09-20_08-06-31-891.log`: packet-receiver and helper
+  function disassembly. Its final `u` starts mid-instruction at `0x1777e0`; ignore that fragment
+  and use the earlier full-function image log for the outer receive path.
