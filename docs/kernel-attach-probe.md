@@ -143,6 +143,11 @@ The exit-only watchdog is not a reliable cancellation bound even after this tran
 synchronization announcement. Do not automate repeated breaks or assume a fixed number of
 continues will recover another run.
 
+The [2026-09-20 exit-watchdog trace](kernel-exit-watchdog.md) isolates the cancellation path
+without attaching to the guest. It records accepted native EXIT requests, the internal exit bit,
+and a kernel-wait stack below the exit check. Its unconnected endpoint is not a reproduction of
+the synchronized live failure; keep those claims separate.
+
 Engine: DbgEng 10.0.29617.1000. Target: four-processor Hyper-V 29671, guest OS 29671.1000. Typed
 teardown: dbgscope `16403fa`. All comparisons retained the same boot; no reset or host configuration
 change was made.
