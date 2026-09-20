@@ -143,10 +143,12 @@ The exit-only watchdog is not a reliable cancellation bound even after this tran
 synchronization announcement. Do not automate repeated breaks or assume a fixed number of
 continues will recover another run.
 
-The [2026-09-20 exit-watchdog trace](kernel-exit-watchdog.md) isolates the cancellation path
-without attaching to the guest. It records accepted native EXIT requests, the internal exit bit,
-and a kernel-wait stack below the exit check. Its unconnected endpoint is not a reproduction of
-the synchronized live failure; keep those claims separate.
+The [2026-09-20 exit-watchdog trace](kernel-exit-watchdog.md) first isolated the cancellation path
+on a synthetic endpoint, then traced a synchronized live wait without sending ACTIVE. Both
+recorded accepted native EXIT requests, the set internal exit bit, and a kernel-wait stack in
+socket reception. The short synchronized checkpoint supports a build-specific DbgEng/KDNET
+cancellation gap, not proof of an indefinite wait or the full post-ACTIVE freeze mechanism.
+Fresh guest-health checks passed before and after reclaiming only that local probe.
 
 Engine: DbgEng 10.0.29617.1000. Target: four-processor Hyper-V 29671, guest OS 29671.1000. Typed
 teardown: dbgscope `16403fa`. All comparisons retained the same boot; no reset or host configuration
