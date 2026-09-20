@@ -158,6 +158,63 @@ connection text; using no real key prevents a redaction failure from exposing la
 
 ## Comparison and remaining work
 
+### Direct-COM comparison across two engine builds
+
+The retained [raw example](../examples/raw_kernel_exit.rs) removes the dbgscope session driver,
+announcement observer, output/event callbacks, and engine-option changes. It uses the Windows
+bindings directly: `DebugCreate<IDebugClient>`, `QueryInterface<IDebugControl>`, `AttachKernel`,
+then one raw `WaitForEvent(0, INFINITE)` on the owner thread. A scoped helper calls only
+`SetInterrupt(EXIT)`, starting after 60 seconds and repeating 150 times at 200 ms intervals.
+Native HRESULTs are logged without converting successful values to a generic `Ok`.
+
+Only synthetic ports `50192` and `50193` are accepted; the key is hard-coded as `1.2.3.4` and no
+target address, live profile, or caller-supplied connection is read. The connection buffer and
+COM owners outlive the wait/helper. COM reference management stays on the owner thread; the
+helper's narrow borrowed wrapper exposes only the documented cross-thread `SetInterrupt` call.
+
+On 2026-09-20, the identical executable ran in two separate processes with unused synthetic
+endpoints. The harness verified each actual loaded engine path/version and exclusive endpoint
+ownership. It drained both output streams and reclaimed only its own synthetic child at the
+100-second outer deadline. Neither run used CDB or paused the probe for tracing.
+
+| Loaded DbgEng | Accepted EXIT calls | Native wait returned | Outer elapsed seconds |
+|---|---|---|---|
+| `10.0.29617.1000` | 150, all `S_OK` | No | 100.0952016 |
+| `10.0.26100.1` | 150, all `S_OK` | No | 100.5128272 |
+
+Both runs logged completion of all 150 requests but no `RAW_WAIT_RETURN`. The last request
+returned at 90763 ms and 90734 ms respectively; the wait still had not returned when the outer
+deadline reclaimed the process. Both processes were independently verified gone and both UDP
+ports free. Process exit `-1` records forced synthetic-probe reclamation, not cancellation.
+
+The executable SHA-256 was
+`1D686673505807DC4F26C1A7348DD0E13C2134DEEAC0E8BB1D0AD0FE631F0E9F`.
+The newer DLL hash is recorded above; the System32 `10.0.26100.1` DLL SHA-256 was
+`BFA188B10EB64A94F1EB59BFB0F8D85EB5DFC803CD0F6B5C554816FE311A236E`.
+These compare the locally installed engine environments, not a controlled replacement of one DLL
+with every dependent binary held identical.
+
+Thus dbgscope's callback, guard, and watchdog implementation are not required to reproduce the
+**unconnected** cancellation failure. It is also not unique to `10.0.29617.1000`. No synchronized
+live-target comparison was performed on `10.0.26100.1`, and these raw runs captured neither
+internal flags nor thread stacks. They do not prove every engine version has the issue, an
+indefinite wait, or the complete mechanism of the earlier post-ACTIVE freeze.
+
+To repeat this comparison, build with `cargo build --example raw_kernel_exit` and run the binary
+under an external 100-second process deadline, with argument `50192` or `50193` after verifying
+the selected port is unused. Do not run it expecting its helper to bound the process: that
+assumption is exactly what it measures. Use separate executable directories to select engine
+environments, verify the actual loaded module, capture stdout/stderr, and check the exact child
+and endpoint are gone afterward. Do not adapt this forced-cleanup harness to a live profile.
+
+Validation: both example input tests passed natively and under Miri; they exercise input rejection,
+not native FFI or cross-thread engine behavior. The normal suite passed 395 tests with 13 ignored,
+plus four doctests. Formatting and focused Clippy passed, with five existing library warnings;
+an extra `-D warnings` attempt failed on those unchanged warnings. The two native comparisons
+above, not the pure tests or Miri, measure DbgEng behavior. No production library code changed.
+
+### Remaining boundaries
+
 The focused local-process tests for exit-deadline attribution and missing-announcement callback
 restoration both passed with the test executable beside the same engine DLL. A CDB module listing
 independently confirmed `10.0.29617.1000` for the exit-deadline comparison. These tests exercise a
@@ -166,11 +223,12 @@ local `ping.exe` debuggee, not KDNET, and do not establish live-target liveness.
 Do not replace EXIT with repeated ACTIVE interrupts, add another cross-thread DbgEng method,
 or patch the private flags. The synchronized trace now records the watchdog HRESULT, actual exit
 branch, and engine-thread stack, but does not establish a safe automatic-recovery procedure.
-The evidence points to a DbgEng/KDNET cancellation limitation or defect in this specific image,
-not a documented general API restriction or proof of the complete post-ACTIVE failure mechanism.
-A minimal direct-COM comparison and a second engine build would help separate library interaction
-from engine-version behavior. Until the native wait returns, a deadline remains a cancellation
-request, not permission to abandon a controller whose target may be stopped.
+The direct-COM comparison strengthens the evidence for a native DbgEng/KDNET cancellation
+limitation or defect across these two unconnected engine environments, rather than a dependency
+on dbgscope's implementation. Synchronized cross-build behavior and the complete post-ACTIVE
+failure mechanism remain unresolved. These are measurements, not a documented general API
+restriction. Until the native wait returns, a deadline remains a cancellation request, not
+permission to abandon a controller whose target may be stopped.
 
 ## Local evidence index
 
@@ -197,3 +255,7 @@ These filenames identify retained bench artifacts, not portable inputs or commit
 - `exit-watchdog-synchronized-image_11f4_2026-09-20_08-06-31-891.log`: packet-receiver and helper
   function disassembly. Its final `u` starts mid-instruction at `0x1777e0`; ignore that fragment
   and use the earlier full-function image log for the outer receive path.
+- `raw-kernel-exit-bundled-20260920-082923.log`: direct-COM synthetic run on `10.0.29617.1000`.
+- `raw-kernel-exit-system-20260920-082938.log`: identical executable on `10.0.26100.1`.
+- `run-raw-kernel-exit.ps1`: local two-environment runner, loaded-module checks, drained output,
+  100-second synthetic-process limit, and endpoint cleanup checks.
