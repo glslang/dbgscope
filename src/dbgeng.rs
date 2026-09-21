@@ -483,24 +483,6 @@ struct ClientState {
     /// somebody else's process — the exact failure this record exists to prevent, reached through
     /// the wrapper boundary. Which processes a session attached to is a property of the session.
     attached_processes: Mutex<HashMap<u32, Attachment>>,
-    /// Whether this session's kernel target was attached **over a KD connection** with
-    /// `INITIAL_BREAK`, and so may still owe break-ins that
-    /// [`DebugEngine::spend_pending_break_ins`] must consume before `qd` does.
-    ///
-    /// Recorded by the opener, like [`Self::attached_processes`] beside it and for the same
-    /// reason: the engine cannot be asked afterwards which of the three kernel attaches was used,
-    /// and they owe different things. The announcement attach removes `INITIAL_BREAK` and owes
-    /// nothing. The **local** kernel arms it and owes nothing either: there is no `DbgKdContinue`
-    /// to lose on a machine that was never halted, and a resume is one of the commands local
-    /// kernel debugging refuses outright. So it is keyed on the *attach*, not on the option — a
-    /// flag set by `request_initial_break` would drain a target that refuses every resume.
-    ///
-    /// **Which opener sets it is not pinned by any test, and cannot be here**: it takes a real KD
-    /// link, so every offline test stays green if `attach_kernel_begin` stops recording it. The
-    /// rule lives in one `store` beside the attach and one `store` in
-    /// [`DebugEngine::forget_the_previous_session`], which every opener runs, so a fourth kernel
-    /// path inherits the clear and has to opt *in* rather than remember to opt out.
-    kd_initial_break_attach: AtomicBool,
 }
 
 /// How far an attachment has got, which is what tells a *deferred* one from a *departed* one.
@@ -1398,9 +1380,12 @@ impl Resumed {
 
 /// How much of a drain has been spent, and what it has learned. See
 /// [`DebugEngine::spend_pending_break_ins`].
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct Drain {
-    /// Resumes spent, against [`DebugEngine::DRAIN_ATTEMPTS`].
+    /// How many resumes this drain may spend, from [`Self::for_processors`]. A per-target number
+    /// rather than a constant, because what a target can owe scales with its processor count.
+    attempts: usize,
+    /// Resumes spent, against [`Self::attempts`].
     spent: usize,
     /// Resumes answered by a break-in.
     delivered: usize,
@@ -1411,12 +1396,49 @@ struct Drain {
     gone: bool,
 }
 
+impl Default for Drain {
+    /// [`DebugEngine::DRAIN_ATTEMPTS`], which is what a target whose processor count could not be
+    /// read gets. Not zero: a drain that spends nothing is the behaviour this whole path exists to
+    /// replace.
+    fn default() -> Self {
+        Self {
+            attempts: DebugEngine::DRAIN_ATTEMPTS,
+            spent: 0,
+            delivered: 0,
+            free_runs: 0,
+            gone: false,
+        }
+    }
+}
+
 impl Drain {
+    /// A drain sized for a target with this many processors: **one resume per processor, plus the
+    /// free runs that end it**, and never fewer than [`DebugEngine::DRAIN_ATTEMPTS`].
+    ///
+    /// **Measured on a four-processor hypervisor, 2026-09-21.** A `run_to_address` that hit a
+    /// software breakpoint in code every processor runs left *three* further stops behind it —
+    /// one per other processor, each a first-chance `0x80000003` at the breakpoint's own address
+    /// and on that processor's own stack, delivered one per resume, after which the target ran
+    /// free. So a target owes up to one per processor and the old constant was a coincidence: five
+    /// is exactly three plus two, and a guest with one more processor would have exhausted it with
+    /// a stop still owing.
+    ///
+    /// The count comes from the target rather than from the host — `GetNumberProcessors` — and
+    /// four is the largest lab this was measured on. What scales it beyond that is the
+    /// one-per-processor rule above rather than a second measurement.
+    fn for_processors(processors: u32) -> Self {
+        let owed = usize::try_from(processors).unwrap_or(usize::MAX);
+        Self {
+            attempts: owed
+                .saturating_add(DebugEngine::DRAIN_FREE_RUNS)
+                .max(DebugEngine::DRAIN_ATTEMPTS),
+            ..Self::default()
+        }
+    }
+
     /// Whether another resume is worth spending.
     fn resume_again(&self) -> bool {
-        !self.gone
-            && self.spent < DebugEngine::DRAIN_ATTEMPTS
-            && self.free_runs < DebugEngine::DRAIN_FREE_RUNS
+        !self.gone && self.spent < self.attempts && self.free_runs < DebugEngine::DRAIN_FREE_RUNS
     }
 
     /// Folds in what one resume settled.
@@ -4851,12 +4873,6 @@ impl DebugEngine {
         // string rides along because that link is only established during the wait.
         self.retain_deferred_input(TargetInput::Ansi(connection));
         self.forget_the_previous_session();
-        // **After the forget, which clears it**, and before the wait, which may fail and still
-        // leave what the engine armed on its way in. See
-        // [`ClientState::kd_initial_break_attach`].
-        self.state
-            .kd_initial_break_attach
-            .store(true, Ordering::SeqCst);
         Ok(PendingTarget::new(self, WaitKind::KernelBreakIn))
     }
 
@@ -8096,12 +8112,6 @@ impl DebugEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .forget_all();
-        // What the *previous* attach owed is not owed by whatever this session holds next. This
-        // runs on the way **in** to every opener, so the announcement and local-kernel paths clear
-        // a flag a plain KD attach left behind rather than inheriting it.
-        self.state
-            .kd_initial_break_attach
-            .store(false, Ordering::SeqCst);
     }
 
     /// Whether this engine holds a live user-mode process it **attached** to rather than
@@ -8240,7 +8250,7 @@ impl DebugEngine {
     /// forced break leaves no artifact of its own.
     const DRAIN_RESUME_MS: u32 = 500;
 
-    /// How many resumes the drain will spend, and how many consecutive *free* ones end it.
+    /// The fewest resumes a drain will spend, and how many consecutive *free* ones end it.
     ///
     /// **Two in a row, because one is not evidence.** A resume that reaches its deadline says the
     /// target ran that whole window without stopping — but a break-in merely slow to arrive reads
@@ -8248,14 +8258,51 @@ impl DebugEngine {
     /// the hypervisor below: draining once survived 2 detach cycles of 3, with the third freezing
     /// the guest; draining to two consecutive free resumes survived 5 of 5.
     ///
-    /// The attempt cap keeps a target that breaks on every resume — its own `int 3` in a loop,
-    /// say — from making a teardown unbounded. Reaching it is not an error: the quit runs
-    /// regardless, exactly as it did before any of this.
+    /// **`DRAIN_ATTEMPTS` is a floor rather than the cap**, which [`Drain::for_processors`] sets
+    /// from the target's own processor count. The attempt count keeps a target that breaks on
+    /// every resume — its own `int 3` in a loop, say — from making a teardown unbounded, and
+    /// [`Self::DRAIN_BUDGET`] bounds the wall clock the same way. Reaching either is not an error:
+    /// the quit runs regardless, exactly as it did before any of this.
     const DRAIN_ATTEMPTS: usize = 5;
     const DRAIN_FREE_RUNS: usize = 2;
 
-    /// Spends the break-ins an `INITIAL_BREAK` KD attach left owing, before `qd` spends the
-    /// target's only continue on one.
+    /// How long the whole drain may take before the quit goes ahead without it.
+    ///
+    /// **It bounds the clock where the attempt count bounds the resumes**, and the two are not the
+    /// same bound once the cap scales with the processor count: a delivered break returns at once
+    /// and costs nothing, while a free run costs [`Self::DRAIN_RESUME_MS`], so a target
+    /// alternating between the two spends real time per attempt. A server-class kernel with scores
+    /// of processors would otherwise make the teardown long enough to matter to whoever is waiting
+    /// on it — including `windbg-mcp`'s supervisor-loss release, which gives the whole teardown
+    /// eight seconds.
+    const DRAIN_BUDGET: Duration = Duration::from_secs(4);
+
+    /// Spends the stops this target still owes, before `qd` spends its only continue on one.
+    ///
+    /// **Two things leave one behind, and only the first is about the attach** — which is why
+    /// nothing here asks how the session was opened:
+    ///
+    /// 1. `DEBUG_ENGOPT_INITIAL_BREAK`, described below, leaves one pending host break-in.
+    /// 2. **A software breakpoint in code every processor runs is hit by more than one of them**
+    ///    before the debugger takes it off, and each of the others' break exceptions is delivered
+    ///    on a later resume. Measured 2026-09-21 on a four-processor hypervisor: a `run_to_address`
+    ///    that reported `hit` and an empty breakpoint inventory left exactly three, one per other
+    ///    processor, each at the breakpoint's own address and on that processor's own stack.
+    ///
+    /// The second owes nothing to the attach, so gating the drain on the attach shape — which this
+    /// did, on [`ClientState::kd_initial_break_attach`] — left it unrun on exactly the path that
+    /// needed it most. Measured the same day: that hit followed by a reported-clean detach through
+    /// an announcement attach left the four-processor guest unreachable, black at the console, and
+    /// a fresh attach found it stopped at the breakpoint's own address. Draining it released the
+    /// guest on the same boot with no reset.
+    ///
+    /// The price of dropping the gate is [`Self::DRAIN_FREE_RUNS`] bounded resumes on a live
+    /// kernel that owes nothing — this is the live-kernel quit path and no other — against a
+    /// frozen machine when the guess is wrong. A **local** kernel is the one target that used to
+    /// be excluded by construction and now is not, and it owes nothing: there is no
+    /// `DbgKdContinue` to lose on a machine that was never halted, and a resume is one of the
+    /// commands local kernel debugging refuses outright, so its first drain resume errors and the
+    /// `Err` arm below ends the loop there.
     ///
     /// **Measured on a Microsoft hypervisor, 2026-09-20.** `DEBUG_ENGOPT_INITIAL_BREAK` leaves a
     /// pending host break-in behind it, and [`Self::absorb_initial_break_artifact`] consumes
@@ -8275,11 +8322,15 @@ impl DebugEngine {
     /// Best-effort throughout and deliberately not a `?`: this sits on a teardown, where a session
     /// that will not close is worse than a resume that did not happen. The quit runs either way.
     fn spend_pending_break_ins(&self) {
-        if !self.state.kd_initial_break_attach.load(Ordering::SeqCst) {
-            return;
-        }
-        let mut drain = Drain::default();
-        while drain.resume_again() {
+        // The target's processors, not this host's. A count that cannot be read falls back to the
+        // floor rather than to nothing: an unsized drain still spends the one an INITIAL_BREAK
+        // attach owes, which is what this path did for every target before it was sized at all.
+        let mut drain = match unsafe { self.control.GetNumberProcessors() } {
+            Ok(processors) => Drain::for_processors(processors),
+            Err(_) => Drain::default(),
+        };
+        let started = Instant::now();
+        while drain.resume_again() && started.elapsed() < Self::DRAIN_BUDGET {
             match self.execute_and_wait("g", Self::DRAIN_RESUME_MS) {
                 Ok(run) => drain.saw(Resumed::of(&run)),
                 // The engine refused the resume — a target that has gone, most likely. Nothing
@@ -9021,6 +9072,72 @@ mod tests {
         ]);
         assert_eq!(drain.spent, 4);
         assert_eq!(drain.delivered, 1);
+    }
+
+    /// **A drain has to outlast one stop per processor**, which is what a breakpoint in code every
+    /// processor runs leaves behind: measured on four, three further stops after the hit, one per
+    /// other processor. So the loop must still be resuming after `processors - 1` breaks and one
+    /// free run, or the last one is handed to `qd` and the guest freezes.
+    ///
+    /// Six counts rather than the lab's four, because four is the number the old fixed cap of five
+    /// happened to fit — three breaks plus two free runs is exactly five — so a test written at
+    /// the lab's topology passes against the bug it is for.
+    #[test]
+    fn test_a_drain_outlasts_one_stop_per_processor() {
+        // Fed one resume at a time rather than through `drain_over`, because what this asks is
+        // whether the drain is *still* resuming part-way through a script — which is a state to
+        // read, not a loop to run to the end.
+        let feed = |processors: u32, resumes: &[Resumed]| {
+            let mut drain = Drain::for_processors(processors);
+            for resumed in resumes {
+                assert!(
+                    drain.resume_again(),
+                    "{processors} processors: the drain gave up after {} of {} resumes with the \
+                     script still owing",
+                    drain.spent,
+                    drain.attempts
+                );
+                drain.saw(*resumed);
+            }
+            drain
+        };
+        for processors in [1u32, 2, 4, 5, 8, 64] {
+            let owed = usize::try_from(processors).unwrap() - 1;
+            let mut script = vec![Resumed::OnABreak; owed];
+            script.push(Resumed::Freely);
+            let part_way = feed(processors, &script);
+            assert!(
+                part_way.resume_again(),
+                "{processors} processors owe {owed} stops, and one free run after them is not \
+                 evidence the last was delivered"
+            );
+            script.push(Resumed::Freely);
+            let drained = feed(processors, &script);
+            assert_eq!(drained.delivered, owed, "every owed stop is spent");
+            assert!(
+                !drained.resume_again(),
+                "two consecutive free runs end it, whatever the processor count"
+            );
+        }
+    }
+
+    /// The floor holds under the sizing: a one- or two-processor target still gets the five
+    /// resumes the hypervisor drain was measured with, rather than the two or three its own
+    /// processor count would buy.
+    #[test]
+    fn test_a_small_target_still_gets_the_measured_floor() {
+        for processors in [0u32, 1, 2, 3] {
+            assert_eq!(
+                Drain::for_processors(processors).attempts,
+                DebugEngine::DRAIN_ATTEMPTS,
+                "{processors} processors must not shrink the drain below its floor"
+            );
+        }
+        assert_eq!(
+            Drain::for_processors(4).attempts,
+            DebugEngine::DRAIN_ATTEMPTS + 1,
+            "and above the floor it is one per processor plus the free runs"
+        );
     }
 
     /// The attempt cap keeps a target that breaks on every resume — its own `int 3` in a loop,
