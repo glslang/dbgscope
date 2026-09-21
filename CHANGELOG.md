@@ -24,13 +24,36 @@ All notable changes to this project are documented here. The format follows
   **Between `clear_all_breakpoints` and `qd`, and that placement is the whole of it.** The clear has
   already succeeded, so the target holds no breakpoint a drain resume could stop at — and a resume
   cannot otherwise tell a caller's breakpoint from the break-in it is hunting, both coming back with
-  no `cut_short`. The quit has not yet spent the target's one continue. It is gated on the **KD
-  connection** attach rather than on the option: the announcement attach removes `INITIAL_BREAK`,
-  and the local kernel arms it while owing nothing, having no execution control to hand back. Two
+  no `cut_short`. The quit has not yet spent the target's one continue. It runs on **every**
+  live-kernel quit, whatever the attach shape — it was gated on the KD-connection attach, and the
+  entry below is what that gate cost. Two
   readings pinned the cause, one of them ruling out the obvious answer — stepping past the
   hypervisor's own `int 3` before detaching does *not* help, so it is not where the instruction
   pointer sits; and the first `g` after a completed attach returns at once with the CTRL+BREAK
   banner while every later one runs to its bound.
+
+- **A breakpoint in code every processor runs owes a stop to each of the others, and the drain is
+  now sized for them.** Measured on a four-processor Microsoft hypervisor, 2026-09-21: a
+  `run_to_address` that returned `verdict: hit` with an empty breakpoint inventory after it left
+  **three** further stops behind it — processors 2, 3 and 1 where the hit was on 0, each a
+  first-chance `0x80000003` at the breakpoint's own address and on that processor's own stack,
+  delivered one per resume in 1–3 ms, after which the target ran free. The others reach the patched
+  instruction before the debugger removes it, and `qd`'s single continue is then taken by the first
+  of them: the guest stops with no debugger attached. It races the quit, so it is intermittent —
+  **2 of 4** hit-then-detach runs froze, both leaving the guest black with a pending stop at that
+  address, each released by one attach and one `end_session` whose drain ran.
+
+  Two changes follow, and the first is why the entry above no longer names an attach shape. These
+  stops owe nothing to the attach, so the gate left the drain unrun on exactly the
+  `experimental_break_on_connect` path a running hypervisor has to be attached with. And the
+  attempt cap is now `GetNumberProcessors` plus the two free runs rather than a fixed five, which
+  four processors met exactly by coincidence — three stops plus two free runs — so one more
+  processor would have exhausted it with a stop still owing. `DRAIN_BUDGET` bounds the wall clock
+  at four seconds where the attempt count no longer does. **Ten of ten** four-processor
+  hit-then-detach cycles then came back clean, each confirmed over WinRM as the same boot with
+  uptime advancing afterwards. A **local** kernel is the one target the old gate excluded by
+  construction: it owes nothing, and its first drain resume errors out because local kernel
+  debugging refuses execution control, which ends the loop there.
 
 - **A slot that names its VS context by displacement is decoded, so current Windows builds walk
   again.** `_HEAP_VS_AFFINITY_SLOT::VsContext` — a back-pointer to the owning `_HEAP_VS_CONTEXT` —
