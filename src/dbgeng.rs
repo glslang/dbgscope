@@ -483,6 +483,24 @@ struct ClientState {
     /// somebody else's process — the exact failure this record exists to prevent, reached through
     /// the wrapper boundary. Which processes a session attached to is a property of the session.
     attached_processes: Mutex<HashMap<u32, Attachment>>,
+    /// Whether this session's kernel target was attached **over a KD connection** with
+    /// `INITIAL_BREAK`, and so may still owe break-ins that
+    /// [`DebugEngine::spend_pending_break_ins`] must consume before `qd` does.
+    ///
+    /// Recorded by the opener, like [`Self::attached_processes`] beside it and for the same
+    /// reason: the engine cannot be asked afterwards which of the three kernel attaches was used,
+    /// and they owe different things. The announcement attach removes `INITIAL_BREAK` and owes
+    /// nothing. The **local** kernel arms it and owes nothing either: there is no `DbgKdContinue`
+    /// to lose on a machine that was never halted, and a resume is one of the commands local
+    /// kernel debugging refuses outright. So it is keyed on the *attach*, not on the option — a
+    /// flag set by `request_initial_break` would drain a target that refuses every resume.
+    ///
+    /// **Which opener sets it is not pinned by any test, and cannot be here**: it takes a real KD
+    /// link, so every offline test stays green if `attach_kernel_begin` stops recording it. The
+    /// rule lives in one `store` beside the attach and one `store` in
+    /// [`DebugEngine::forget_the_previous_session`], which every opener runs, so a fourth kernel
+    /// path inherits the clear and has to opt *in* rather than remember to opt out.
+    kd_initial_break_attach: AtomicBool,
 }
 
 /// How far an attachment has got, which is what tells a *deferred* one from a *departed* one.
@@ -1339,6 +1357,82 @@ impl CommandRun {
     /// command it knows cannot be interrupted.
     pub fn into_output(self) -> String {
         self.output
+    }
+}
+
+/// What one of [`DebugEngine::spend_pending_break_ins`]'s resumes settled about the break-ins a
+/// kernel attach still owes.
+///
+/// Split from the engine call so the loop's termination rule can be driven by a test: the two
+/// facts it turns on — how a run ended, and whether the target is still there — are the whole of
+/// what the engine contributes, and [`Drain`] decides everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resumed {
+    /// It came back on its own, which for a resume that short means a break-in was waiting — and
+    /// not a caller's breakpoint, `clear_all_breakpoints` having taken those off the target first.
+    /// That is one fewer for `qd` to lose.
+    OnABreak,
+    /// The deadline stopped it: the target ran the whole window without stopping, so nothing was
+    /// pending in this one.
+    Freely,
+    /// A host asked for the break. That says nothing about what the target was doing, so it is
+    /// **not** a free run — counting it as one is how a drain stops early and leaves the break-in
+    /// for `qd`.
+    OnRequest,
+    /// The target has gone. Nothing is owed, and nothing more can be learned by resuming.
+    Gone,
+}
+
+impl Resumed {
+    /// Reads one run. `target_gone` first: a run that lost its target may also have been cut
+    /// short, and which of the two happened decides whether resuming again is worth anything.
+    fn of(run: &CommandRun) -> Self {
+        match (run.target_gone, run.cut_short) {
+            (true, _) => Self::Gone,
+            (false, Some(Interruption::Deadline { .. })) => Self::Freely,
+            (false, Some(Interruption::OnRequest)) => Self::OnRequest,
+            (false, None) => Self::OnABreak,
+        }
+    }
+}
+
+/// How much of a drain has been spent, and what it has learned. See
+/// [`DebugEngine::spend_pending_break_ins`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Drain {
+    /// Resumes spent, against [`DebugEngine::DRAIN_ATTEMPTS`].
+    spent: usize,
+    /// Resumes answered by a break-in.
+    delivered: usize,
+    /// Consecutive free runs, against [`DebugEngine::DRAIN_FREE_RUNS`]. Reset by a delivered
+    /// break.
+    free_runs: usize,
+    /// The target has gone; no further resume can say anything.
+    gone: bool,
+}
+
+impl Drain {
+    /// Whether another resume is worth spending.
+    fn resume_again(&self) -> bool {
+        !self.gone
+            && self.spent < DebugEngine::DRAIN_ATTEMPTS
+            && self.free_runs < DebugEngine::DRAIN_FREE_RUNS
+    }
+
+    /// Folds in what one resume settled.
+    fn saw(&mut self, resumed: Resumed) {
+        self.spent += 1;
+        match resumed {
+            Resumed::OnABreak => {
+                self.delivered += 1;
+                self.free_runs = 0;
+            }
+            Resumed::Freely => self.free_runs += 1,
+            // Neither evidence of a free run nor of a break-in: it costs an attempt and leaves the
+            // count where it was.
+            Resumed::OnRequest => {}
+            Resumed::Gone => self.gone = true,
+        }
     }
 }
 
@@ -4757,6 +4851,12 @@ impl DebugEngine {
         // string rides along because that link is only established during the wait.
         self.retain_deferred_input(TargetInput::Ansi(connection));
         self.forget_the_previous_session();
+        // **After the forget, which clears it**, and before the wait, which may fail and still
+        // leave what the engine armed on its way in. See
+        // [`ClientState::kd_initial_break_attach`].
+        self.state
+            .kd_initial_break_attach
+            .store(true, Ordering::SeqCst);
         Ok(PendingTarget::new(self, WaitKind::KernelBreakIn))
     }
 
@@ -7996,6 +8096,12 @@ impl DebugEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .forget_all();
+        // What the *previous* attach owed is not owed by whatever this session holds next. This
+        // runs on the way **in** to every opener, so the announcement and local-kernel paths clear
+        // a flag a plain KD attach left behind rather than inheriting it.
+        self.state
+            .kd_initial_break_attach
+            .store(false, Ordering::SeqCst);
     }
 
     /// Whether this engine holds a live user-mode process it **attached** to rather than
@@ -8115,9 +8221,72 @@ impl DebugEngine {
     fn quit_and_detach_target(&self) -> Result<(), DbgEngError> {
         self.refuse_without_a_debuggee()?;
         self.clear_all_breakpoints()?;
+        // **Between the clear and the quit, and that placement is the whole of it.** See
+        // [`Self::spend_pending_break_ins`]: the clear above has succeeded, so the target holds no
+        // breakpoint a drain resume could stop at, and `qd` below has not yet spent the target's
+        // one continue. Neither neighbour is incidental — a drain before the clear cannot tell a
+        // caller's breakpoint from the break-in it is hunting, and one after `qd` is too late.
+        self.spend_pending_break_ins();
         // A fixed literal, but still use the guarded command path: this can reach execution.
         self.execute_command("qd")?;
         require_detached(self.has_target()?)
+    }
+
+    /// How long each drain resume gives a leftover break-in to show itself.
+    ///
+    /// It fires on the *first instruction* of the resume, so this bounds a thing that either
+    /// happens at once or not at all rather than budgeting for work. With nothing pending the
+    /// target simply runs for this long and is broken back in, which is measurably harmless: a
+    /// forced break leaves no artifact of its own.
+    const DRAIN_RESUME_MS: u32 = 500;
+
+    /// How many resumes the drain will spend, and how many consecutive *free* ones end it.
+    ///
+    /// **Two in a row, because one is not evidence.** A resume that reaches its deadline says the
+    /// target ran that whole window without stopping — but a break-in merely slow to arrive reads
+    /// exactly the same, and stopping there leaves it pending for `qd`. Measured by hand against
+    /// the hypervisor below: draining once survived 2 detach cycles of 3, with the third freezing
+    /// the guest; draining to two consecutive free resumes survived 5 of 5.
+    ///
+    /// The attempt cap keeps a target that breaks on every resume — its own `int 3` in a loop,
+    /// say — from making a teardown unbounded. Reaching it is not an error: the quit runs
+    /// regardless, exactly as it did before any of this.
+    const DRAIN_ATTEMPTS: usize = 5;
+    const DRAIN_FREE_RUNS: usize = 2;
+
+    /// Spends the break-ins an `INITIAL_BREAK` KD attach left owing, before `qd` spends the
+    /// target's only continue on one.
+    ///
+    /// **Measured on a Microsoft hypervisor, 2026-09-20.** `DEBUG_ENGOPT_INITIAL_BREAK` leaves a
+    /// pending host break-in behind it, and [`Self::absorb_initial_break_artifact`] consumes
+    /// exactly *one* with a single `g` — which is right for NT, whose artifact that comment names,
+    /// and one short on that target. What is left over is invisible in the attach's result: the
+    /// session looks ordinary. It is spent at the worst possible moment instead. `qd` sends one
+    /// `DbgKdContinue`, the pending break-in takes it, and the target stops again with **no
+    /// debugger attached** — a frozen guest, while the teardown reports a clean release.
+    ///
+    /// How it was pinned down, because the obvious reading is wrong: a plain attach leaves that
+    /// hypervisor halted *on its own* `int 3`, and stepping past it before detaching still froze
+    /// the guest — so it is not where the instruction pointer sits. What shows the leftover is a
+    /// resume. The first `g` after a completed attach returns **immediately** with the CTRL+BREAK
+    /// banner, while every later one runs to its bound and has to be broken in. One pending
+    /// break-in, exactly.
+    ///
+    /// Best-effort throughout and deliberately not a `?`: this sits on a teardown, where a session
+    /// that will not close is worse than a resume that did not happen. The quit runs either way.
+    fn spend_pending_break_ins(&self) {
+        if !self.state.kd_initial_break_attach.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut drain = Drain::default();
+        while drain.resume_again() {
+            match self.execute_and_wait("g", Self::DRAIN_RESUME_MS) {
+                Ok(run) => drain.saw(Resumed::of(&run)),
+                // The engine refused the resume — a target that has gone, most likely. Nothing
+                // left to drain, and nothing to report about it.
+                Err(_) => break,
+            }
+        }
     }
 
     fn clear_all_breakpoints(&self) -> Result<(), DbgEngError> {
@@ -8790,6 +8959,124 @@ mod tests {
             require_detached(true),
             Err(DbgEngError::IncompleteKernelDetach)
         ));
+    }
+
+    fn ran(cut_short: Option<Interruption>, target_gone: bool) -> CommandRun {
+        CommandRun {
+            output: String::new(),
+            cut_short,
+            target_gone,
+        }
+    }
+
+    /// Runs a drain over a scripted sequence of resumes, as [`DebugEngine::spend_pending_break_ins`]
+    /// does over real ones, and answers with the state it stopped in.
+    ///
+    /// The whole loop rather than one step, because the rule under test *is* the loop: how many
+    /// resumes it spends, and on what evidence it stops.
+    fn drain_over(resumes: &[Resumed]) -> Drain {
+        let mut drain = Drain::default();
+        let mut next = resumes.iter();
+        while drain.resume_again() {
+            match next.next() {
+                Some(resumed) => drain.saw(*resumed),
+                None => panic!(
+                    "the drain asked for resume {} and the script had none",
+                    drain.spent + 1
+                ),
+            }
+        }
+        drain
+    }
+
+    /// **One free run is not evidence, and this is the rule that was measured.**
+    ///
+    /// A break-in merely slow to arrive reads exactly like a target running freely, so a drain
+    /// that stopped at the first free resume left it pending for `qd`. Measured by hand on the
+    /// hypervisor: draining once survived 2 detach cycles of 3, with the third freezing the guest;
+    /// draining to two consecutive free resumes survived 5 of 5.
+    #[test]
+    fn test_one_free_resume_does_not_end_the_break_in_drain() {
+        let mut drain = Drain::default();
+        drain.saw(Resumed::OnABreak);
+        drain.saw(Resumed::Freely);
+        assert!(
+            drain.resume_again(),
+            "stopping on a single free resume is the version that froze the guest"
+        );
+        drain.saw(Resumed::Freely);
+        assert!(!drain.resume_again(), "two in a row is what ends it");
+        assert_eq!(drain.delivered, 1, "one break-in was spent, not three");
+    }
+
+    /// A delivered break-in starts the count again: the two free runs have to be *consecutive*,
+    /// or a drain could stop having seen one free resume before a break and one after it.
+    #[test]
+    fn test_a_break_in_between_two_free_resumes_restarts_the_count() {
+        let drain = drain_over(&[
+            Resumed::Freely,
+            Resumed::OnABreak,
+            Resumed::Freely,
+            Resumed::Freely,
+        ]);
+        assert_eq!(drain.spent, 4);
+        assert_eq!(drain.delivered, 1);
+    }
+
+    /// The attempt cap keeps a target that breaks on every resume — its own `int 3` in a loop,
+    /// say — from turning a teardown into an unbounded one.
+    #[test]
+    fn test_a_target_that_breaks_every_time_still_ends_the_drain() {
+        let drain = drain_over(&[Resumed::OnABreak; DebugEngine::DRAIN_ATTEMPTS]);
+        assert_eq!(drain.spent, DebugEngine::DRAIN_ATTEMPTS);
+        assert_eq!(drain.delivered, DebugEngine::DRAIN_ATTEMPTS);
+    }
+
+    /// **A host's interrupt is not a free run.** It says the caller asked, and nothing about
+    /// whether a break-in was pending — so counting it as one is how a drain stops early and hands
+    /// the leftover back to `qd`.
+    #[test]
+    fn test_a_host_interrupt_is_not_counted_as_a_free_resume() {
+        let mut drain = Drain::default();
+        drain.saw(Resumed::Freely);
+        drain.saw(Resumed::OnRequest);
+        assert!(
+            drain.resume_again(),
+            "an interrupt and a deadline are not two free runs"
+        );
+        assert_eq!(drain.free_runs, 1, "and it does not reset the count either");
+        assert_eq!(drain.delivered, 0, "nor is it a break-in delivered");
+    }
+
+    /// A target that goes during the drain ends it there: nothing is owed by a target that is
+    /// gone, and the quit has nothing left to protect.
+    #[test]
+    fn test_a_target_that_goes_ends_the_break_in_drain() {
+        let drain = drain_over(&[Resumed::Gone]);
+        assert_eq!(drain.spent, 1);
+        assert_eq!(drain.delivered, 0);
+    }
+
+    /// The two facts the engine contributes, read the one way round that matters: a run that lost
+    /// its target may *also* have been cut short, and which of the two happened decides whether
+    /// another resume is worth anything.
+    #[test]
+    fn test_a_resume_that_lost_its_target_is_read_as_gone_however_it_ended() {
+        assert_eq!(Resumed::of(&ran(None, true)), Resumed::Gone);
+        assert_eq!(
+            Resumed::of(&ran(Some(Interruption::Deadline { after_ms: 500 }), true)),
+            Resumed::Gone,
+            "a deadline on a run whose target went is not evidence the target ran freely"
+        );
+        assert_eq!(
+            Resumed::of(&ran(Some(Interruption::Deadline { after_ms: 500 }), false)),
+            Resumed::Freely
+        );
+        assert_eq!(
+            Resumed::of(&ran(Some(Interruption::OnRequest), false)),
+            Resumed::OnRequest
+        );
+        assert_eq!(Resumed::of(&ran(None, false)), Resumed::OnABreak);
     }
 
     /// An exit deadline is not an observed stop, regardless of GetExecutionStatus afterward.

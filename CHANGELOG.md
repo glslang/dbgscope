@@ -8,6 +8,30 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A KD attach left break-ins owing, and the teardown paid one with the target's only continue.**
+  `DEBUG_ENGOPT_INITIAL_BREAK` leaves a pending host break-in behind it, and
+  `absorb_initial_break_artifact` consumes exactly *one* with a single `g` — right for NT, whose
+  `nt!DbgBreakPointWithStatus` artifact its comment names, and one short on a Microsoft hypervisor.
+  The leftover is invisible in the attach's result, and `end_session` spends it: `qd` sends one
+  `DbgKdContinue`, the pending break-in takes it, and the target stops again with **no debugger
+  attached** — a frozen guest, reported as a clean release. `quit_and_detach_target` now spends
+  them first, resuming with a 500 ms bound until **two consecutive** resumes run free. One free run
+  is not evidence: a break-in merely slow to arrive reads exactly the same, and a version draining
+  once survived 2 detach cycles of 3 where draining to two survived 5 of 5 — each confirmed over
+  WinRM as the same boot with advancing uptime. NT is unaffected, checked across two pool-walk
+  cycles on a four-processor guest.
+
+  **Between `clear_all_breakpoints` and `qd`, and that placement is the whole of it.** The clear has
+  already succeeded, so the target holds no breakpoint a drain resume could stop at — and a resume
+  cannot otherwise tell a caller's breakpoint from the break-in it is hunting, both coming back with
+  no `cut_short`. The quit has not yet spent the target's one continue. It is gated on the **KD
+  connection** attach rather than on the option: the announcement attach removes `INITIAL_BREAK`,
+  and the local kernel arms it while owing nothing, having no execution control to hand back. Two
+  readings pinned the cause, one of them ruling out the obvious answer — stepping past the
+  hypervisor's own `int 3` before detaching does *not* help, so it is not where the instruction
+  pointer sits; and the first `g` after a completed attach returns at once with the CTRL+BREAK
+  banner while every later one runs to its bound.
+
 - **A slot that names its VS context by displacement is decoded, so current Windows builds walk
   again.** `_HEAP_VS_AFFINITY_SLOT::VsContext` — a back-pointer to the owning `_HEAP_VS_CONTEXT` —
   is spelled `VsContextOffset` on 26100.33438 and 26200, and holds `slot - context` rather than an
