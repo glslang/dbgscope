@@ -124,12 +124,15 @@ fn controller() -> Result<(), Box<dyn std::error::Error>> {
         &engine,
         HeapWalk::refreshed().within(Duration::from_secs(30)),
     )?;
+    // The heap the child created, not merely *a* Segment Heap: the process heap can be one too
+    // (it is on ARM64 26100.1), so the weaker check can pass on a listing that never reached the
+    // heap this example exists to verify.
     assert!(
         listed
             .found
             .iter()
-            .any(|root| root.kind == HeapKind::Segment),
-        "the child created no detected Segment Heap: {:?}",
+            .any(|root| root.address == heap && root.kind == HeapKind::Segment),
+        "the Segment Heap the child created ({heap:#x}) is not among the roots: {:?}",
         listed.found
     );
     let allocations = heap::allocations(&engine, HeapWalk::cached())?;
