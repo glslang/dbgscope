@@ -8,6 +8,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The heap tools saw one heap in processes that have several.** `heap::list` and everything
+  built on it took its roots from the PEB's `ProcessHeaps`, and on current Windows that array names
+  the process heap and nothing else: `RtlpProcessHeapsInsert` writes it for the first heap only and
+  links every heap — the first included — onto a list in `ntdll`'s data, which is what
+  `GetProcessHeaps` walks. So a `HeapCreate` return value was never a root, and the answer still
+  called itself complete. Measured 2026-09-22 on a live ARM64 26100.1 process holding three heaps
+  against a PEB naming one, the missing two including the heap it had just created; and on two
+  x64 26200 dumps whose list head links two entries against a PEB naming one. Roots now come from
+  that list, in its order, reached through the process heap's typed `UserContext` — which names
+  its entry on both builds, where only 26200's PDB names the list head. Every entry is checked
+  rather than trusted: its heap has to name it back, its `Blink` has to be the entry before it,
+  and exactly one entry, the head, lies inside `ntdll`. An entry that fails any of those ends the
+  walk as **unseen** rather than absent — the roots before it stay listed, the walk reports
+  `Partial`, and a diagnostic names the entry. A build whose process heap names no entry keeps no
+  list and gets the PEB answer exactly as before. `HeapRoot::index` is now the position in that
+  order, and the user-mode layout fingerprint moves on every build that carries `UserContext`,
+  because the schema reads it; the kernel schema does not, so no pool fingerprint moves.
+  `windbg-mcp` `FOLLOWUPS.md` item 79.
+
 - **A KD attach left break-ins owing, and the teardown paid one with the target's only continue.**
   `DEBUG_ENGOPT_INITIAL_BREAK` leaves a pending host break-in behind it, and
   `absorb_initial_break_artifact` consumes exactly *one* with a single `g` — right for NT, whose

@@ -1,9 +1,11 @@
 //! Typed, version-aware queries over user-mode Segment Heaps.
 //!
-//! Root discovery is user-specific (PEB and `ntdll`); page-segment, LFH, VS, backend, and
+//! Root discovery is user-specific — `ntdll`'s process heap list, and the PEB's `ProcessHeaps`
+//! on a build that keeps none (see `enumerate_roots`); page-segment, LFH, VS, backend, and
 //! large-allocation decoding is shared with the kernel-pool walker.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -74,6 +76,9 @@ pub enum HeapKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeapRoot {
+    /// Position in the enumeration: `ntdll`'s process heap list in its own order, which is the
+    /// order `GetProcessHeaps` returns, then any root the PEB names that the list did not hold.
+    /// On a build that keeps no list this is the index into the PEB's `ProcessHeaps`.
     pub index: usize,
     pub address: u64,
     pub kind: HeapKind,
@@ -212,7 +217,7 @@ pub enum HeapQueryError {
     UnsupportedArchitecture { machine: u32 },
     #[error("invalid PEB heap metadata: {0}")]
     InvalidPeb(String),
-    #[error("heap selector {heap:#x} is not a supported Segment Heap root in the current PEB")]
+    #[error("heap selector {heap:#x} is not a supported Segment Heap root of the current process")]
     UnsupportedHeap { heap: u64 },
     #[error(
         "missing or unsupported ntdll allocator layout ({0}); run `.reload /f ntdll.dll` and retry"
@@ -365,19 +370,36 @@ pub fn invalidate_caches() {
     LayoutCache::global().invalidate();
 }
 
-fn read_u32(engine: &DebugEngine, address: u64) -> Result<u32, DbgEngError> {
+/// The reads root discovery makes, so it can be driven against a double modelled on a measured
+/// process as well as against a live engine.
+trait RootMemory {
+    fn read(&self, address: u64, size: usize) -> Result<Vec<u8>, DbgEngError>;
+    fn interrupted(&self) -> Result<bool, DbgEngError>;
+}
+
+impl RootMemory for DebugEngine {
+    fn read(&self, address: u64, size: usize) -> Result<Vec<u8>, DbgEngError> {
+        self.read_memory(address, size)
+    }
+
+    fn interrupted(&self) -> Result<bool, DbgEngError> {
+        DebugEngine::interrupted(self)
+    }
+}
+
+fn read_u32(memory: &impl RootMemory, address: u64) -> Result<u32, DbgEngError> {
     Ok(u32::from_le_bytes(
-        engine
-            .read_memory(address, 4)?
+        memory
+            .read(address, 4)?
             .try_into()
             .expect("read_memory returns exactly four bytes or a ShortRead error"),
     ))
 }
 
-fn read_u64(engine: &DebugEngine, address: u64) -> Result<u64, DbgEngError> {
+fn read_u64(memory: &impl RootMemory, address: u64) -> Result<u64, DbgEngError> {
     Ok(u64::from_le_bytes(
-        engine
-            .read_memory(address, 8)?
+        memory
+            .read(address, 8)?
             .try_into()
             .expect("read_memory returns exactly eight bytes or a ShortRead error"),
     ))
@@ -415,7 +437,7 @@ fn classify_root(
 }
 
 fn read_root_signatures(
-    engine: &DebugEngine,
+    memory: &impl RootMemory,
     address: u64,
     segment_offset: u64,
     nt_offset: u64,
@@ -428,7 +450,7 @@ fn read_root_signatures(
     };
     let size = usize::try_from(end_offset.saturating_sub(start_offset))
         .expect("two u32 PDB fields fit in a host-sized read buffer");
-    let bytes = match engine.read_memory(start, size) {
+    let bytes = match memory.read(start, size) {
         Ok(bytes) => bytes,
         Err(error) => {
             let error = error.to_string();
@@ -448,35 +470,75 @@ fn read_root_signatures(
     (decode(segment_offset), decode(nt_offset))
 }
 
+/// Where an entry on `ntdll`'s process heap list keeps the heap it stands for.
+///
+/// The entry has no type in the public PDB, so this is a measured offset rather than a resolved
+/// one: `RtlpProcessHeapsInsert` allocates 0x30 bytes, links them into the list at +0 and stores
+/// the heap at +0x10 — the same on 26100.1 ARM64 and 26200 x64 (2026-09-22). What makes reading
+/// it safe is the check made on every entry rather than the offset: the heap found here has to
+/// name the entry back through its own PDB-typed `UserContext`, and an entry that is not the
+/// list's own does not get that by accident.
+const LIST_ENTRY_HEAP: u64 = 0x10;
+
+/// The offsets root discovery reads, taken out of the schema once.
+#[derive(Debug, Clone, Copy)]
+struct RootLayout {
+    number_of_heaps: u64,
+    process_heaps: u64,
+    segment_signature: u64,
+    nt_signature: u64,
+    /// Where each kind of heap names its entry on `ntdll`'s heap list, when the PDB says.
+    segment_entry: Option<u64>,
+    nt_entry: Option<u64>,
+}
+
+impl RootLayout {
+    fn of(layout: &PoolLayout) -> Result<Self, HeapQueryError> {
+        let required = |type_name: &str, field: &str| {
+            layout
+                .field(type_name, field)
+                .map(|offset| offset as u64)
+                .map_err(|error| HeapQueryError::Layout(error.to_string()))
+        };
+        let optional = |type_name: &str, field: &str| {
+            layout
+                .field(type_name, field)
+                .ok()
+                .map(|offset| offset as u64)
+        };
+        Ok(Self {
+            number_of_heaps: required("_PEB", "NumberOfHeaps")?,
+            process_heaps: required("_PEB", "ProcessHeaps")?,
+            segment_signature: required("_SEGMENT_HEAP", "Signature")?,
+            nt_signature: required("_HEAP", "Signature")?,
+            segment_entry: optional("_SEGMENT_HEAP", "UserContext"),
+            nt_entry: optional("_HEAP", "UserContext"),
+        })
+    }
+}
+
 struct RootEnumeration {
     roots: Vec<HeapRoot>,
+    /// How many roots there are, when that was known before they were all classified — the
+    /// PEB's count, on a build that keeps no heap list. A list has no count until it is walked.
     total: Option<usize>,
     budget_expired: bool,
+    /// Why roots may exist that this enumeration did not see. `None` means it saw them all.
+    unseen: Option<String>,
 }
 
 impl RootEnumeration {
-    fn expired(roots: Vec<HeapRoot>, total: Option<usize>) -> Self {
-        Self {
-            roots,
-            total,
-            budget_expired: true,
-        }
-    }
-
-    fn complete(roots: Vec<HeapRoot>, total: usize) -> Self {
-        Self {
-            roots,
-            total: Some(total),
-            budget_expired: false,
-        }
+    /// Whether a heap absent from `roots` is absent from the process, rather than unseen.
+    fn saw_every_root(&self) -> bool {
+        !self.budget_expired && self.unseen.is_none()
     }
 }
 
 fn root_read_budget_expired(
-    engine: &DebugEngine,
+    memory: &impl RootMemory,
     deadline: Option<Instant>,
 ) -> Result<bool, HeapQueryError> {
-    if engine.interrupted()? {
+    if memory.interrupted()? {
         return Err(HeapQueryError::Interrupted);
     }
     Ok(deadline.is_some_and(|deadline| Instant::now() >= deadline))
@@ -497,7 +559,7 @@ fn truncated_root_snapshot(
         |budget| format!("{budget:?} budget"),
     );
     let coverage = total.map_or_else(
-        || format!("{classified} roots classified before the PEB heap count was read"),
+        || format!("{classified} heap roots classified before their number was known"),
         |total| format!("{classified} of {total} PEB heap roots classified"),
     );
     snapshot.diagnostics.push(format!(
@@ -507,100 +569,307 @@ fn truncated_root_snapshot(
     snapshot
 }
 
-fn enumerate_roots(
-    engine: &DebugEngine,
-    layout: &PoolLayout,
-    peb: u64,
-    deadline: Option<Instant>,
-) -> Result<RootEnumeration, HeapQueryError> {
-    if root_read_budget_expired(engine, deadline)? {
-        return Ok(RootEnumeration::expired(Vec::new(), None));
+/// A walk that covered every root it was handed has still not covered the ones enumeration
+/// could not see, and says so rather than reporting itself complete.
+fn with_unseen_roots(mut snapshot: PoolSnapshot, unseen: Option<String>) -> PoolSnapshot {
+    if let Some(unseen) = unseen {
+        snapshot.complete = false;
+        snapshot.diagnostics.push(unseen);
     }
-    let count = read_u32(
-        engine,
-        peb + layout
-            .field("_PEB", "NumberOfHeaps")
-            .map_err(|error| HeapQueryError::Layout(error.to_string()))? as u64,
-    )? as usize;
+    snapshot
+}
+
+fn root(index: usize, address: u64, (kind, reason): (HeapKind, Option<String>)) -> HeapRoot {
+    HeapRoot {
+        index,
+        address,
+        kind,
+        supported: kind == HeapKind::Segment,
+        reason,
+    }
+}
+
+/// What the heap at `address` is, by its PDB-resolved signatures.
+fn classify_at(
+    memory: &impl RootMemory,
+    layout: &RootLayout,
+    address: u64,
+) -> (HeapKind, Option<String>) {
+    if address == 0 {
+        return (HeapKind::Unknown, Some("null heap root".into()));
+    }
+    if !user_pointer(address) {
+        return (
+            HeapKind::Unknown,
+            Some("heap root is outside the x64 user address range".into()),
+        );
+    }
+    let (segment, nt) = read_root_signatures(
+        memory,
+        address,
+        layout.segment_signature,
+        layout.nt_signature,
+    );
+    classify_root(segment, nt)
+}
+
+/// Where `heap` names its entry on `ntdll`'s heap list. `Ok(None)` is a heap naming none: a PDB
+/// without the field, or a null one — a build that keeps no list.
+fn list_entry_of(
+    memory: &impl RootMemory,
+    layout: &RootLayout,
+    heap: u64,
+    kind: HeapKind,
+) -> Result<Option<u64>, String> {
+    let offset = match kind {
+        HeapKind::Segment => layout.segment_entry,
+        HeapKind::Nt => layout.nt_entry,
+        HeapKind::Unknown | HeapKind::Unreadable => {
+            return Err(format!(
+                "heap {heap:#x} is neither a Segment nor an NT heap, so where it names its entry \
+                 is not known"
+            ));
+        }
+    };
+    let Some(offset) = offset else {
+        return Ok(None);
+    };
+    match read_u64(memory, heap.saturating_add(offset)) {
+        Ok(0) => Ok(None),
+        Ok(entry) => Ok(Some(entry)),
+        Err(error) => Err(format!(
+            "cannot read where heap {heap:#x} names its entry: {error}"
+        )),
+    }
+}
+
+/// The PEB's `ProcessHeaps`, which on a build keeping `ntdll`'s heap list names the process heap
+/// alone: `RtlpProcessHeapsInsert` writes the array for the first heap and never again.
+fn peb_heaps(
+    memory: &impl RootMemory,
+    layout: &RootLayout,
+    peb: u64,
+) -> Result<Vec<u64>, HeapQueryError> {
+    let count = read_u32(memory, peb + layout.number_of_heaps)? as usize;
     if count > MAX_PROCESS_HEAPS {
         return Err(HeapQueryError::InvalidPeb(format!(
             "NumberOfHeaps is {count}, maximum is {MAX_PROCESS_HEAPS}"
         )));
     }
-    if root_read_budget_expired(engine, deadline)? {
-        return Ok(RootEnumeration::expired(Vec::new(), Some(count)));
-    }
-    let array = read_u64(
-        engine,
-        peb + layout
-            .field("_PEB", "ProcessHeaps")
-            .map_err(|error| HeapQueryError::Layout(error.to_string()))? as u64,
-    )?;
+    let array = read_u64(memory, peb + layout.process_heaps)?;
     if count != 0 && array == 0 {
         return Err(HeapQueryError::InvalidPeb(
             "ProcessHeaps is null while NumberOfHeaps is nonzero".into(),
         ));
     }
     if count == 0 {
-        return Ok(RootEnumeration::complete(Vec::new(), 0));
+        return Ok(Vec::new());
     }
     if !user_pointer(array) {
         return Err(HeapQueryError::InvalidPeb(format!(
             "ProcessHeaps {array:#x} is outside the x64 user address range"
         )));
     }
-    if root_read_budget_expired(engine, deadline)? {
-        return Ok(RootEnumeration::expired(Vec::new(), Some(count)));
+    Ok(memory
+        .read(array, count.saturating_mul(8))?
+        .chunks_exact(8)
+        .map(|entry| {
+            u64::from_le_bytes(
+                entry
+                    .try_into()
+                    .expect("ProcessHeaps is read as a whole number of pointer-sized entries"),
+            )
+        })
+        .collect())
+}
+
+/// Every heap root in the process: the heaps on `ntdll`'s process heap list, in its order —
+/// which is the order `GetProcessHeaps` returns them in — then any the PEB names that the list
+/// did not hold.
+///
+/// **The PEB is not the list, and has not been since at least 26100.** Its `ProcessHeaps` holds
+/// the process heap and nothing else, so a `HeapCreate` return value is absent from it while
+/// `GetProcessHeaps` returns it: measured 2026-09-22 on a live ARM64 26100.1 process holding
+/// three heaps against a PEB naming one, and on two x64 26200 dumps whose list head links two
+/// entries against a PEB naming one. Walking the PEB alone listed every such process as having
+/// one heap and called the answer complete.
+///
+/// The list is reached through the process heap, which names its entry in `UserContext`, rather
+/// than through the list head's symbol: 26200's public PDB names the head
+/// (`ntdll!RtlpProcessHeaps`) and 26100.1 ARM64's does not, while both carry the typed field.
+/// Every entry is checked rather than trusted — its heap has to name it back, and its `Blink`
+/// has to be the entry before it — and exactly one entry, the head, lies inside `ntdll`. A build
+/// whose process heap names no entry keeps no list, and its PEB array is the whole answer, as it
+/// was for every release before this one. Anything else the walk cannot follow is reported as
+/// unseen rather than absent.
+fn enumerate_roots(
+    memory: &impl RootMemory,
+    layout: &RootLayout,
+    peb: u64,
+    ntdll: Range<u64>,
+    deadline: Option<Instant>,
+) -> Result<RootEnumeration, HeapQueryError> {
+    let mut found = RootEnumeration {
+        roots: Vec::new(),
+        total: None,
+        budget_expired: false,
+        unseen: None,
+    };
+    if root_read_budget_expired(memory, deadline)? {
+        found.budget_expired = true;
+        return Ok(found);
     }
-    let bytes = engine.read_memory(array, count.saturating_mul(8))?;
-    let segment_offset = layout
-        .field("_SEGMENT_HEAP", "Signature")
-        .map_err(|error| HeapQueryError::Layout(error.to_string()))?
-        as u64;
-    let nt_offset = layout
-        .field("_HEAP", "Signature")
-        .map_err(|error| HeapQueryError::Layout(error.to_string()))? as u64;
-    let mut roots = Vec::with_capacity(count);
-    for (index, entry) in bytes.chunks_exact(8).enumerate() {
-        let address = u64::from_le_bytes(
-            entry
-                .try_into()
-                .expect("ProcessHeaps is read as a whole number of pointer-sized entries"),
-        );
-        if address == 0 {
-            roots.push(HeapRoot {
-                index,
-                address,
-                kind: HeapKind::Unknown,
-                supported: false,
-                reason: Some("null heap root".into()),
-            });
+    let named = peb_heaps(memory, layout, peb)?;
+    let listed = match named.first() {
+        Some(&process_heap) => {
+            follow_heap_list(memory, layout, process_heap, &ntdll, deadline, &mut found)?
+        }
+        None => false,
+    };
+    if found.budget_expired {
+        return Ok(found);
+    }
+    if !listed {
+        found.total = Some(named.len());
+    }
+    let on_list: HashSet<u64> = found.roots.iter().map(|root| root.address).collect();
+    for address in named {
+        if on_list.contains(&address) {
             continue;
         }
-        if !user_pointer(address) {
-            roots.push(HeapRoot {
-                index,
-                address,
-                kind: HeapKind::Unknown,
-                supported: false,
-                reason: Some("heap root is outside the x64 user address range".into()),
-            });
-            continue;
+        if root_read_budget_expired(memory, deadline)? {
+            found.budget_expired = true;
+            return Ok(found);
         }
-        if root_read_budget_expired(engine, deadline)? {
-            return Ok(RootEnumeration::expired(roots, Some(count)));
-        }
-        let (segment, nt) = read_root_signatures(engine, address, segment_offset, nt_offset);
-        let (kind, reason) = classify_root(segment, nt);
-        roots.push(HeapRoot {
-            index,
-            address,
-            kind,
-            supported: kind == HeapKind::Segment,
-            reason,
-        });
+        let index = found.roots.len();
+        found
+            .roots
+            .push(root(index, address, classify_at(memory, layout, address)));
     }
-    Ok(RootEnumeration::complete(roots, count))
+    Ok(found)
+}
+
+/// Follow `ntdll`'s heap list from the process heap's own entry, adding each heap on it to
+/// `found`. Answers whether there was a list to follow; `false` leaves the PEB as the answer.
+fn follow_heap_list(
+    memory: &impl RootMemory,
+    layout: &RootLayout,
+    process_heap: u64,
+    ntdll: &Range<u64>,
+    deadline: Option<Instant>,
+    found: &mut RootEnumeration,
+) -> Result<bool, HeapQueryError> {
+    if layout.segment_entry.is_none() && layout.nt_entry.is_none() {
+        return Ok(false);
+    }
+    if root_read_budget_expired(memory, deadline)? {
+        found.budget_expired = true;
+        return Ok(true);
+    }
+    let (kind, _) = classify_at(memory, layout, process_heap);
+    let start = match list_entry_of(memory, layout, process_heap, kind) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return Ok(false),
+        Err(why) => {
+            found.unseen = Some(format!(
+                "the process heap could not say where ntdll's heap list is ({why}), so heaps the \
+                 PEB does not name are unknown, not absent"
+            ));
+            return Ok(true);
+        }
+    };
+    let broken = |entry: u64, why: String| {
+        format!(
+            "ntdll's heap list could not be followed past {entry:#x}: {why}; heaps after it are \
+             unknown, not absent"
+        )
+    };
+    let mut visited = HashSet::new();
+    let mut heads = Vec::new();
+    let mut entry = start;
+    let mut previous = None;
+    let mut first_blink = 0;
+    loop {
+        if root_read_budget_expired(memory, deadline)? {
+            found.budget_expired = true;
+            return Ok(true);
+        }
+        if !visited.insert(entry) {
+            found.unseen = Some(broken(
+                entry,
+                format!("the list comes back to it without returning to {start:#x}"),
+            ));
+            return Ok(true);
+        }
+        let links = match memory.read(entry, 0x18) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                found.unseen = Some(broken(entry, format!("the entry cannot be read: {error}")));
+                return Ok(true);
+            }
+        };
+        let word = |index: usize| {
+            u64::from_le_bytes(
+                links[index * 8..index * 8 + 8]
+                    .try_into()
+                    .expect("an entry is read as three whole pointers"),
+            )
+        };
+        let (flink, blink, heap) = (word(0), word(1), word(LIST_ENTRY_HEAP as usize / 8));
+        match previous {
+            None => first_blink = blink,
+            Some(previous) if blink != previous => {
+                found.unseen = Some(broken(
+                    entry,
+                    format!("it links back to {blink:#x} rather than to {previous:#x}"),
+                ));
+                return Ok(true);
+            }
+            Some(_) => {}
+        }
+        if ntdll.contains(&entry) {
+            heads.push(entry);
+        } else {
+            let classified = classify_at(memory, layout, heap);
+            let named = match list_entry_of(memory, layout, heap, classified.0) {
+                Ok(Some(named)) if named == entry => None,
+                Ok(Some(named)) => Some(format!("names {named:#x} instead")),
+                Ok(None) => Some("names no entry".into()),
+                Err(why) => Some(why),
+            };
+            if let Some(why) = named {
+                found.unseen = Some(broken(
+                    entry,
+                    format!("it stands for heap {heap:#x}, which {why}"),
+                ));
+                return Ok(true);
+            }
+            let index = found.roots.len();
+            found.roots.push(root(index, heap, classified));
+        }
+        previous = Some(entry);
+        entry = flink;
+        if entry == start {
+            break;
+        }
+    }
+    if Some(first_blink) != previous {
+        found.unseen = Some(broken(
+            start,
+            format!(
+                "the first entry links back to {first_blink:#x} rather than to the last, {:#x}",
+                previous.unwrap_or_default()
+            ),
+        ));
+    } else if heads.len() != 1 {
+        found.unseen = Some(format!(
+            "the heap list followed from the process heap has {} entries inside ntdll where a list \
+             has exactly one head, so it is not the list this walker knows; heaps it did not \
+             reach are unknown, not absent",
+            heads.len()
+        ));
+    }
+    Ok(true)
 }
 
 fn scope_of(roots: &[HeapRoot]) -> HeapScope {
@@ -773,16 +1042,29 @@ fn walk_snapshot(
         return Ok(snapshot);
     }
 
-    // The absolute deadline keeps schema resolution and PEB enumeration inside the caller's
+    // The absolute deadline keeps schema resolution and root enumeration inside the caller's
     // one budget. An unrepresentably large duration has the same unbounded meaning as the
     // shared walker gives it.
     let deadline = walk.budget.and_then(|budget| started.checked_add(budget));
+    let ntdll = schema.image.base
+        ..schema
+            .image
+            .base
+            .saturating_add(u64::from(schema.image.size));
+    let enumeration = enumerate_roots(
+        engine,
+        &RootLayout::of(&schema.layout)?,
+        target.peb,
+        ntdll,
+        deadline,
+    )?;
+    let mut scope = scope_for(&enumeration.roots, heap, enumeration.saw_every_root())?;
     let RootEnumeration {
         roots,
         total,
         budget_expired,
-    } = enumerate_roots(engine, &schema.layout, target.peb, deadline)?;
-    let mut scope = scope_for(&roots, heap, !budget_expired)?;
+        unseen,
+    } = enumeration;
     let pool = if budget_expired {
         // These roots were identified but no allocator region was walked after the deadline.
         scope.segment_heaps_walked.clear();
@@ -791,7 +1073,7 @@ fn walk_snapshot(
         let remaining = walk
             .budget
             .map(|budget| budget.saturating_sub(started.elapsed()));
-        walk_user_segment_heaps(
+        let walked = walk_user_segment_heaps(
             engine,
             &schema.layout,
             target.peb,
@@ -802,7 +1084,8 @@ fn walk_snapshot(
         .map_err(|error| match error {
             SnapshotError::Interrupted => HeapQueryError::Interrupted,
             other => HeapQueryError::Walk(other.to_string()),
-        })?
+        })?;
+        with_unseen_roots(walked, unseen)
     };
     let (allocations, report, diagnostics) = from_pool_snapshot(pool);
     let snapshot = HeapSnapshot {
@@ -1187,6 +1470,302 @@ mod tests {
         assert!(diagnostics.examples[0].contains("2s budget"));
         assert!(diagnostics.examples[0].contains("3 of 12 PEB heap roots classified"));
         assert!(diagnostics.examples[0].contains("unknown, not absent"));
+    }
+
+    /// A process for root discovery, byte by byte, so a fixture can be laid out the way a
+    /// measurement found one and a test can then break exactly one thing in it.
+    #[derive(Default)]
+    struct Process {
+        bytes: HashMap<u64, u8>,
+        interrupted: bool,
+    }
+
+    impl Process {
+        fn put(&mut self, address: u64, bytes: &[u8]) {
+            for (offset, &byte) in bytes.iter().enumerate() {
+                self.bytes.insert(address + offset as u64, byte);
+            }
+        }
+
+        fn put_u64(&mut self, address: u64, value: u64) {
+            self.put(address, &value.to_le_bytes());
+        }
+
+        fn forget(&mut self, address: u64, size: u64) {
+            for offset in 0..size {
+                self.bytes.remove(&(address + offset));
+            }
+        }
+
+        /// A heap of `kind` naming `entry` as its place on the list, at the measured offsets.
+        fn heap(&mut self, address: u64, kind: HeapKind, entry: u64) {
+            let layout = measured_layout();
+            self.put(address, &[0; 0x190]);
+            let (signature, named_at) = match kind {
+                HeapKind::Segment => (
+                    (layout.segment_signature, SEGMENT_HEAP_SIGNATURE),
+                    layout.segment_entry,
+                ),
+                _ => ((layout.nt_signature, NT_HEAP_SIGNATURE), layout.nt_entry),
+            };
+            self.put(address + signature.0, &signature.1.to_le_bytes());
+            self.put_u64(address + named_at.unwrap(), entry);
+        }
+    }
+
+    impl RootMemory for Process {
+        fn read(&self, address: u64, size: usize) -> Result<Vec<u8>, DbgEngError> {
+            (0..size)
+                .map(|offset| {
+                    self.bytes.get(&(address + offset as u64)).copied().ok_or(
+                        DbgEngError::ShortRead {
+                            address,
+                            requested: size,
+                            actual: offset,
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        fn interrupted(&self) -> Result<bool, DbgEngError> {
+            Ok(self.interrupted)
+        }
+    }
+
+    // The process measured on 2026-09-22: `user_heap_smoke`'s child on ARM64 26100.1, stopped at
+    // its `DebugBreak` after `HeapCreate(HEAP_CREATE_SEGMENT_HEAP)`. The addresses and offsets
+    // are that process's own.
+    const PEB: u64 = 0x3e_0cbf_f000;
+    /// `ntdll!RtlpPebHeapListStaticBuffer`, which is what the PEB's `ProcessHeaps` points at.
+    const PEB_ARRAY: u64 = 0x7ffe_77e9_d5a0;
+    /// The list head: a static in `ntdll`'s data with no public symbol on this build.
+    const LIST_HEAD: u64 = 0x7ffe_77e9_3440;
+    const NTDLL: Range<u64> = 0x7ffe_77b0_0000..0x7ffe_77f0_0000;
+    const PROCESS_HEAP: u64 = 0x1a0_4700_0000;
+    const NT_HEAP: u64 = 0x1a0_4619_0000;
+    /// The heap the child created, which the PEB does not name and `GetProcessHeaps` returns.
+    const CREATED_HEAP: u64 = 0x1a0_4740_0000;
+    const ENTRIES: [u64; 3] = [0x1a0_4710_2040, 0x1a0_4711_3100, 0x1a0_4713_6920];
+
+    fn measured_layout() -> RootLayout {
+        RootLayout {
+            number_of_heaps: 0xe8,
+            process_heaps: 0xf0,
+            segment_signature: 0x10,
+            nt_signature: 0x98,
+            segment_entry: Some(0x38),
+            nt_entry: Some(0x188),
+        }
+    }
+
+    fn measured_process() -> Process {
+        let mut process = Process::default();
+        process.put(PEB + 0xe8, &1u32.to_le_bytes());
+        process.put_u64(PEB + 0xf0, PEB_ARRAY);
+        process.put_u64(PEB_ARRAY, PROCESS_HEAP);
+        let heaps = [
+            (PROCESS_HEAP, HeapKind::Segment),
+            (NT_HEAP, HeapKind::Nt),
+            (CREATED_HEAP, HeapKind::Segment),
+        ];
+        for (&(heap, kind), &entry) in heaps.iter().zip(&ENTRIES) {
+            process.heap(heap, kind, entry);
+            process.put_u64(entry + LIST_ENTRY_HEAP, heap);
+        }
+        let ring = [LIST_HEAD, ENTRIES[0], ENTRIES[1], ENTRIES[2]];
+        for (position, &entry) in ring.iter().enumerate() {
+            process.put_u64(entry, ring[(position + 1) % ring.len()]);
+            process.put_u64(entry + 8, ring[(position + ring.len() - 1) % ring.len()]);
+        }
+        process.put_u64(LIST_HEAD + LIST_ENTRY_HEAP, 0);
+        process
+    }
+
+    fn enumerate(process: &Process, layout: RootLayout, ntdll: Range<u64>) -> RootEnumeration {
+        enumerate_roots(process, &layout, PEB, ntdll, None).unwrap()
+    }
+
+    fn addresses(found: &RootEnumeration) -> Vec<u64> {
+        found.roots.iter().map(|root| root.address).collect()
+    }
+
+    fn unseen(found: &RootEnumeration) -> &str {
+        assert!(!found.saw_every_root());
+        let unseen = found
+            .unseen
+            .as_deref()
+            .expect("an enumeration that could not see every root said nothing about it");
+        assert!(unseen.contains("unknown, not absent"), "{unseen}");
+        unseen
+    }
+
+    /// The item this exists for (`windbg-mcp` `FOLLOWUPS.md` item 79): the PEB names one heap,
+    /// the process has three, and a heap from `HeapCreate` is among the two it does not name.
+    #[test]
+    fn test_every_heap_on_ntdlls_list_is_a_root_not_only_the_one_the_peb_names() {
+        let found = enumerate(&measured_process(), measured_layout(), NTDLL);
+
+        assert_eq!(addresses(&found), [PROCESS_HEAP, NT_HEAP, CREATED_HEAP]);
+        let kinds: Vec<_> = found.roots.iter().map(|root| root.kind).collect();
+        assert_eq!(kinds, [HeapKind::Segment, HeapKind::Nt, HeapKind::Segment]);
+        let indices: Vec<_> = found.roots.iter().map(|root| root.index).collect();
+        assert_eq!(
+            indices,
+            [0, 1, 2],
+            "an index is a position in the list's own order"
+        );
+        assert!(found.saw_every_root(), "{:?}", found.unseen);
+        assert_eq!(
+            found.total, None,
+            "a list has no count to report before it is walked"
+        );
+    }
+
+    /// A build whose process heap names no entry keeps no list, and gets exactly the answer every
+    /// release before this one gave it — the PEB, with its count, null rows included.
+    #[test]
+    fn test_a_build_keeping_no_list_answers_from_the_peb_as_before() {
+        let mut named = measured_process();
+        named.put(PEB + 0xe8, &2u32.to_le_bytes());
+        named.put_u64(PEB_ARRAY + 8, 0);
+        let no_field = RootLayout {
+            segment_entry: None,
+            nt_entry: None,
+            ..measured_layout()
+        };
+        let mut null_entry = measured_process();
+        null_entry.put(PEB + 0xe8, &2u32.to_le_bytes());
+        null_entry.put_u64(PEB_ARRAY + 8, 0);
+        null_entry.put_u64(PROCESS_HEAP + 0x38, 0);
+
+        for found in [
+            enumerate(&named, no_field, NTDLL),
+            enumerate(&null_entry, measured_layout(), NTDLL),
+        ] {
+            assert_eq!(addresses(&found), [PROCESS_HEAP, 0]);
+            assert_eq!(found.roots[1].reason.as_deref(), Some("null heap root"));
+            assert_eq!(found.total, Some(2));
+            assert!(found.saw_every_root(), "{:?}", found.unseen);
+        }
+    }
+
+    /// An entry is believed only if its heap names it back — the check that makes reading an
+    /// untyped offset safe. What the walk listed before the break stays listed.
+    #[test]
+    fn test_an_entry_its_heap_does_not_name_back_leaves_the_rest_unseen() {
+        let mut process = measured_process();
+        process.put_u64(NT_HEAP + 0x188, 0x1a0_4799_0000);
+
+        let found = enumerate(&process, measured_layout(), NTDLL);
+
+        assert_eq!(addresses(&found), [PROCESS_HEAP]);
+        let unseen = unseen(&found);
+        assert!(unseen.contains(&format!("{:#x}", ENTRIES[1])), "{unseen}");
+    }
+
+    #[test]
+    fn test_an_entry_that_does_not_link_back_leaves_the_rest_unseen() {
+        let mut process = measured_process();
+        process.put_u64(ENTRIES[2] + 8, ENTRIES[0]);
+
+        let found = enumerate(&process, measured_layout(), NTDLL);
+
+        assert_eq!(addresses(&found), [PROCESS_HEAP, NT_HEAP]);
+        unseen(&found);
+    }
+
+    #[test]
+    fn test_an_unreadable_entry_leaves_the_rest_unseen() {
+        let mut process = measured_process();
+        process.forget(ENTRIES[1], 0x18);
+
+        let found = enumerate(&process, measured_layout(), NTDLL);
+
+        assert_eq!(addresses(&found), [PROCESS_HEAP]);
+        unseen(&found);
+    }
+
+    #[test]
+    fn test_a_list_that_loops_short_of_where_it_started_is_unseen() {
+        let mut process = measured_process();
+        process.put_u64(ENTRIES[2], ENTRIES[1]);
+
+        let found = enumerate(&process, measured_layout(), NTDLL);
+
+        assert_eq!(addresses(&found), [PROCESS_HEAP, NT_HEAP, CREATED_HEAP]);
+        unseen(&found);
+    }
+
+    /// Exactly one entry is the head, and it is the one inside `ntdll`. A ring read with the
+    /// wrong image — none of it inside, or all of it — is not the list this walker knows.
+    #[test]
+    fn test_a_list_is_trusted_only_with_exactly_one_head_inside_ntdll() {
+        let outside = enumerate(&measured_process(), measured_layout(), 0..0x1000);
+        assert_eq!(addresses(&outside), [PROCESS_HEAP, NT_HEAP, CREATED_HEAP]);
+        unseen(&outside);
+
+        let everything = enumerate(&measured_process(), measured_layout(), 0..u64::MAX);
+        assert_eq!(
+            addresses(&everything),
+            [PROCESS_HEAP],
+            "no entry was a heap's, so only the PEB's root is known"
+        );
+        unseen(&everything);
+    }
+
+    /// A process heap that cannot be read cannot say whether there is a list, so what the PEB
+    /// does not name is unknown — on a dump without heap pages, that is every other heap.
+    #[test]
+    fn test_a_process_heap_that_cannot_be_read_leaves_the_rest_unseen() {
+        let mut process = measured_process();
+        process.forget(PROCESS_HEAP, 0x190);
+
+        let found = enumerate(&process, measured_layout(), NTDLL);
+
+        assert_eq!(addresses(&found), [PROCESS_HEAP]);
+        assert_eq!(found.roots[0].kind, HeapKind::Unreadable);
+        assert!(unseen(&found).contains("process heap"));
+    }
+
+    #[test]
+    fn test_root_enumeration_honours_an_interrupt_and_a_deadline() {
+        let mut process = measured_process();
+        process.interrupted = true;
+        assert!(matches!(
+            enumerate_roots(&process, &measured_layout(), PEB, NTDLL, None),
+            Err(HeapQueryError::Interrupted)
+        ));
+
+        let found = enumerate_roots(
+            &measured_process(),
+            &measured_layout(),
+            PEB,
+            NTDLL,
+            Some(Instant::now()),
+        )
+        .unwrap();
+        assert!(found.budget_expired);
+        assert!(!found.saw_every_root());
+    }
+
+    /// Roots enumeration could not see make a walk of every root it did see partial, rather than
+    /// letting it report itself complete.
+    #[test]
+    fn test_unseen_roots_make_a_complete_walk_partial() {
+        let complete = || PoolSnapshot {
+            complete: true,
+            ..PoolSnapshot::default()
+        };
+
+        let (_, walk, _) = from_pool_snapshot(with_unseen_roots(complete(), None));
+        assert_eq!(walk.coverage, WalkCoverage::Complete);
+
+        let unseen = "ntdll's heap list could not be followed; unknown, not absent".to_string();
+        let (_, walk, diagnostics) =
+            from_pool_snapshot(with_unseen_roots(complete(), Some(unseen.clone())));
+        assert_eq!(walk.coverage, WalkCoverage::Partial);
+        assert_eq!(diagnostics.examples, [unseen]);
     }
 
     #[test]

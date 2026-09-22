@@ -339,6 +339,16 @@ const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
     ("_HEAP_LARGE_ALLOC_DATA", "UnusedBytes", &["UnusedBytes"]),
 ];
 
+/// Where a heap keeps its entry on `ntdll`'s process heap list, which is where heap roots come
+/// from on a build that keeps one (`crate::heap`). Resolved for the **user** schema only: the
+/// kernel's `_SEGMENT_HEAP` carries the field too, and reading it there would move every kernel
+/// fingerprint for a fact the pool walker never uses. Optional because a build that predates the
+/// list need not have it, and such a build's PEB array is the whole answer.
+const USER_OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
+    ("_SEGMENT_HEAP", "UserContext", &["UserContext"]),
+    ("_HEAP", "UserContext", &["UserContext"]),
+];
+
 const USER_TYPES: &[TypeSpec] = &[
     TypeSpec {
         name: "_PEB",
@@ -395,8 +405,9 @@ fn apply_optional_fields(
     symbols: &impl Symbols,
     module: u64,
     types: &mut HashMap<&'static str, TypeLayout>,
+    table: &[(&'static str, &'static str, &[&str])],
 ) -> Result<(), LayoutError> {
-    for &(type_name, canonical, aliases) in OPTIONAL_FIELDS {
+    for &(type_name, canonical, aliases) in table {
         let Some(layout) = types.get_mut(type_name) else {
             continue;
         };
@@ -556,7 +567,7 @@ impl AllocatorSchema {
                 Err(error) => return Err(error),
             }
         }
-        apply_optional_fields(symbols, key.image.base, &mut types)?;
+        apply_optional_fields(symbols, key.image.base, &mut types, OPTIONAL_FIELDS)?;
         Ok(Self {
             key,
             globals,
@@ -605,7 +616,8 @@ impl AllocatorSchema {
                 Err(error) => return Err(error),
             }
         }
-        apply_optional_fields(symbols, key.image.base, &mut types)?;
+        apply_optional_fields(symbols, key.image.base, &mut types, OPTIONAL_FIELDS)?;
+        apply_optional_fields(symbols, key.image.base, &mut types, USER_OPTIONAL_FIELDS)?;
         if !types
             .get("_SEGMENT_HEAP")
             .is_some_and(|layout| layout.fields.contains_key("Signature"))
@@ -899,8 +911,10 @@ mod tests {
             }
 
             if self.optional_fields
-                && let Some(&(_, canonical, aliases)) =
-                    OPTIONAL_FIELDS.iter().find(|(type_name, _, aliases)| {
+                && let Some(&(_, canonical, aliases)) = OPTIONAL_FIELDS
+                    .iter()
+                    .chain(USER_OPTIONAL_FIELDS)
+                    .find(|(type_name, _, aliases)| {
                         *type_name == spec.name && aliases.contains(&name)
                     })
             {
@@ -1280,6 +1294,41 @@ mod tests {
             missing_item(PoolLayout::resolve_user(&FakeSymbols::default(), key(),)),
             "_SEGMENT_HEAP.Signature"
         );
+    }
+
+    /// Where a heap names its entry on `ntdll`'s heap list is read for the user schema only, and
+    /// its absence refuses nothing.
+    ///
+    /// The kernel's `_SEGMENT_HEAP` carries `UserContext` too, so a shared table would put it in
+    /// every kernel fingerprint — moving the digests pinned above for a field the pool walker
+    /// never reads. And a PDB without it is a build whose PEB array is the whole answer, so it
+    /// resolves rather than refusing the heap tools.
+    #[test]
+    fn test_the_heap_list_entry_is_a_user_field_and_an_optional_one() {
+        let symbols = FakeSymbols {
+            optional_fields: true,
+            ..FakeSymbols::default()
+        };
+        let user = PoolLayout::resolve_user(&symbols, key()).unwrap();
+        assert!(user.field("_SEGMENT_HEAP", "UserContext").is_ok());
+        assert!(user.field("_HEAP", "UserContext").is_ok());
+
+        let kernel = PoolLayout::resolve(&symbols, key()).unwrap();
+        assert!(
+            kernel.field("_SEGMENT_HEAP", "UserContext").is_err(),
+            "the kernel schema read a user-only field, which moves every kernel fingerprint"
+        );
+
+        let without = PoolLayout::resolve_user(
+            &FakeSymbols {
+                optional_fields: true,
+                missing_fields: &[("_SEGMENT_HEAP", "UserContext"), ("_HEAP", "UserContext")],
+                ..FakeSymbols::default()
+            },
+            key(),
+        )
+        .unwrap();
+        assert!(without.field("_SEGMENT_HEAP", "UserContext").is_err());
     }
 
     #[test]
