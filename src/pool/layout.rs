@@ -3,7 +3,7 @@ use std::sync::{Mutex, OnceLock};
 
 use thiserror::Error;
 
-use super::decode::PoolHeaderLayout;
+use super::decode::{LfhBitmap, PoolHeaderLayout};
 use crate::allocator::{LayoutProvenance, VsSemanticFamily, fingerprint};
 use crate::dbgeng::{DbgEngError, DebugEngine, KernelImage, ModuleIdentity};
 
@@ -497,6 +497,17 @@ const SLOT_BACK_REFERENCES: &[&str] = &["VsContextOffset", "VsContext"];
 impl AllocatorSchema {
     pub(crate) fn is_user(&self) -> bool {
         !self.globals.contains_key("ExPoolState") && self.globals.contains_key("RtlpHpHeapGlobals")
+    }
+
+    /// How this schema's allocator packs an LFH block bitmap: `ntdll` and `nt` differ, and
+    /// nothing in either PDB says so. The kernel's reading is not yet `nt`'s own; see
+    /// [`LfhBitmap::AdjacentPairs`].
+    pub(crate) fn lfh_bitmap(&self) -> LfhBitmap {
+        if self.is_user() {
+            LfhBitmap::SplitWord
+        } else {
+            LfhBitmap::AdjacentPairs
+        }
     }
 
     pub(crate) fn type_layout(&self, name: &str) -> Result<&TypeLayout, LayoutError> {
@@ -1077,6 +1088,8 @@ mod tests {
 
         assert!(!kernel.is_user());
         assert!(user.is_user());
+        assert_eq!(kernel.lfh_bitmap(), LfhBitmap::AdjacentPairs);
+        assert_eq!(user.lfh_bitmap(), LfhBitmap::SplitWord);
         assert!(
             symbols.resolutions.get() > resolved_after_kernel,
             "one image key may not alias two module-specific resolver modes"

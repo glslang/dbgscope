@@ -53,7 +53,8 @@ see [Unknown, not absent](docs/unknown-not-absent.md).
   `snapshot_report` — every answer paired with the coverage of the walk it came from.
 - **User-mode Segment Heap walking** (`heap`): version-aware queries over the same page-segment,
   LFH, VS and backend decoding, because the two allocators are the same machinery either side of
-  the ring boundary.
+  the ring boundary — nearly: `ntdll` and `nt` pack an LFH block bitmap differently. x64 and
+  ARM64 processes, including x64 emulated on ARM64; a WoW64 process is refused.
 - **A WinDbg extension**, `!dbgscope.poolmap`, over the same walker and the same caches, so the
   interactive and programmatic entry points cannot drift apart.
 
@@ -207,8 +208,8 @@ ordinary four-byte tag `0x2e`.
 ## Requirements
 
 - Windows x86_64 or Windows ARM64. The crate calls Windows APIs directly with no `#[cfg]`
-  gating and is not designed to build elsewhere; pool *walking* is x64-only, because the
-  allocator encodings it consults are.
+  gating and is not designed to build elsewhere. Heap walking takes x64 and ARM64 processes;
+  pool *walking* is x64-only until the kernel's side has been checked against an ARM64 pool.
 - Rust 1.88 or later (let-chains, used in the pool walker); nightly for Miri.
 - MSVC build tools.
 - Optional: `cargo nextest` as the local test runner.
@@ -303,7 +304,7 @@ Per-session paged heaps are outside the initial pool-map scope, and the command 
 | `examples/scope_restore.rs` | Re-validates scope save/restore against a dump. |
 | `examples/split_open.rs` | Re-validates the two-step openers, including a guard dropped before the engine is pumped. |
 | `examples/typed_context.rs` | Typed reads next to the debugger's own text for the same state. |
-| `examples/user_heap_smoke.rs` | Launches a child, allocates across size regimes, walks its Segment Heap. |
+| `examples/user_heap_smoke.rs` | Launches a child, allocates across size regimes, walks its Segment Heap and checks it against the child's own `HeapWalk`. |
 | `examples/register_description.rs` | The full register description, not one flag of it. |
 
 ## Building

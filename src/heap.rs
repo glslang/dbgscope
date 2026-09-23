@@ -13,7 +13,9 @@ use thiserror::Error;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_STATUS_BREAK, DEBUG_STATUS_NO_DEBUGGEE,
 };
-use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
+use windows::Win32::System::SystemInformation::{
+    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64,
+};
 
 use crate::allocator::LayoutProvenance;
 use crate::dbgeng::{DbgEngError, DebugEngine, KernelImage};
@@ -213,8 +215,19 @@ pub enum HeapQueryError {
         "the target is not stopped (execution status {status:#x}); break in before walking heaps"
     )]
     TargetRunning { status: u32 },
-    #[error("heap walking supports x64 targets only (machine {machine:#x})")]
+    #[error("heap walking supports x64 and ARM64 targets only (machine {machine:#x})")]
     UnsupportedArchitecture { machine: u32 },
+    /// The current thread's TEB names a 32-bit one beside it. The heaps the PEB and `ntdll`
+    /// know about are then the 64-bit emulation layer's, and the program's own are 32-bit
+    /// structures this walker does not decode.
+    #[error(
+        "heap walking does not support a WoW64 process (_TEB.WowTebOffset is \
+         {wow_teb_offset}): its own heaps are 32-bit, and the 64-bit heaps beside them are the \
+         emulation layer's"
+    )]
+    Wow64Process { wow_teb_offset: i32 },
+    #[error("invalid TEB: {0}")]
+    InvalidTeb(String),
     #[error("invalid PEB heap metadata: {0}")]
     InvalidPeb(String),
     #[error("heap selector {heap:#x} is not a supported Segment Heap root of the current process")]
@@ -405,6 +418,7 @@ fn read_u64(memory: &impl RootMemory, address: u64) -> Result<u64, DbgEngError> 
     ))
 }
 
+/// The same 128 TiB user half on x64 and ARM64.
 fn user_pointer(address: u64) -> bool {
     (0x1_0000..0x0000_8000_0000_0000).contains(&address)
 }
@@ -601,7 +615,7 @@ fn classify_at(
     if !user_pointer(address) {
         return (
             HeapKind::Unknown,
-            Some("heap root is outside the x64 user address range".into()),
+            Some("heap root is outside the user address range".into()),
         );
     }
     let (segment, nt) = read_root_signatures(
@@ -667,7 +681,7 @@ fn peb_heaps(
     }
     if !user_pointer(array) {
         return Err(HeapQueryError::InvalidPeb(format!(
-            "ProcessHeaps {array:#x} is outside the x64 user address range"
+            "ProcessHeaps {array:#x} is outside the user address range"
         )));
     }
     Ok(memory
@@ -960,8 +974,16 @@ fn validate_target(engine: &DebugEngine) -> Result<ValidatedTarget, HeapQueryErr
         DEBUG_STATUS_BREAK => {}
         status => return Err(HeapQueryError::TargetRunning { status }),
     }
+    // The physical processor, not the one the engine is rendering for: it is what fixes a
+    // pointer's width. An x64 process emulated on ARM64 is `0xaa64` here and ARM64EC to the
+    // engine, and its heaps are the ARM64X `ntdll`'s like a native process's (2026-09-23). What
+    // this cannot see is WoW64, which reads the same as a native process on both machines —
+    // `refuse_wow64` is the check for that.
     let machine = engine.processor_type()?;
-    if machine != u32::from(IMAGE_FILE_MACHINE_AMD64.0) {
+    if ![IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64]
+        .iter()
+        .any(|supported| u32::from(supported.0) == machine)
+    {
         return Err(HeapQueryError::UnsupportedArchitecture { machine });
     }
     let peb = engine.current_process_peb()?;
@@ -976,6 +998,58 @@ fn validate_target(engine: &DebugEngine) -> Result<ValidatedTarget, HeapQueryErr
         peb,
         generation: crate::pool::query::generation(),
     })
+}
+
+/// Refuses a WoW64 process, by the one field that says so at every stop.
+///
+/// Neither processor type does. The physical one is the host's, and the effective one is still
+/// 64-bit at a WoW64 launch's first break — `ARM64` there on ARM64 26100.1, measured 2026-09-23,
+/// and the same on x64 per `windbg-mcp` `FOLLOWUPS.md` item 58. The heaps a walk would find
+/// then are real, which is the trouble: the PEB and `ntdll` it reads are the 64-bit emulation
+/// layer's, so it would list those and call the answer complete while every heap the program
+/// allocates from is 32-bit and absent. `_TEB.WowTebOffset` is the kernel's own statement that
+/// the thread has a 32-bit TEB, and it read `+0x2000` at both of that launch's breaks, and zero
+/// in a native ARM64 process and in an emulated x64 one.
+fn refuse_wow64(
+    engine: &DebugEngine,
+    ntdll: u64,
+    deadline: Option<Instant>,
+) -> Result<(), HeapQueryError> {
+    let symbols = BudgetedSymbols { engine, deadline };
+    symbols.check()?;
+    let offset = symbols
+        .type_id(ntdll, "_TEB")
+        .and_then(|teb| symbols.field(ntdll, teb, "WowTebOffset"))
+        .map_err(|error| {
+            HeapQueryError::Layout(format!(
+                "ntdll's _TEB.WowTebOffset, which says whether this is a WoW64 process: {error}"
+            ))
+        })?;
+    symbols.check()?;
+    let teb = engine.current_thread_teb()?;
+    wow_teb_offset(engine, teb, u64::from(offset))
+}
+
+/// `refuse_wow64`'s reading of a TEB, apart from the engine that finds it.
+fn wow_teb_offset(memory: &impl RootMemory, teb: u64, offset: u64) -> Result<(), HeapQueryError> {
+    if teb == 0 {
+        return Err(HeapQueryError::InvalidTeb(
+            "DbgEng returned a null TEB".into(),
+        ));
+    }
+    let field = teb.checked_add(offset).ok_or_else(|| {
+        HeapQueryError::InvalidTeb(format!("TEB {teb:#x} + {offset:#x} overflows"))
+    })?;
+    let bytes = memory.read(field, 4).map_err(|error| {
+        HeapQueryError::InvalidTeb(format!("cannot read WowTebOffset at {field:#x}: {error}"))
+    })?;
+    let wow_teb_offset = i32::from_le_bytes(bytes.as_slice().try_into().map_err(|_| {
+        HeapQueryError::InvalidTeb(format!("short read of WowTebOffset at {field:#x}"))
+    })?);
+    match wow_teb_offset {
+        0 => Ok(()),
+        wow_teb_offset => Err(HeapQueryError::Wow64Process { wow_teb_offset }),
+    }
 }
 
 fn resolve_schema(
@@ -1115,6 +1189,7 @@ fn prepare_for_heap(
     let deadline = walk.budget.and_then(|budget| started.checked_add(budget));
     let target = validate_target(engine)?;
     let schema = resolve_schema(engine, target, deadline)?;
+    refuse_wow64(engine, schema.image.base, deadline)?;
     walk_snapshot(engine, walk, started, target, schema, heap)
 }
 
@@ -1815,5 +1890,44 @@ mod tests {
         assert_eq!(rows[0].total_capacity, 0x1000);
         assert_eq!(rows[1].chunks, 2);
         assert_eq!(rows[1].total_capacity, 0x40);
+    }
+
+    /// A TEB naming a 32-bit one beside it is refused, whichever side of it that one is, and a
+    /// TEB that cannot be read is refused too rather than taken for a native one.
+    ///
+    /// The offsets are the ones measured on ARM64 26100.1 (2026-09-23): `_TEB.WowTebOffset` at
+    /// `+0x180c`, holding `+0x2000` in a WoW64 process at both of its launch breaks and zero in
+    /// an emulated x64 one.
+    #[test]
+    fn test_a_teb_with_a_32_bit_teb_beside_it_is_refused() {
+        const TEB: u64 = 0x2fd_e000;
+        const FIELD: u64 = 0x180c;
+        let with = |value: i32| {
+            let mut process = Process::default();
+            process.put(TEB + FIELD, &value.to_le_bytes());
+            wow_teb_offset(&process, TEB, FIELD)
+        };
+
+        assert!(with(0).is_ok());
+        assert!(matches!(
+            with(0x2000),
+            Err(HeapQueryError::Wow64Process {
+                wow_teb_offset: 0x2000
+            })
+        ));
+        assert!(matches!(
+            with(-0x2000),
+            Err(HeapQueryError::Wow64Process {
+                wow_teb_offset: -0x2000
+            })
+        ));
+        assert!(matches!(
+            wow_teb_offset(&Process::default(), TEB, FIELD),
+            Err(HeapQueryError::InvalidTeb(_))
+        ));
+        assert!(matches!(
+            wow_teb_offset(&Process::default(), 0, FIELD),
+            Err(HeapQueryError::InvalidTeb(_))
+        ));
     }
 }
