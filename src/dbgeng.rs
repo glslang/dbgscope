@@ -4501,8 +4501,8 @@ impl DebugEngine {
     ///
     /// **The native one, whatever machine the engine is rendering for.** Measured on a WoW64
     /// process on ARM64 26100.1 (2026-09-23): at its 32-bit initial break, with the effective
-    /// machine x86, `@$teb` still names the 64-bit TEB — its `WowTebOffset` reads `+0x2000`,
-    /// where the 32-bit TEB's own reads negative.
+    /// machine x86, this names the 64-bit TEB — its `WowTebOffset` reads `+0x2000` through
+    /// `heap::list`'s WoW64 check, as `@$teb`'s does, where the 32-bit TEB's own reads negative.
     pub fn current_thread_teb(&self) -> Result<u64, DbgEngError> {
         let objects: IDebugSystemObjects =
             self.client.cast().map_err(|source| DbgEngError::Context {
