@@ -19,6 +19,9 @@ use thiserror::Error;
 use windows::Win32::System::Diagnostics::Debug::Extensions::{
     DEBUG_STATUS_BREAK, DEBUG_STATUS_NO_DEBUGGEE,
 };
+use windows::Win32::System::SystemInformation::{
+    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64,
+};
 
 use super::decode::parse_tag;
 use super::index::{PoolIndex, SnapshotCache};
@@ -26,8 +29,6 @@ use super::layout::{LayoutCache, LayoutTarget, SessionKey};
 use super::snapshot::{PoolMatchLimit, SnapshotError, SnapshotWalker, WalkStalls};
 use super::{PoolBackend, PoolDiagnostics, PoolSpan, PoolState};
 use crate::dbgeng::{DbgEngError, DebugEngine};
-
-const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
 
 /// Bumped whenever the debugger tells us the session changed, and whenever a caller
 /// forces a refresh. Both caches key on it, so a stale walk can never outlive the
@@ -92,7 +93,7 @@ pub enum PoolQueryError {
     #[error("target is running; break in before taking a pool snapshot")]
     TargetRunning,
 
-    #[error("pool walking supports x64 targets only (machine {machine:#x})")]
+    #[error("pool walking supports x64 and ARM64 targets only (machine {machine:#x})")]
     UnsupportedArchitecture { machine: u32 },
 
     #[error(
@@ -367,8 +368,23 @@ fn prepare_index_until(
     if status != DEBUG_STATUS_BREAK {
         return Err(PoolQueryError::TargetRunning);
     }
+    // ARM64 was refused here until it was walked rather than reasoned about (windbg-mcp
+    // `FOLLOWUPS.md` item 96, 2026-09-23). `_POOL_HEADER` and `_HEAP_LFH_SUBSEGMENT` have the
+    // same offsets on both, and `ExpAddTagForBigPages` and the `RtlpHpLfh*` family are the same
+    // algorithm on both — but that was the argument for *looking*, not a substitute for it. What
+    // settled it was a live ARM64 kernel (26100, AArch64): 18 LFH subsegments whose
+    // `BlockBitmap` reproduced `FreeCount` exactly, the big-page hash landing on each in-use
+    // entry's own slot, and a gate-lifted walk agreeing with `!pool` block for block on two
+    // subsegments where the pre-fix decoder called 25 live blocks free.
+    //
+    // Kept as a list rather than widened to "anything 64-bit": x86 and ARM32 have neither the
+    // pointer width the decoders assume nor a segment heap in the kernel, so admitting them
+    // would produce confident wrong answers rather than this error.
     let machine = engine.processor_type()?;
-    if machine != IMAGE_FILE_MACHINE_AMD64 {
+    if ![IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64]
+        .iter()
+        .any(|supported| u32::from(supported.0) == machine)
+    {
         return Err(PoolQueryError::UnsupportedArchitecture { machine });
     }
 
@@ -638,10 +654,22 @@ mod tests {
     fn test_unsupported_architecture_names_the_machine() {
         // The extension used to own this check; the message is load-bearing for the
         // E_INVALIDARG/E_FAIL mapping, so pin it here now that it lives in the API.
+        //
+        // The fixture is `i386` because this used to be `0xaa64`, which the gate now *accepts* —
+        // a refusal test whose machine became supported would have gone on passing on the
+        // message alone while asserting nothing about the gate.
         assert_eq!(
-            PoolQueryError::UnsupportedArchitecture { machine: 0xaa64 }.to_string(),
-            "pool walking supports x64 targets only (machine 0xaa64)"
+            PoolQueryError::UnsupportedArchitecture { machine: 0x014c }.to_string(),
+            "pool walking supports x64 and ARM64 targets only (machine 0x14c)"
         );
+    }
+
+    /// The two machines the gate admits, against the constants the OS defines rather than the
+    /// literals this file used to carry.
+    #[test]
+    fn test_the_gate_admits_x64_and_arm64() {
+        assert_eq!(u32::from(IMAGE_FILE_MACHINE_AMD64.0), 0x8664);
+        assert_eq!(u32::from(IMAGE_FILE_MACHINE_ARM64.0), 0xaa64);
     }
 
     /// The conversion is what keeps a plain `refresh` argument safe: every caller that never

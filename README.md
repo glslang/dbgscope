@@ -208,8 +208,8 @@ ordinary four-byte tag `0x2e`.
 ## Requirements
 
 - Windows x86_64 or Windows ARM64. The crate calls Windows APIs directly with no `#[cfg]`
-  gating and is not designed to build elsewhere. Heap walking takes x64 and ARM64 processes;
-  pool *walking* is x64-only until the kernel's side has been checked against an ARM64 pool.
+  gating and is not designed to build elsewhere. Heap and pool walking both take x64 and ARM64
+  targets.
 - Rust 1.88 or later (let-chains, used in the pool walker); nightly for Miri.
 - MSVC build tools.
 - Optional: `cargo nextest` as the local test runner.

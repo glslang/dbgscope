@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The kernel pool walker takes ARM64 targets.** `pool::query` accepted
+  `IMAGE_FILE_MACHINE_AMD64` and nothing else, so every `pool_*` query against an ARM64 kernel
+  came back `pool walking supports x64 targets only (machine 0xaa64)`. It now admits ARM64
+  alongside x64, from the same `IMAGE_FILE_MACHINE_*` constants `heap::validate_target` uses.
+  The gate was waiting on a walk rather than an argument, and the walk was run: on a live ARM64
+  kernel (26100, AArch64), 18 LFH subsegments whose `BlockBitmap` reproduced `FreeCount` exactly
+  under `LfhBitmap::ContiguousBits`, the big-page hash landing on each in-use entry's own slot
+  where the truncating one landed on none, and — with the gate lifted — a walk agreeing with
+  `!pool` block for block on two subsegments (59/59 and 7/7 allocated blocks), where the
+  pre-fix decoder reported 25 of those live blocks as free. Still a list of two machines rather
+  than "anything 64-bit": x86 and ARM32 have neither the pointer width the decoders assume nor a
+  kernel segment heap, and admitting them would produce confident wrong answers instead of an
+  error. windbg-mcp `FOLLOWUPS.md` item 96.
+
 ### Fixed
 
 - **The heap walker read an LFH subsegment's busy blocks from the wrong bits, on every current
