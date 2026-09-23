@@ -104,6 +104,9 @@ pub(crate) struct PoolRegion {
     pub subsegment: Option<u64>,
     pub backend: PoolBackend,
     pub unit_size: u32,
+    /// An LFH subsegment's busy blocks, one bit per slot. Discovery reduces the allocator's own
+    /// `BlockBitmap` to this with `LfhBitmap::normalise`, so nothing that walks a region has
+    /// to know which allocator laid it out.
     pub bitmap: Vec<u8>,
     pub heap_key: u64,
     pub pool_header: PoolHeaderLayout,
@@ -302,8 +305,12 @@ fn walk_tree_nodes(
     let mut nodes = Vec::new();
     let mut stack = vec![root];
     let mut seen = HashSet::new();
+    // Links are followed exactly as stored. They were masked to 16 bytes, which is harmless for
+    // a page-range descriptor's node and wrong for a VS free chunk's: its `Node` is at +0x8 of a
+    // 16-aligned header, so masking landed every VS node on its chunk's encoded `Sizes` word,
+    // read that as the left link, and took the real left link for the right one — the
+    // `unreadable VS free tree node 0x84a23d…` diagnostics on ARM64 26100.1 (2026-09-23).
     while let Some(node) = stack.pop() {
-        let node = node & !0xf;
         if node == 0 {
             continue;
         }
@@ -994,6 +1001,7 @@ fn discover_segment_context(
 ) -> Result<(), SnapshotError> {
     let segment = layout.type_layout("_HEAP_PAGE_SEGMENT")?;
     let descriptor = layout.type_layout("_HEAP_PAGE_RANGE_DESCRIPTOR")?;
+    let lfh_bitmap = layout.lfh_bitmap();
     let shift = scalar(
         memory,
         context_address + layout.field("_HEAP_SEG_CONTEXT", "UnitShift")? as u64,
@@ -1043,7 +1051,12 @@ fn discover_segment_context(
         .ok_or_else(|| SnapshotError::InvalidData {
             detail: "descriptor metadata size overflow".into(),
         })?;
-    let mut entry = scalar(memory, list_head, 8)? & !0xf;
+    // Plain `LIST_ENTRY` links, compared with the head exactly. They used to be masked to 16
+    // bytes like a tree node's, and the head is only 8-aligned — `SegContexts` at +0x140 and
+    // `SegmentListHead` at +0x48 of it, on x64 26100.8972 and ARM64 26100.1 `ntdll` alike — so
+    // the last segment's link back to the head never matched it, and the walk read the heap's
+    // own fields as a segment header (2026-09-23).
+    let mut entry = scalar(memory, list_head, 8)?;
     let mut seen = HashSet::new();
     while entry != 0 && entry != list_head && seen.len() < traversal_limit {
         check_budget(memory)?;
@@ -1061,7 +1074,7 @@ fn discover_segment_context(
                     "cannot read segment header {segment_address:#x}: {error}"
                 ));
                 match scalar(memory, entry, 8) {
-                    Ok(next) => entry = next & !0xf,
+                    Ok(next) => entry = next,
                     Err(_) => break,
                 }
                 continue;
@@ -1074,7 +1087,7 @@ fn discover_segment_context(
             discovery.diagnostics.push(format!(
                 "rejecting page segment {segment_address:#x} with invalid signature {signature:#x}"
             ));
-            entry = read_u64(&segment_header, list_entry).unwrap_or(0) & !0xf;
+            entry = read_u64(&segment_header, list_entry).unwrap_or(0);
             continue;
         }
         let metadata_address = segment_address + desc_array as u64;
@@ -1084,7 +1097,7 @@ fn discover_segment_context(
                 discovery.diagnostics.push(format!(
                     "cannot read descriptors at {metadata_address:#x}: {error}"
                 ));
-                entry = read_u64(&segment_header, list_entry).unwrap_or(0) & !0xf;
+                entry = read_u64(&segment_header, list_entry).unwrap_or(0);
                 continue;
             }
         };
@@ -1106,8 +1119,13 @@ fn discover_segment_context(
                 continue;
             };
             // `TreeSignature` shares its bytes with the range's tree node, so it only means
-            // anything on the descriptor that *is* the range's node — its first.
+            // anything on the descriptor that *is* the range's node — its first — and not even
+            // there once the range is free: a range in the free-page tree holds its node's links
+            // in those bytes. Membership of the tree is that range's evidence, and asking it for
+            // the signature as well dropped every free range there is (2026-09-23).
+            let descriptor_node = metadata_address + offset as u64 + tree_node_offset as u64;
             if decoded.first
+                && !free_nodes.contains(&descriptor_node)
                 && !read_u32(&metadata, offset + tree_signature_offset)
                     .is_some_and(valid_descriptor_tree_signature)
             {
@@ -1181,16 +1199,28 @@ fn discover_segment_context(
                     }
                 };
                 block_size = lfh.block_size;
-                bitmap = match guarded_read(
+                let raw = match guarded_read(
                     memory,
                     address + bitmap_offset as u64,
-                    lfh.blocks.div_ceil(4),
+                    lfh_bitmap.bytes_for(lfh.blocks),
                 ) {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         discovery
                             .diagnostics
                             .push(format!("cannot read LFH bitmap at {address:#x}: {error}"));
+                        descriptor_index += unit_size;
+                        continue;
+                    }
+                };
+                bitmap = match lfh_bitmap.normalise(&raw, lfh.blocks) {
+                    Some(busy) => busy,
+                    None => {
+                        discovery.diagnostics.push(format!(
+                            "LFH bitmap at {address:#x} is {} bytes, short of its {} blocks",
+                            raw.len(),
+                            lfh.blocks
+                        ));
                         descriptor_index += unit_size;
                         continue;
                     }
@@ -1270,7 +1300,6 @@ fn discover_segment_context(
                     region_size = declared_size;
                 }
             }
-            let descriptor_node = metadata_address + offset as u64 + tree_node_offset as u64;
             // Two independent ways to be free, and either is enough: the range sits in the
             // segment's free-page tree, or its own flags say it is not in use.
             let state = if free_nodes.contains(&descriptor_node) || !decoded.allocated() {
@@ -1300,7 +1329,7 @@ fn discover_segment_context(
             });
             descriptor_index += unit_size;
         }
-        entry = read_u64(&segment_header, list_entry).unwrap_or(0) & !0xf;
+        entry = read_u64(&segment_header, list_entry).unwrap_or(0);
     }
     Ok(())
 }
@@ -2922,7 +2951,7 @@ mod tests {
             subsegment: None,
             backend: PoolBackend::Lfh,
             unit_size,
-            // Two slots' worth, both marked allocated.
+            // Eight slots' worth, all marked allocated.
             bitmap: vec![0xff],
             heap_key: 0,
             pool_header: PoolHeaderLayout {
@@ -5405,6 +5434,139 @@ mod tests {
                     [PoolState::ReusableFree].as_slice()
                 ),
             ]
+        );
+    }
+
+    /// A segment laid out the way ARM64 26100.1 `ntdll` lays one out, where two shapes the
+    /// walker mishandled meet: a segment list whose head is only 8-aligned, and a free range
+    /// that is a node of the free-page tree.
+    ///
+    /// Measured 2026-09-23 on `user_heap_smoke`'s child. `SegContexts` is at +0x140 of the heap
+    /// and `SegmentListHead` at +0x48 of a context, so the head sits at +0x188; x64 26100.8972
+    /// has the same offsets. And the segment's trailing free range carried no `TreeSignature`,
+    /// because it is the free-page tree's only node and those bytes are its (null) links.
+    fn segment_with_an_unaligned_head_and_a_free_tree_node(heap_key: u64) -> SyntheticMemory {
+        let mut bytes = Writes::default();
+        let context = HEAP + 0x108;
+        let free_node = SEGMENT + 0x100 + 2 * 0x20;
+
+        fill(&mut bytes, HEAP, 0x800);
+        put_u64(&mut bytes, context, SEGMENT); // SegmentListHead, 8 bytes past a 16 boundary
+        put_u64(&mut bytes, context + 0x10, free_node); // FreePageRanges.Root, not encoded
+        put(&mut bytes, context + 0x20, &[12, 1]); // UnitShift, FirstDescriptorIndex
+        put_u64(&mut bytes, context + 0x28, !0xffffu64); // SegmentMask: 16 descriptors
+
+        fill(&mut bytes, SEGMENT, 0x300);
+        put_u64(&mut bytes, SEGMENT, context); // ListEntry back to the head, exactly
+        put_u64(
+            &mut bytes,
+            SEGMENT + 0x20,
+            SEGMENT ^ context ^ heap_key ^ super::super::decode::PAGE_SEGMENT_SIGNATURE,
+        );
+        let allocated = SEGMENT + 0x100 + 0x20;
+        put_u32(
+            &mut bytes,
+            allocated,
+            super::super::decode::DESCRIPTOR_TREE_SIGNATURE,
+        );
+        put(&mut bytes, allocated + 0x18, &[RANGE_IN_USE]);
+        put(&mut bytes, allocated + 0x1f, &[1]);
+        // The free range: first, not in use, and a tree node whose links are all null — so
+        // where an allocated range has its signature, this one has zeroes.
+        put(&mut bytes, free_node + 0x18, &[DESCRIPTOR_FLAG_FIRST]);
+        put(&mut bytes, free_node + 0x1f, &[1]);
+        SyntheticMemory::new(bytes, Vec::new())
+    }
+
+    /// Both ranges of that segment are found, the free one as free, and nothing is said about
+    /// either — where the walker used to read the heap's own fields as a second segment and
+    /// drop the free range for the signature its node bytes cannot carry.
+    #[test]
+    fn test_an_unaligned_segment_list_head_and_a_free_tree_node_are_walked_as_ntdll_lays_them_out()
+    {
+        let heap_key = 0x55aa_1234_9876_0000;
+        let memory = segment_with_an_unaligned_head_and_a_free_tree_node(heap_key);
+        let layout = synthetic_layout();
+        let mut discovery = Discovery::default();
+
+        discover_segment_context(
+            &memory,
+            &layout,
+            HEAP + 0x108,
+            0,
+            PoolKind::NonPagedNx,
+            HeapIdentity {
+                pool_state: STATE,
+                heap: HEAP,
+                special: false,
+            },
+            heap_key,
+            0xa5c3_1357,
+            1024,
+            &SharedChunks::default(),
+            &SharedChunks::default(),
+            &mut discovery,
+        )
+        .expect("the fixture is readable throughout");
+
+        assert!(
+            discovery.diagnostics.is_empty(),
+            "one segment, one allocated range and one free one, all well formed: {:?}",
+            discovery.diagnostics
+        );
+        let described: Vec<_> = discovery
+            .regions
+            .iter()
+            .map(|region| (region.address, region.backend, region.states.as_slice()))
+            .collect();
+        assert_eq!(
+            described,
+            [
+                (
+                    SEGMENT + 0x1000,
+                    PoolBackend::Segment,
+                    [PoolState::Allocated].as_slice()
+                ),
+                (
+                    SEGMENT + 0x2000,
+                    PoolBackend::Segment,
+                    [PoolState::ReusableFree].as_slice()
+                ),
+            ]
+        );
+    }
+
+    /// A tree whose nodes sit 8 bytes past a 16-byte boundary is walked node for node.
+    ///
+    /// That is every VS free tree: a free chunk's `Node` is at +0x8 of its 16-aligned header,
+    /// and the eight bytes below it are the chunk's encoded `Sizes`. Each node here has such a
+    /// word below it, pointing nowhere readable, which is what a walk that masks its links to
+    /// 16 bytes follows instead of the real ones — the `unreadable VS free tree node 0x84a23d…`
+    /// diagnostics measured on ARM64 26100.1, 2026-09-23.
+    #[test]
+    fn test_a_tree_of_nodes_eight_past_a_boundary_is_walked_exactly() {
+        const ROOT: u64 = K + 0x40_0008;
+        const LEFT: u64 = K + 0x40_1008;
+        const RIGHT: u64 = K + 0x40_2008;
+        let mut bytes = Writes::default();
+        for (node, left, right) in [(ROOT, LEFT, RIGHT), (LEFT, 0, 0), (RIGHT, 0, 0)] {
+            put_u64(&mut bytes, node - 8, 0x84a2_3d0f_b239_be00); // the chunk's encoded Sizes
+            put_u64(&mut bytes, node, left);
+            put_u64(&mut bytes, node + 8, right);
+        }
+        let memory = SyntheticMemory::new(bytes, Vec::new());
+        let mut diagnostics = Vec::new();
+
+        let mut nodes = walk_tree_nodes(&memory, ROOT, 0, 8, 16, "VS free tree", &mut diagnostics)
+            .expect("the fixture is readable throughout");
+        nodes.sort_unstable();
+
+        assert_eq!(nodes, [ROOT, LEFT, RIGHT]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let tree = K + 0x50_0000;
+        assert_eq!(
+            decode_rb_root_for(ROOT ^ tree, tree, true, false),
+            Some(ROOT)
         );
     }
 

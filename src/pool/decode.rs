@@ -380,12 +380,69 @@ pub(crate) fn decode_lfh_subsegment(
     })
 }
 
-/// Each LFH slot uses two bits. Bit 0 is the busy state, while bit 1 records
-/// unused-byte metadata and does not affect whether the block is allocated.
+/// How an allocator arranges an LFH subsegment's `BlockBitmap`.
+///
+/// Both PDBs type the field as one `ULONGLONG` and say nothing about what is packed into it, and
+/// `nt` and `ntdll` pack it differently. So which arrangement applies is a fact about **which
+/// allocator the schema was resolved from** — `PoolLayout::is_user` — never about a build
+/// number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LfhBitmap {
+    /// `ntdll`'s: each 64-bit word covers 32 blocks, with their busy bits in its low half and
+    /// each block's unused-bytes bit 32 above its busy bit. Read out of the routine `HeapWalk`
+    /// reaches, `ntdll!RtlpHpLfhSubsegmentWalk`, which tests `1 << (slot & 31)` against the low
+    /// 32 bits of word `slot >> 5` — `mov eax,[r15+rax*8]` / `bt rax,rcx` on x64 26100.8972,
+    /// `ldr x9,[x23,x9,lsl #3]` / `uxtw` / `tst` on ARM64 26100.1 — and retires a delay-freed
+    /// block by clearing bit `slot & 31` and bit `32 + (slot & 31)` of that word together
+    /// (2026-09-23). A live ARM64 subsegment of 62 blocks agreed with `HeapWalk` slot for slot
+    /// read this way, and disagreed in 17 of its 62 slots read the [`Self::AdjacentPairs`] way.
+    SplitWord,
+    /// Two adjacent bits per block, busy the lower: what the kernel pool walker has always read.
+    ///
+    /// **Not `nt`'s arrangement as measured.** `nt!RtlpHpLfhBlockBitmapInitialize` sizes the
+    /// bitmap at one bit per block, 64 to a word (x64 26100.32995), and
+    /// `nt!RtlpHpLfhBlockBitmapAllocateNonAtomic` hands out `word * 64 + bit` (ARM64 26100).
+    /// It is kept for the kernel walker unchanged until that can be checked against a live
+    /// pool: `windbg-mcp` `FOLLOWUPS.md` item 96.
+    AdjacentPairs,
+}
+
+impl LfhBitmap {
+    /// How many bytes of `BlockBitmap` cover `blocks` blocks in this arrangement.
+    pub(crate) fn bytes_for(self, blocks: usize) -> usize {
+        match self {
+            Self::SplitWord => blocks.div_ceil(32).saturating_mul(8),
+            Self::AdjacentPairs => blocks.div_ceil(4),
+        }
+    }
+
+    /// Where `slot`'s busy bit is, counting from bit 0 of the bitmap's first byte.
+    fn busy_bit(self, slot: usize) -> Option<usize> {
+        match self {
+            Self::SplitWord => (slot / 32).checked_mul(64)?.checked_add(slot % 32),
+            Self::AdjacentPairs => slot.checked_mul(2),
+        }
+    }
+
+    /// The busy bits of the first `blocks` slots, one bit per slot, which is the only form
+    /// [`lfh_bitmap_state`] reads. `None` when `bitmap` stops short of a slot's busy bit.
+    pub(crate) fn normalise(self, bitmap: &[u8], blocks: usize) -> Option<Vec<u8>> {
+        let mut busy = vec![0u8; blocks.div_ceil(8)];
+        for slot in 0..blocks {
+            let bit = self.busy_bit(slot)?;
+            if (*bitmap.get(bit / 8)? >> (bit % 8)) & 1 != 0 {
+                busy[slot / 8] |= 1 << (slot % 8);
+            }
+        }
+        Some(busy)
+    }
+}
+
+/// Whether LFH `slot` is busy, in a bitmap [`LfhBitmap::normalise`] has reduced to one bit per
+/// slot. `None` when the bitmap does not reach the slot.
 pub(crate) fn lfh_bitmap_state(bitmap: &[u8], slot: usize) -> Option<PoolState> {
-    let bit = slot.checked_mul(2)?;
-    let byte = *bitmap.get(bit / 8)?;
-    Some(if (byte >> (bit % 8)) & 1 == 0 {
+    let byte = *bitmap.get(slot / 8)?;
+    Some(if (byte >> (slot % 8)) & 1 == 0 {
         PoolState::ReusableFree
     } else {
         PoolState::Allocated
@@ -542,7 +599,9 @@ pub(crate) fn decode_rb_root_for(
     encoded: bool,
     user: bool,
 ) -> Option<u64> {
-    let pointer = if encoded { root ^ tree_address } else { root } & !0xf;
+    // Not masked: a VS free chunk's node is at +0x8 of a 16-aligned header, so a 16-byte mask
+    // moves a VS tree's root onto the chunk's encoded `Sizes` word.
+    let pointer = if encoded { root ^ tree_address } else { root };
     (pointer == 0
         || if user {
             is_user_pointer(pointer)
@@ -811,7 +870,10 @@ mod tests {
             decode_lfh_offsets(encoded_offsets, subsegment, lfh_key),
             (0x30, 0x248)
         );
-        let lfh_bitmap = [0b1110_0100];
+        // The kernel walker's reading, which normalising must leave exactly as it was.
+        let lfh_bitmap = LfhBitmap::AdjacentPairs
+            .normalise(&[0b1110_0100], 4)
+            .expect("one byte covers four adjacent pairs");
         assert_eq!(
             lfh_bitmap_state(&lfh_bitmap, 0),
             Some(PoolState::ReusableFree)
@@ -823,6 +885,7 @@ mod tests {
         );
         assert_eq!(lfh_bitmap_state(&lfh_bitmap, 3), Some(PoolState::Allocated));
         assert_eq!(lfh_bitmap_state(&[], 0), None);
+        assert_eq!(LfhBitmap::AdjacentPairs.normalise(&[0xff], 5), None);
 
         let mut shifted = [0u8; 24];
         shifted[7..11].copy_from_slice(&[2, 3, 4, 1]);
@@ -894,6 +957,56 @@ mod tests {
             descriptor_backend(DESCRIPTOR_FLAG_FIRST),
             PoolBackend::Segment
         );
+    }
+
+    /// `ntdll`'s block bitmap, read the way `ntdll` reads it, gives the blocks `HeapWalk` does.
+    ///
+    /// The bytes are a live subsegment's, measured 2026-09-23 on ARM64 26100.1: 62 blocks of
+    /// 0x40, sixteen of them busy by `HeapWalk`. The first word's low half is those sixteen
+    /// and its high half repeats them (every block was a 0x20 request, so every busy block has
+    /// unused bytes); the second word's low half marks slots 62 and 63, which are past
+    /// `BlockCount`. Read as adjacent pairs it gives fifteen busy blocks, eight of which are
+    /// free, and misses nine that are busy — which is what the heap queries reported before this.
+    #[test]
+    fn test_ntdlls_block_bitmap_splits_each_word_into_busy_and_unused_halves() {
+        let measured = [
+            0x97, 0x0e, 0x0a, 0xf6, 0x97, 0x0e, 0x0a, 0xf6, 0x00, 0x00, 0x00, 0xc0, 0, 0, 0, 0,
+        ];
+        let heap_walk_busy = [0, 1, 2, 4, 7, 9, 10, 11, 17, 19, 25, 26, 28, 29, 30, 31];
+        let busy = |layout: LfhBitmap| {
+            let normalised = layout
+                .normalise(&measured, 62)
+                .expect("sixteen bytes cover 62 blocks in either arrangement");
+            (0..62)
+                .filter(|&slot| lfh_bitmap_state(&normalised, slot) == Some(PoolState::Allocated))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(LfhBitmap::SplitWord.bytes_for(62), measured.len());
+        assert_eq!(busy(LfhBitmap::SplitWord), heap_walk_busy);
+        assert_ne!(busy(LfhBitmap::AdjacentPairs), heap_walk_busy);
+        // The unused-bytes half is not a second copy of the busy one in general, so it must
+        // never be read as busy: a block with no unused bytes is busy with its high bit clear,
+        // and a block past `BlockCount` is marked busy in the low half only.
+        let low_half_only = [0x01, 0, 0, 0, 0x02, 0, 0, 0];
+        assert_eq!(
+            LfhBitmap::SplitWord.normalise(&low_half_only, 2),
+            Some(vec![0b01])
+        );
+        // A 33rd block starts the second word, not the fifth byte of the first.
+        let second_word = [
+            0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0x01, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let normalised = LfhBitmap::SplitWord.normalise(&second_word, 33).unwrap();
+        assert_eq!(
+            lfh_bitmap_state(&normalised, 0),
+            Some(PoolState::ReusableFree)
+        );
+        assert_eq!(
+            lfh_bitmap_state(&normalised, 32),
+            Some(PoolState::Allocated)
+        );
+        assert_eq!(LfhBitmap::SplitWord.normalise(&second_word[..8], 33), None);
     }
 
     /// Every rejection has to name the check it failed and carry the values that failed it.

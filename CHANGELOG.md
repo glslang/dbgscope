@@ -8,6 +8,43 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The heap walker read an LFH subsegment's busy blocks from the wrong bits, on every current
+  build.** `_HEAP_LFH_SUBSEGMENT.BlockBitmap` was read as two adjacent bits per block, busy the
+  lower. `ntdll` packs it otherwise: each 64-bit word covers 32 blocks, busy bits in its low half
+  and each block's unused-bytes bit 32 above — read out of `ntdll!RtlpHpLfhSubsegmentWalk`, the
+  routine `HeapWalk` reaches, identically on x64 26100.8972 and ARM64 26100.1. Measured on a live
+  ARM64 subsegment of 62 blocks, the old reading reported fifteen busy, eight of which were free,
+  and missed nine that were busy. The heap queries now agree with `HeapWalk` block for block on
+  the heap `user_heap_smoke` creates, which now asserts exactly that, live and over its dump. The
+  arrangement is chosen by the allocator the schema was resolved from (`is_user`), never by a
+  build. **The kernel pool walker keeps its reading unchanged**, and it is not `nt`'s either:
+  `nt!RtlpHpLfhBlockBitmapInitialize` (x64 26100.32995) and
+  `nt!RtlpHpLfhBlockBitmapAllocateNonAtomic` (ARM64 26100) use one bit per block, 64 to a word.
+  That wants a live pool to check against and is `windbg-mcp` `FOLLOWUPS.md` item 96.
+
+- **A segment list whose head is 8-aligned was walked one entry too far.** Its links were masked
+  to 16 bytes, and on current `ntdll` the head is not 16-aligned — `SegContexts` at +0x140 of the
+  heap and `SegmentListHead` at +0x48 of a context, on x64 and ARM64 alike — so the last segment's
+  link back never matched the head, and the walk read the heap's own fields as a segment header.
+  Nothing was lost, but every heap said `cannot read segment header` twice and called its walk
+  partial. The links are compared exactly now.
+
+- **Every free page range in a segment's free-page tree was dropped.** The descriptor check
+  asked a range's first descriptor for `TreeSignature` before asking whether it was a node of
+  the free-page tree, and the two share bytes: a free range in the tree holds its node's links
+  there. Tree membership is now that range's evidence, and it is reported as free.
+
+- **The VS free tree was walked from the wrong address.** A free VS chunk's `Node` is at +0x8 of
+  its 16-aligned header, and tree links and roots were masked to 16 bytes, which moved every node
+  onto the chunk's encoded `Sizes` word: the walk followed that word as a left link, took the real
+  left link for the right one, and reported the result as unreadable nodes (`0x84a23d…` on ARM64
+  26100.1). It changed no chunk's state — a VS header carries its own — but it was the rest of
+  why a user-mode walk was partial.
+
+  These last three are in code the kernel pool walker shares, so it has them too. They were
+  measured in user mode only; checking them against a live pool is `windbg-mcp` `FOLLOWUPS.md`
+  item 96, with the LFH bitmap above.
+
 - **The heap tools saw one heap in processes that have several.** `heap::list` and everything
   built on it took its roots from the PEB's `ProcessHeaps`, and on current Windows that array names
   the process heap and nothing else: `RtlpProcessHeapsInsert` writes it for the first heap only and
@@ -89,6 +126,20 @@ All notable changes to this project are documented here. The format follows
   fingerprints included — are pinned against values recorded before this change.
 
 ### Added
+
+- **The heap queries walk ARM64 processes.** `heap::*` refused any processor but AMD64. It now
+  accepts ARM64 as well — native processes, and x64 processes emulated on ARM64, whose heaps
+  are the ARM64X `ntdll`'s like any other's. Nothing else in the walker was specific to either
+  architecture: the four fixes above are x64's as much as ARM64's, and were found by running
+  `user_heap_smoke` on ARM64 for the first time. What it does refuse, on both, is a **WoW64**
+  process (`HeapQueryError::Wow64Process`): the PEB and `ntdll` a 64-bit engine sees there are
+  the emulation layer's, so a walk would list those heaps and call itself complete while the
+  program's own, 32-bit, heaps were absent. No processor type says so — the effective one is
+  still 64-bit at a WoW64 launch's first break — so it is read from `_TEB.WowTebOffset`, which
+  was `+0x2000` at both of that launch's breaks and zero in native and emulated-x64 processes.
+  A TEB that cannot be read is `HeapQueryError::InvalidTeb`, not a pass.
+
+- **`DebugEngine::current_thread_teb`**, beside `current_process_peb`.
 
 - **ARM64 operands, registers, effect, condition and privilege are decoded**, so
   `InstructionSet::operands_are_read` answers `true` there and every `Instruction` field is a real
