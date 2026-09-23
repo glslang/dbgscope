@@ -422,9 +422,14 @@ pub(crate) enum LfhBitmap {
     /// each block that straddles a page boundary, wherever in the subsegment that falls — they
     /// are not a block of high slots this can skip.
     ///
-    /// **Not yet confirmed slot for slot against a live pool**, which is the half of
-    /// `windbg-mcp` `FOLLOWUPS.md` item 96 that a crash dump cannot answer: both sample dumps
-    /// are minidumps whose `nt!ExPoolState` does not read, so nothing here walks a pool.
+    /// **Confirmed against a live pool**, which no crash dump here could answer — both sample
+    /// dumps are minidumps whose `nt!ExPoolState` does not read. Measured on a live x64 kernel
+    /// (Server 26100.33438) 2026-09-23: subsegment `0xffffac09de402000` had `BlockCount` 171,
+    /// `WitheldBlockCount` 14 and `FreeCount` 0, with `CommitStateOffset - 8` = 3 words all
+    /// `0xffffffffffffffff` — popcount 192 less 7 padding bits and 14 withheld is exactly its
+    /// 171 allocated blocks. Read two bits per block, as this was until then, it sized the read
+    /// at `ceil(171 / 4)` = 43 bytes against a 24-byte bitmap and reported every slot above ~96
+    /// free, which `!pool` contradicted block for block.
     ContiguousBits,
 }
 
