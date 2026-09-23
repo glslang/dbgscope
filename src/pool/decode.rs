@@ -397,14 +397,35 @@ pub(crate) enum LfhBitmap {
     /// (2026-09-23). A live ARM64 subsegment of 62 blocks agreed with `HeapWalk` slot for slot
     /// read this way, and disagreed in 17 of its 62 slots read the [`Self::AdjacentPairs`] way.
     SplitWord,
-    /// Two adjacent bits per block, busy the lower: what the kernel pool walker has always read.
+    /// `nt`'s: one bit per block, 64 to a word — bit `slot & 63` of word `slot >> 6`, set when
+    /// the block is busy. Since a word is eight little-endian bytes, that is bit `slot` of the
+    /// bitmap counted from bit 0 of its first byte, with no gaps.
     ///
-    /// **Not `nt`'s arrangement as measured.** `nt!RtlpHpLfhBlockBitmapInitialize` sizes the
-    /// bitmap at one bit per block, 64 to a word (x64 26100.32995), and
-    /// `nt!RtlpHpLfhBlockBitmapAllocateNonAtomic` hands out `word * 64 + bit` (ARM64 26100).
-    /// It is kept for the kernel walker unchanged until that can be checked against a live
-    /// pool: `windbg-mcp` `FOLLOWUPS.md` item 96.
-    AdjacentPairs,
+    /// Read out of `nt`'s own code on both architectures, 2026-09-23, from the repository's
+    /// sample dumps. The bit-level authority is
+    /// `nt!RtlpHpLfhSubsegmentSetWitheldBlocks`, which withholds block `rdx` with
+    /// `shr rdx,6` / `and r8d,3Fh` / `bts rcx,r8` against `BlockBitmap` itself (x64 26100.32995,
+    /// `081226-2187-01.dmp`). Three more agree with it:
+    /// `nt!RtlpHpLfhBlockBitmapInitialize` zeroes `ceil(n / 64)` words and sets the top
+    /// `(-n) & 63` bits of the last; `nt!RtlpHpLfhSubsegmentCountAllocatedBlocks` popcounts
+    /// whole words and subtracts both that padding and `WitheldBlockCount`; and ARM64 26100's
+    /// `nt!RtlpHpLfhBlockBitmapAllocateNonAtomic` (`082126-7015-01.dmp`) finds a free block by
+    /// inverting a word and masking the bit it picks `& 0x3F`. ARM64's
+    /// `CountAllocatedBlocks` is the same routine instruction for instruction, over NEON
+    /// `cnt`/`uaddlv` instead of `popcnt`, and `_HEAP_LFH_SUBSEGMENT` has the same offsets on
+    /// both — so this arrangement is `nt`'s, not x64 `nt`'s.
+    ///
+    /// The `n` those routines size by is `BlockCount + WitheldBlockCount`, so [`Self::bytes_for`]
+    /// sized for `BlockCount` alone stops *inside* the bitmap rather than past its end.
+    ///
+    /// **Withheld blocks read busy and are not allocations.** `SetWitheldBlocks` sets the bit of
+    /// each block that straddles a page boundary, wherever in the subsegment that falls — they
+    /// are not a block of high slots this can skip.
+    ///
+    /// **Not yet confirmed slot for slot against a live pool**, which is the half of
+    /// `windbg-mcp` `FOLLOWUPS.md` item 96 that a crash dump cannot answer: both sample dumps
+    /// are minidumps whose `nt!ExPoolState` does not read, so nothing here walks a pool.
+    ContiguousBits,
 }
 
 impl LfhBitmap {
@@ -412,7 +433,7 @@ impl LfhBitmap {
     pub(crate) fn bytes_for(self, blocks: usize) -> usize {
         match self {
             Self::SplitWord => blocks.div_ceil(32).saturating_mul(8),
-            Self::AdjacentPairs => blocks.div_ceil(4),
+            Self::ContiguousBits => blocks.div_ceil(64).saturating_mul(8),
         }
     }
 
@@ -420,7 +441,8 @@ impl LfhBitmap {
     fn busy_bit(self, slot: usize) -> Option<usize> {
         match self {
             Self::SplitWord => (slot / 32).checked_mul(64)?.checked_add(slot % 32),
-            Self::AdjacentPairs => slot.checked_mul(2),
+            // word `slot >> 6`, bit `slot & 63`, little-endian: bit `slot` outright.
+            Self::ContiguousBits => Some(slot),
         }
     }
 
@@ -672,8 +694,17 @@ pub(crate) fn big_page_hash(address: u64, table_size: usize) -> Option<usize> {
     if !table_size.is_power_of_two() {
         None
     } else {
-        // The allocator truncates the page number to ULONG before multiplying.
-        let mut hash = u64::from((address >> 12) as u32).wrapping_mul(0x9e5f);
+        // The allocator does *not* truncate the page number: it shifts the whole pointer and
+        // multiplies 64 bits wide. Measured 2026-09-23 in `nt!ExpRemoveTagForBigPages`, which
+        // is the lookup this mirrors — `shr rax,0Ch` / `imul rcx,rax,9E5Fh` / `shr rdx,20h` /
+        // `xor edx,ecx` / `and edx,eax` (x64 26100.32995) — and identically in ARM64 26100's
+        // `nt!ExpAddTagForBigPages`: `lsr x9,x21,#0xC` / `mul x8,x9,x8` /
+        // `eor x25,x8,x8,lsr #0x20`. This read `(address >> 12) as u32` until then, which
+        // agrees on the low 32 bits of the product and so on nothing that survives the fold:
+        // the two indices differed for every kernel address tried, because a kernel page
+        // number never fits in 32 bits. That matters rather than merely costing probes,
+        // because the probe stops at the first empty entry.
+        let mut hash = (address >> 12).wrapping_mul(0x9e5f);
         hash ^= hash >> 32;
         Some(hash as usize & (table_size - 1))
     }
@@ -871,9 +902,9 @@ mod tests {
             (0x30, 0x248)
         );
         // The kernel walker's reading, which normalising must leave exactly as it was.
-        let lfh_bitmap = LfhBitmap::AdjacentPairs
-            .normalise(&[0b1110_0100], 4)
-            .expect("one byte covers four adjacent pairs");
+        let lfh_bitmap = LfhBitmap::ContiguousBits
+            .normalise(&[0b0000_1010, 0, 0, 0, 0, 0, 0, 0], 4)
+            .expect("one word covers four contiguous bits");
         assert_eq!(
             lfh_bitmap_state(&lfh_bitmap, 0),
             Some(PoolState::ReusableFree)
@@ -885,7 +916,8 @@ mod tests {
         );
         assert_eq!(lfh_bitmap_state(&lfh_bitmap, 3), Some(PoolState::Allocated));
         assert_eq!(lfh_bitmap_state(&[], 0), None);
-        assert_eq!(LfhBitmap::AdjacentPairs.normalise(&[0xff], 5), None);
+        // A read that stops short of a slot's bit is not silently treated as free.
+        assert_eq!(LfhBitmap::ContiguousBits.normalise(&[0xff], 9), None);
 
         let mut shifted = [0u8; 24];
         shifted[7..11].copy_from_slice(&[2, 3, 4, 1]);
@@ -965,8 +997,10 @@ mod tests {
     /// 0x40, sixteen of them busy by `HeapWalk`. The first word's low half is those sixteen
     /// and its high half repeats them (every block was a 0x20 request, so every busy block has
     /// unused bytes); the second word's low half marks slots 62 and 63, which are past
-    /// `BlockCount`. Read as adjacent pairs it gives fifteen busy blocks, eight of which are
-    /// free, and misses nine that are busy — which is what the heap queries reported before this.
+    /// `BlockCount`. Read `nt`'s way it gives thirty busy blocks: the sixteen real ones and the
+    /// fourteen of the unused-bytes half that fall below `BlockCount`, read as blocks 32 to 61.
+    /// So the two arrangements are not interchangeable in either direction, which is why the
+    /// choice is made from the allocator the schema came from rather than from the build.
     #[test]
     fn test_ntdlls_block_bitmap_splits_each_word_into_busy_and_unused_halves() {
         let measured = [
@@ -984,7 +1018,7 @@ mod tests {
 
         assert_eq!(LfhBitmap::SplitWord.bytes_for(62), measured.len());
         assert_eq!(busy(LfhBitmap::SplitWord), heap_walk_busy);
-        assert_ne!(busy(LfhBitmap::AdjacentPairs), heap_walk_busy);
+        assert_ne!(busy(LfhBitmap::ContiguousBits), heap_walk_busy);
         // The unused-bytes half is not a second copy of the busy one in general, so it must
         // never be read as busy: a block with no unused bytes is busy with its high bit clear,
         // and a block past `BlockCount` is marked busy in the low half only.
@@ -1007,6 +1041,76 @@ mod tests {
             Some(PoolState::Allocated)
         );
         assert_eq!(LfhBitmap::SplitWord.normalise(&second_word[..8], 33), None);
+    }
+
+    /// `nt`'s block bitmap is one bit per block, and `nt`'s own arithmetic says which bit.
+    ///
+    /// The fixture is built the way `nt!RtlpHpLfhBlockBitmapInitialize` builds one — words
+    /// zeroed, the top `(-n) & 63` bits of the last word set as padding — with literal bytes
+    /// rather than by calling the code under test, so the test can fail if
+    /// [`LfhBitmap::ContiguousBits`] moves. `n` is `BlockCount + WitheldBlockCount` = 70 + 2,
+    /// so the bitmap is two words and the padding is the top `(-72) & 63` = 56 bits of the
+    /// second.
+    ///
+    /// The oracle is `nt!RtlpHpLfhSubsegmentCountAllocatedBlocks`: popcount every whole word,
+    /// subtract that padding, subtract `WitheldBlockCount`. Nothing in this test computes the
+    /// busy slots the way the walker does, so agreeing is evidence rather than a tautology.
+    #[test]
+    fn test_nts_block_bitmap_is_one_bit_per_block_sixty_four_to_a_word() {
+        const BLOCK_COUNT: usize = 70;
+        const WITHELD: u32 = 2;
+        // Word 0: blocks 0, 3 and 63 busy. Word 1: block 64 busy, then blocks 70 and 71 — the
+        // two withheld ones, which `SetWitheldBlocks` marks busy like any other — and bits
+        // 72..127 set as `Initialize`'s padding.
+        let word0: u64 = (1 << 0) | (1 << 3) | (1 << 63);
+        let word1: u64 =
+            (1 << (64 - 64)) | (1 << (70 - 64)) | (1 << (71 - 64)) | (!0u64 << (72 - 64));
+        let mut measured = [0u8; 16];
+        measured[..8].copy_from_slice(&word0.to_le_bytes());
+        measured[8..].copy_from_slice(&word1.to_le_bytes());
+
+        // Two words cover 70 blocks, and the walker reads exactly them.
+        assert_eq!(LfhBitmap::ContiguousBits.bytes_for(BLOCK_COUNT), 16);
+        let normalised = LfhBitmap::ContiguousBits
+            .normalise(&measured, BLOCK_COUNT)
+            .expect("two words cover seventy blocks");
+        let busy = (0..BLOCK_COUNT)
+            .filter(|&slot| lfh_bitmap_state(&normalised, slot) == Some(PoolState::Allocated))
+            .collect::<Vec<_>>();
+        assert_eq!(busy, vec![0, 3, 63, 64]);
+
+        // `nt`'s own count, over the whole bitmap, reached independently of `normalise`.
+        let popcount: u32 = measured
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| u64::from_le_bytes(*word).count_ones())
+            .sum();
+        let padding = (BLOCK_COUNT as u32 + WITHELD).wrapping_neg() & 63;
+        assert_eq!(padding, 56);
+        assert_eq!(popcount - padding - WITHELD, busy.len() as u32);
+
+        // Bit `slot`, not bit `2 * slot`: block 3 must not read as block 1's neighbour. This is
+        // the mutation the arrangement is for, so pin it rather than trusting the list above.
+        assert_eq!(
+            lfh_bitmap_state(&normalised, 1),
+            Some(PoolState::ReusableFree)
+        );
+        assert_eq!(lfh_bitmap_state(&normalised, 3), Some(PoolState::Allocated));
+        // Block 64 is bit 0 of the second word, not the ninth byte of the first.
+        assert_eq!(
+            lfh_bitmap_state(&normalised, 64),
+            Some(PoolState::Allocated)
+        );
+        assert_eq!(
+            lfh_bitmap_state(&normalised, 65),
+            Some(PoolState::ReusableFree)
+        );
+        // A bitmap one word short of the blocks claimed is refused, not padded with frees.
+        assert_eq!(
+            LfhBitmap::ContiguousBits.normalise(&measured[..8], BLOCK_COUNT),
+            None
+        );
     }
 
     /// Every rejection has to name the check it failed and carry the values that failed it.
@@ -1244,13 +1348,17 @@ mod tests {
         assert_eq!(big_page_hash(0, 0), None);
         assert_eq!(big_page_hash(0x9000, 3), None);
         assert!(big_page_probe(0x9000, 3).is_none());
-        let high_address = 0xffff_8000_1234_5000;
-        let mut expected = u64::from((high_address >> 12) as u32) * 0x9e5f;
-        expected ^= expected >> 32;
-        assert_eq!(
-            big_page_hash(high_address, 0x100),
-            Some(expected as usize & 0xff)
-        );
+        // Literals, not the formula recomputed: this assertion used to build `expected` the
+        // same truncating way `big_page_hash` did, so it agreed with the bug instead of
+        // catching it. These indices are `nt`'s, worked out by hand from
+        // `nt!ExpRemoveTagForBigPages` — full 64-bit page number, 64-bit multiply, fold the
+        // high half down, mask. A kernel page number does not fit in 32 bits, so truncating it
+        // gives 0x9b and 0xe1d here instead.
+        assert_eq!(big_page_hash(0xffff_8000_1234_5000, 0x100), Some(0x93));
+        assert_eq!(big_page_hash(0xffff_9982_2800_0000, 0x1000), Some(0x984));
+        // A page number that does fit in 32 bits is unaffected, which is why every user-mode
+        // fixture kept passing.
+        assert_eq!(big_page_hash(0x9000, 0x100), Some(0x57));
         assert_eq!(adjust_page_end_header(0x1ff0, 0x10), Some(0x1ff0));
         assert_eq!(adjust_page_end_header(0x1ff8, 0x10), Some(0x1ff0));
         assert_eq!(adjust_page_end_header(0x2000, 0x10), Some(0x2000));

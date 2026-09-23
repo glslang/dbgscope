@@ -500,13 +500,13 @@ impl AllocatorSchema {
     }
 
     /// How this schema's allocator packs an LFH block bitmap: `ntdll` and `nt` differ, and
-    /// nothing in either PDB says so. The kernel's reading is not yet `nt`'s own; see
-    /// [`LfhBitmap::AdjacentPairs`].
+    /// nothing in either PDB says so — both type `BlockBitmap` as one `ULONGLONG`. So this is a
+    /// fact about *which allocator the schema came from*, never about a build number.
     pub(crate) fn lfh_bitmap(&self) -> LfhBitmap {
         if self.is_user() {
             LfhBitmap::SplitWord
         } else {
-            LfhBitmap::AdjacentPairs
+            LfhBitmap::ContiguousBits
         }
     }
 
@@ -1088,7 +1088,7 @@ mod tests {
 
         assert!(!kernel.is_user());
         assert!(user.is_user());
-        assert_eq!(kernel.lfh_bitmap(), LfhBitmap::AdjacentPairs);
+        assert_eq!(kernel.lfh_bitmap(), LfhBitmap::ContiguousBits);
         assert_eq!(user.lfh_bitmap(), LfhBitmap::SplitWord);
         assert!(
             symbols.resolutions.get() > resolved_after_kernel,
