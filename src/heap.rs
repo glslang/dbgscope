@@ -112,7 +112,24 @@ pub enum HeapState {
     Allocated,
     ReusableFree,
     CachedFree,
+    /// Memory the walk could not read that the process does have; see
+    /// [`PoolState::Unreadable`].
     Unreadable,
+    /// Address space in a heap region with no pages behind it; see
+    /// [`PoolState::Uncommitted`]. Not a gap in the walk's coverage — a reserved subsegment
+    /// tail is the allocator working, not something the walk missed.
+    Uncommitted,
+}
+
+impl HeapState {
+    /// Whether this is a chunk the allocator laid out rather than a gap; see
+    /// [`PoolState::is_chunk`].
+    pub fn is_chunk(self) -> bool {
+        match self {
+            Self::Allocated | Self::ReusableFree | Self::CachedFree => true,
+            Self::Unreadable | Self::Uncommitted => false,
+        }
+    }
 }
 
 impl From<PoolState> for HeapState {
@@ -122,6 +139,7 @@ impl From<PoolState> for HeapState {
             PoolState::ReusableFree => Self::ReusableFree,
             PoolState::CachedFree => Self::CachedFree,
             PoolState::Unreadable => Self::Unreadable,
+            PoolState::Uncommitted => Self::Uncommitted,
         }
     }
 }
@@ -164,7 +182,18 @@ pub struct HeapWalkReport {
     pub total_chunks: usize,
     pub allocated_chunks: usize,
     pub diagnostic_count: usize,
+    /// Spans the walk could not read and the process **does** have; each one clears
+    /// [`WalkCoverage::complete`].
     pub unreadable_gaps: usize,
+    /// Spans with no pages behind them — reserved subsegment tails and the like, which the
+    /// memory manager confirmed rather than the walk assumed.
+    ///
+    /// Reported beside `unreadable_gaps` rather than folded into it, and rather than left out:
+    /// these are the spans the walk stopped counting against its coverage, so a reader who
+    /// wants to know what a `Complete` answer forgave has the figure. Always zero where
+    /// nothing could be asked — a kernel walk, or a dump that records no memory information —
+    /// because there the walk keeps its old conservative reading.
+    pub uncommitted_gaps: usize,
     pub refused_headers: u64,
     /// Committed VS bytes the walk declined to decode because it could not place a chunk
     /// boundary in them; see [`crate::pool::PoolSnapshot::unplaced_bytes`].
@@ -954,6 +983,10 @@ fn from_pool_snapshot(
             .iter()
             .filter(|allocation| allocation.state == HeapState::Unreadable)
             .count(),
+        uncommitted_gaps: allocations
+            .iter()
+            .filter(|allocation| allocation.state == HeapState::Uncommitted)
+            .count(),
         refused_headers: snapshot.refused_chunks,
         unplaced_bytes: snapshot.unplaced_bytes,
         stalls: snapshot.stalls,
@@ -1244,7 +1277,9 @@ fn neighbourhood_at(allocations: &[HeapAllocation], address: u64) -> Option<Heap
         candidate.heap == allocation.heap
             && candidate.backend == allocation.backend
             && candidate.subsegment == allocation.subsegment
-            && candidate.state != HeapState::Unreadable
+            // A chunk, not merely a readable span — see `PoolIndex::same_boundary`, which
+            // makes the same check for the same reason on the pool side.
+            && candidate.state.is_chunk()
     };
     let previous = position
         .checked_sub(1)

@@ -63,6 +63,10 @@ features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_Debug_Extensions",
+    # `MEMORY_BASIC_INFORMATION64` and the `MEM_*` state constants, which is what
+    # `IDebugDataSpaces2::QueryVirtual` answers in — the memory manager's own record of which
+    # pages are committed, as `DebugEngine::virtual_region` returns it.
+    "Win32_System_Memory",
     "Win32_System_SystemInformation",
     # `RtlUpcaseUnicodeChar`, which is how `object::same_object_name` folds a name: it is the
     # object manager's own fold rather than a reproduction of it. Under `Wdk` rather than `Win32`
@@ -81,11 +85,16 @@ disarm64 = "0.2"
 
 # Only `examples/user_heap_smoke.rs` allocates on the host heap it then walks. Cargo unifies
 # this with the normal dependency when building examples and tests, and a downstream consumer
-# of the library still resolves the four features above and no more.
+# of the library still resolves the features above and no more.
+#
+# `Win32_System_Memory` is deliberately **not** repeated here even though the example calls
+# `HeapCreate`/`HeapAlloc` from it: the library dependency now carries it, and listing it twice
+# would leave a reader unable to tell which of the two is load-bearing — so deleting it from the
+# library list above would still build, and the deletion would only be found by a downstream
+# consumer.
 [dev-dependencies.windows]
 version = "0.62.2"
 features = [
-    "Win32_System_Memory",
     "Win32_System_Threading",
     # `GetConsoleProcessList` and `EnumWindows`/`IsWindowVisible`, which is how the launch tests
     # check that a debuggee gets a console of its own and that the console has no window

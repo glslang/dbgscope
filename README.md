@@ -305,6 +305,7 @@ Per-session paged heaps are outside the initial pool-map scope, and the command 
 | `examples/split_open.rs` | Re-validates the two-step openers, including a guard dropped before the engine is pumped. |
 | `examples/typed_context.rs` | Typed reads next to the debugger's own text for the same state. |
 | `examples/user_heap_smoke.rs` | Launches a child, allocates across size regimes, walks its Segment Heap and checks it against the child's own `HeapWalk`. |
+| `examples/heap_coverage.rs` | What, if anything, holds a user heap walk short of `Complete` — every gap it filed, against the memory manager's own record of what is behind it. |
 | `examples/register_description.rs` | The full register description, not one flag of it. |
 
 ## Building

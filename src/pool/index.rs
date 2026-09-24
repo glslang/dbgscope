@@ -108,8 +108,13 @@ impl PoolIndex {
             && left.heap == right.heap
             && left.backend == right.backend
             && left.subsegment == right.subsegment
-            && left.state != PoolState::Unreadable
-            && right.state != PoolState::Unreadable
+            // Both have to be *chunks*, not merely readable ones: a gap has no header and no
+            // successor, so letting one be a neighbour puts an allocation next to memory
+            // nothing was decoded out of. Asked through `is_chunk` rather than named here, so
+            // that a second kind of gap cannot arrive and pass this test by default — which is
+            // exactly what `PoolState::Uncommitted` would have done.
+            && left.state.is_chunk()
+            && right.state.is_chunk()
     }
 
     pub(crate) fn predecessor(&self, index: usize) -> Option<usize> {
@@ -313,6 +318,24 @@ mod tests {
         });
         assert_eq!(contextual.context_for_tag(tag), vec![0, 1, 2, 3, 4]);
         assert_eq!(contextual.successor(2), None);
+
+        // The other kind of gap, and the same answer. A span with nothing behind it has no
+        // header and no successor either, so it cannot be an allocation's neighbour — and
+        // arriving after this test was written is exactly why the check asks `is_chunk`
+        // rather than naming `Unreadable`.
+        let mut uncommitted = span(0x1060, 0, PoolState::Uncommitted, 1);
+        uncommitted.size_class = 0x20;
+        let across_a_gap = PoolIndex::build(PoolSnapshot {
+            spans: vec![
+                span(0x1040, 0, PoolState::ReusableFree, 1),
+                uncommitted,
+                span(0x1080, other, PoolState::Allocated, 1),
+            ],
+            complete: true,
+            ..PoolSnapshot::default()
+        });
+        assert_eq!(across_a_gap.successor(0), None);
+        assert_eq!(across_a_gap.predecessor(2), None);
 
         // Distinct targets, not just distinct generations: the cache keys on the whole
         // SessionKey so a snapshot cannot outlive the target it described.

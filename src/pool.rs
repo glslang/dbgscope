@@ -50,12 +50,56 @@ pub enum PoolBackend {
     Large,
 }
 
+/// What a span is: three kinds of chunk the allocator laid out, and two kinds of span that is
+/// not a chunk at all but the walk accounting for address space it could not decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PoolState {
     Allocated,
     ReusableFree,
     CachedFree,
+    /// Memory the walk could not read, and which the target *has*: a page that is committed
+    /// and paged out, one missing from a dump, or one the debugger refused. Something may have
+    /// been there, so this is a hole in the walk's coverage and clears
+    /// [`query::WalkCoverage::complete`].
     Unreadable,
+    /// Address space inside a region with **no pages behind it** — reserved, or committed and
+    /// since released — as the target's memory manager says, not as the walk inferred from
+    /// where the span lies.
+    ///
+    /// Distinct from [`Self::Unreadable`] because the two are opposite answers to the only
+    /// question coverage asks. Nothing can be in memory that does not exist, so a walk that did
+    /// not read this missed nothing and stays complete. Collapsing the two, which is what this
+    /// walker did until a live user-mode heap was measured against the memory manager's own
+    /// record (glslang/windbg-mcp FOLLOWUPS item 98), left `Partial` as the answer on every
+    /// healthy live target and so left the one signal for *we could not see something* saying
+    /// nothing.
+    Uncommitted,
+}
+
+impl PoolState {
+    /// Whether this span is a chunk the allocator laid out, rather than a gap the walk is
+    /// accounting for.
+    ///
+    /// The distinction every caller that walks *neighbours* needs: a gap has no header, no tag
+    /// and no successor, so treating one as a chunk makes a span adjacent to memory that was
+    /// never decoded. Asked here rather than at each site, because the sites that get it wrong
+    /// are the ones that named `Unreadable` and were never revisited when a second kind of gap
+    /// arrived.
+    pub fn is_chunk(self) -> bool {
+        match self {
+            Self::Allocated | Self::ReusableFree | Self::CachedFree => true,
+            Self::Unreadable | Self::Uncommitted => false,
+        }
+    }
+
+    /// Whether a span in this state counts *against* the walk's coverage — the one place that
+    /// decides what `complete` means.
+    pub fn is_coverage_gap(self) -> bool {
+        match self {
+            Self::Unreadable => true,
+            Self::Allocated | Self::ReusableFree | Self::CachedFree | Self::Uncommitted => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

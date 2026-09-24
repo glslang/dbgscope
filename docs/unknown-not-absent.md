@@ -65,10 +65,62 @@ Two further properties of it are load-bearing:
 `WalkCoverage`. No caller has to know that "incomplete" has more than one cause, and none can
 invent the distinction differently.
 
-**It is not implied by the diagnostics.** A walk can end incomplete having said nothing at all —
-`walk_vs` clears completeness when a readable region stops mid-chunk, without a message. A
-caller that wants to reject partial results consults `coverage` and never the message list.
-The inverse also holds: a walk with thousands of diagnostics can be `Complete`.
+**It is not implied by the diagnostics.** A walk can end incomplete having said nothing at all,
+and a walk with thousands of diagnostics can be `Complete`. A caller that wants to reject
+partial results consults `coverage` and never the message list. (`walk_vs` clearing
+completeness at a chunk running past a committed extent used to be the standing example of the
+silent case; it now names the chunk it dropped — see below.)
+
+### A page that will not read is three things, and only one of them is a gap
+
+A user-mode heap walk was `Partial` on every healthy live process. That is the same failure as
+reporting a partial reading as a total one, reached from the other side: a signal that fires on
+everything says nothing. What held it there was not damage. It was the tails of subsegments and
+page ranges — address space the allocator reserved and never committed — filed as `Unreadable`,
+because *would not read* was the only thing the walk could observe.
+
+Three states hide behind that one observation, and the failed read does not separate them:
+
+| What it is | What it means for coverage |
+|---|---|
+| Reserved, or decommitted — no pages behind it | Nothing could have been there, so nothing was missed. |
+| Committed and paged out, or absent from a dump | The target has this memory and the walk did not see it. A real gap. |
+| Committed and present | Not a gap at all — it read. |
+
+The allocator's own records can answer the first distinction: a page range descriptor's
+`CommittedPageCount`, a VS subsegment's `CommitBitmap`, an LFH subsegment's commit state at
+`CommitStateOffset`. That is three structures, each of which moves between builds, to learn
+what one allocator believes. The **memory manager** answers all of it in one call, about the
+target rather than about the allocator: `DebugEngine::virtual_region`, which is
+`IDebugDataSpaces2::QueryVirtual` returning `MEM_RESERVE`, `MEM_COMMIT` or `MEM_FREE`.
+
+So `PoolState::Uncommitted` joins `Unreadable`, and `PoolState::is_coverage_gap` is the single
+definition of which one costs a walk its `complete`. Three properties keep it honest:
+
+- **Only a positive answer excuses a gap.** A query that fails, a run that cannot advance, a
+  state this crate does not name, and a source that cannot be asked at all are each `None`, and
+  `None` keeps the conservative reading. The excuse is never granted by an absence of evidence.
+- **It is asked of the memory manager, never inferred from where the span lies.** Position is a
+  good guess and it is a guess: on a target trimming paged pool the pages that will not read
+  are committed and written, and a walk calling them empty would claim coverage it never had.
+- **A kernel session is not asked at all.** `QueryVirtual` is a user-mode question, so the
+  kernel pool walk keeps counting every unreadable page against its coverage — which, for paged
+  pool, is the truth.
+
+The same question answers a second one. A free chunk whose middle the allocator decommitted
+runs past the committed extent it starts in, and `walk_vs` emitted no span for it. A span is
+geometry and state, both of which are known there — the header was read, the size came out of
+it and passed the subsegment bound, the state comes from the free tree — and the only thing
+missing is the chunk's *contents*, which no span carries. So where the tail holds nothing the
+chunk is reported; where it is memory the process has, it is not, and now the walk says so.
+
+Measured on a live 26200 process (`sihost`, four Segment Heaps, 19,448 chunks, 2026-09-24): all
+48 gaps were `MEM_RESERVE`, both controls — an allocated chunk and a free one — were
+`MEM_COMMIT`, five chunks with decommitted middles were the last thing holding the walk short,
+and the answer that had been `Partial` was `Complete`. The dump direction was checked from the
+other end, on a thin dump of the same process: an address whose page the dump does not carry
+still answers `Committed`, the read of it still fails, and the walk still counts it. A dump
+that lacks committed pages is exactly the case this must not sweep up.
 
 ### Running out of time is not an error
 
@@ -415,6 +467,8 @@ Once you adopt it, it stops being a pool-walker concern.
 | `Module::name` empty | For an unloaded module there is no name to qualify symbols by. Empty is the fact, not a truncation. |
 | `PoolSpan::requested_size: Option<u64>` | Set only where allocator metadata validates it. Kernel pool and LFH/VS spans leave it `None` rather than guessing from capacity. |
 | `PoolState::Unreadable` | A distinct state from `Allocated` and the two free states — the walker reached the chunk and could not read it. |
+| `PoolState::Uncommitted` | Distinct from `Unreadable`, and the one gap that does *not* cost the walk its `complete`: the memory manager says there are no pages behind it, so nothing was missed. Never inferred — only a positive `MEM_RESERVE`/`MEM_FREE` puts a span here. |
+| `VirtualState::Unknown(u32)` | A `State` the engine returned that this crate does not name, kept rather than folded into reserved or committed — guessing either way is the one thing that would make the primitive lie. |
 | `query::chunk_at` → `Ok(None)` | "Not covered by the snapshot at all", which is a different answer from "it is a free hole" — that comes back as a chunk whose `PoolState` is not `Allocated`. |
 | `find_tag` indexes allocated chunks only | A freed chunk's tag is not reliably preserved by the allocator, so "freed chunks with this tag" would be inventing information. |
 | `PoolKind`'s eight variants | Not collapsed to paged/nonpaged, because crossing one of those boundaries creates false holes. |
