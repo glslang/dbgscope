@@ -6,7 +6,56 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`DebugEngine::virtual_region`** — `IDebugDataSpaces2::QueryVirtual` as a typed answer
+  (`VirtualRegion`, `VirtualState`), which is what the memory manager says about a run of pages
+  rather than what the debugger can read there. `VirtualState::Unknown(u32)` keeps a state this
+  crate does not name instead of folding it into reserved or committed, because either guess is
+  what would make the primitive lie. User-mode only; a kernel session has no answer to give and
+  says so as an error.
+
+  **Its output buffer must be 16-byte aligned**, which `MEMORY_BASIC_INFORMATION64` is not: the
+  engine's live-target path copies the 48-byte answer out with three `movaps` stores and takes
+  an access violation *inside dbgeng* otherwise. The dump path copies field by field, so the
+  same call against a full dump answered 22 queries from an 8-aligned buffer without complaint —
+  testing this on a dump proves nothing about it. Measured on 26200, 2026-09-24
+  (`dbgeng!Ordinal367+0x14f96`, `movaps xmmword ptr [rbx],xmm0`).
+
+- **`examples/heap_coverage.rs`** — what, if anything, holds a user heap walk short of
+  `Complete`: every gap it filed, put back to the memory manager, with an allocated chunk and a
+  free one as controls. An address as a second argument answers that one question, which is how
+  the dump direction is checked.
+
 ### Changed
+
+- **A heap walk no longer calls reserved address space a hole in its own coverage.** A user-mode
+  walk came back `coverage: Partial` on every healthy live process, because the tails of
+  subsegments and page ranges — reserved and never committed — read the same way a paged-out
+  page does, and *would not read* was the only thing the walk could observe. `PoolState` gains
+  `Uncommitted` (and `HeapState` with it), and `PoolState::is_coverage_gap` is now the single
+  definition of which gap costs a walk its `complete`.
+
+  What separates them is `virtual_region`, not the allocator's records: `CommittedPageCount`,
+  `CommitBitmap` and the LFH commit state are three structures that move between builds and say
+  what one allocator believes, while the memory manager answers about the target in one call.
+  Only a positive `MEM_RESERVE`/`MEM_FREE` excuses a gap — a failed query, a run that cannot
+  advance, an unnamed state and a source that cannot be asked are each conservative, so the
+  excuse is never granted by an absence of evidence. The kernel pool walk is not asked at all
+  and is unchanged.
+
+  A free chunk whose middle the allocator decommitted is the same question reached another way:
+  it runs past the committed extent it starts in, and `walk_vs` emitted no span for it and
+  cleared `complete` **without a diagnostic**. A span is geometry and state, both of which are
+  known there, so where the tail holds nothing the chunk is now reported; where it is memory the
+  process has, it is still refused, and the walk now names the chunk it dropped.
+
+  Measured on a live 26200 process (`sihost`, four Segment Heaps, 20,426 chunks, 2026-09-24):
+  every one of its 33 gaps `MEM_RESERVE`, both controls `MEM_COMMIT`, and an answer that had
+  been `Partial` is `Complete`. Checked from the other end on a thin dump of the same process:
+  an address whose page the dump does not carry still answers `Committed`, the read still fails,
+  and the walk still counts it. `HeapWalkReport` gains `uncommitted_gaps` so that what a
+  `Complete` answer forgave is still on the report. windbg-mcp `FOLLOWUPS.md` item 98.
 
 - **The kernel pool walker takes ARM64 targets.** `pool::query` accepted
   `IMAGE_FILE_MACHINE_AMD64` and nothing else, so every `pool_*` query against an ARM64 kernel

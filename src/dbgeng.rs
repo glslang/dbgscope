@@ -38,6 +38,9 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     IDebugSystemObjects,
 };
 use windows::Win32::System::Diagnostics::Debug::{EXCEPTION_RECORD64, IMAGEHLP_MODULEW64};
+use windows::Win32::System::Memory::{
+    MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION64,
+};
 
 /// Callback type for breakpoint events that receives the breakpoint, context, and flags
 pub type BreakpointCallback =
@@ -1476,6 +1479,96 @@ pub struct MemoryRead {
     pub bytes: Vec<u8>,
     /// `None` when the whole range was read.
     pub cut_short: Option<Interruption>,
+}
+
+/// `QueryVirtual`'s output buffer, **16-byte aligned**, which the type it holds is not.
+///
+/// `MEMORY_BASIC_INFORMATION64` is 48 bytes of 8-byte fields, so Rust aligns it to 8 — and the
+/// engine's *live-target* path copies the answer out with three `movaps` stores, which fault on
+/// anything less than 16. Measured on 26200 (`dbgeng!Ordinal367+0x14f96`,
+/// `movaps xmmword ptr [rbx],xmm0`, 2026-09-24): an 8-aligned buffer took an access violation
+/// **inside dbgeng** on the first call against a live process, with nothing in the Rust frames
+/// to suggest the caller was at fault.
+///
+/// The crash is path-dependent, which is what makes it worth a type rather than a comment: the
+/// dump path copies the same structure field by field, so the identical call against a full
+/// dump answered 22 queries with no alignment at all. Testing this on a dump proves nothing
+/// about it.
+#[repr(C, align(16))]
+#[derive(Default)]
+struct AlignedMemoryInfo(MEMORY_BASIC_INFORMATION64);
+
+/// One run of pages as the memory manager describes it; see [`DebugEngine::virtual_region`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualRegion {
+    /// The first address of the run, which is at or below the address asked about.
+    pub base: u64,
+    /// Its length in bytes. Zero would mean the engine described nothing, and callers that act
+    /// on a region have to check for it rather than assume a query that succeeded covers the
+    /// address it was given.
+    pub size: u64,
+    pub state: VirtualState,
+    /// `PAGE_*` protection, verbatim. Meaningless on a [`VirtualState::Free`] run, and for
+    /// [`VirtualState::Reserved`] it is `AllocationProtect` rather than a page protection.
+    pub protect: u32,
+}
+
+impl VirtualRegion {
+    /// Whether this run covers `address` — what a caller needs before reading anything off it.
+    pub fn contains(&self, address: u64) -> bool {
+        address >= self.base && address - self.base < self.size
+    }
+
+    /// The last address in the run, or `None` for an empty one.
+    pub fn end(&self) -> Option<u64> {
+        (self.size != 0).then(|| self.base.saturating_add(self.size))
+    }
+}
+
+/// Whether a run of pages holds anything.
+///
+/// The distinction [`DebugEngine::virtual_region`] exists for: address space that was never
+/// committed can hold nothing, so a walk that cannot read it has missed nothing, while committed
+/// memory that will not read is a real hole in what the walk saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualState {
+    /// `MEM_FREE`: not reserved at all.
+    Free,
+    /// `MEM_RESERVE`: address space claimed, no pages behind it.
+    Reserved,
+    /// `MEM_COMMIT`: pages exist. They may still be unreadable — paged out, or absent from a
+    /// dump — which is exactly the case a walk must keep counting against its coverage.
+    Committed,
+    /// A `State` this build of the engine returned and this crate does not name. Kept rather
+    /// than folded into one of the three above, because guessing which way it folds is the one
+    /// thing that would make this primitive lie: read as `Reserved` it would excuse a gap that
+    /// is real, and read as `Committed` it would refuse to excuse one that is not.
+    Unknown(u32),
+}
+
+impl VirtualState {
+    fn from_mem_state(state: u32) -> Self {
+        // `VIRTUAL_ALLOCATION_TYPE` is a flag word, and the three states are disjoint bits in
+        // it, so this matches on the bit rather than on equality: `MEM_COMMIT` arrives beside
+        // other bits on some queries and an `==` would send it to `Unknown`.
+        match state {
+            _ if state & MEM_COMMIT.0 != 0 => Self::Committed,
+            _ if state & MEM_RESERVE.0 != 0 => Self::Reserved,
+            _ if state & MEM_FREE.0 != 0 => Self::Free,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Whether pages are behind this address space. `false` for both `MEM_RESERVE` and
+    /// `MEM_FREE`; `None` when the engine named a state this crate does not know, where the
+    /// caller must fall back rather than choose.
+    pub fn committed(self) -> Option<bool> {
+        match self {
+            Self::Committed => Some(true),
+            Self::Reserved | Self::Free => Some(false),
+            Self::Unknown(_) => None,
+        }
+    }
 }
 
 /// How much of a bounded read to ask the engine for per `ReadVirtual`.
@@ -4673,6 +4766,37 @@ impl DebugEngine {
             source,
         })?;
         Ok((valid_base, valid_size as usize))
+    }
+
+    /// What the **memory manager** says about the run of pages `address` lies in, rather than
+    /// what the debugger can read there.
+    ///
+    /// The two are different questions and [`Self::valid_virtual_region`] only answers the
+    /// second. A page that will not read is reserved, or decommitted, or committed and paged
+    /// out, and a walk that cannot tell those apart has to treat all three as a hole in its own
+    /// coverage. This tells them apart: `MEM_RESERVE` is address space nothing was ever put in,
+    /// so nothing was missed there, while `MEM_COMMIT` that will not read is memory the target
+    /// does have and the debugger could not see.
+    ///
+    /// **User-mode targets only.** `QueryVirtual` is `NtQueryVirtualMemory` as the engine reaches
+    /// it, so a kernel session has no answer to give and this is an error there rather than a
+    /// state — callers must keep whatever conservative reading they had. On a crash dump it is
+    /// the `MemoryInfoListStream`, which a full dump carries and a minidump need not, so the
+    /// same error stands in for "this dump does not say".
+    pub fn virtual_region(&self, address: u64) -> Result<VirtualRegion, DbgEngError> {
+        let mut info = AlignedMemoryInfo::default();
+        unsafe { self.dataspaces.QueryVirtual(address, &mut info.0) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: format!("querying the memory manager about {address:#x}"),
+                source,
+            }
+        })?;
+        Ok(VirtualRegion {
+            base: info.0.BaseAddress,
+            size: info.0.RegionSize,
+            state: VirtualState::from_mem_state(info.0.State.0),
+            protect: info.0.Protect.0,
+        })
     }
 
     pub fn interrupted(&self) -> Result<bool, DbgEngError> {

@@ -135,6 +135,17 @@ pub(crate) struct PoolRegion {
     pub big_pool: Arc<HashMap<u64, BigPageEntry>>,
 }
 
+/// One run of address space the target's memory manager describes the same way; see
+/// [`PoolMemory::committed_run`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitRun {
+    /// One past the last byte of the run, and always above the address it was asked about —
+    /// so a caller stepping a span with it cannot fail to advance.
+    pub end: u64,
+    /// Whether pages exist behind it.
+    pub committed: bool,
+}
+
 pub(crate) trait PoolMemory {
     fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError>;
     fn valid_region(&self, address: u64, size: usize) -> Result<(u64, usize), SnapshotError>;
@@ -146,6 +157,20 @@ pub(crate) trait PoolMemory {
     /// puts one in front of it, and [`SnapshotWalker::walk`] is what wraps it.
     fn out_of_budget(&self) -> bool {
         false
+    }
+
+    /// What the target's **memory manager** says about the run of pages `address` lies in —
+    /// a different question from whether the debugger can read it, and the only one that
+    /// separates *nothing was ever here* from *we could not see what is here*.
+    ///
+    /// `None` means this source cannot say, and the caller then keeps the conservative
+    /// reading: what did not read stays a hole in the walk's coverage. **That default is
+    /// deliberate.** A source that does not override this behaves exactly as it did, so no
+    /// fixture starts excusing gaps by accident — the ones that exercise
+    /// [`PoolState::Uncommitted`] have to say so, which is what makes their assertions mean
+    /// anything.
+    fn committed_run(&self, _address: u64) -> Option<CommitRun> {
+        None
     }
 }
 
@@ -192,6 +217,10 @@ impl<M: PoolMemory> PoolMemory for Budgeted<'_, M> {
             .is_some_and(|deadline| Instant::now() >= deadline)
             || self.inner.out_of_budget()
     }
+
+    fn committed_run(&self, address: u64) -> Option<CommitRun> {
+        self.inner.committed_run(address)
+    }
 }
 
 impl PoolMemory for crate::dbgeng::DebugEngine {
@@ -218,6 +247,32 @@ impl PoolMemory for crate::dbgeng::DebugEngine {
             SnapshotError::InterruptQuery {
                 source: Box::new(source),
             }
+        })
+    }
+
+    /// **Not asked of a kernel session at all.** `QueryVirtual` is the engine reaching
+    /// `NtQueryVirtualMemory` in the debuggee, which a kernel target has no equivalent of, so
+    /// every call there fails — and a kernel walk files thousands of unreadable spans, which
+    /// would be thousands of failed calls to learn the same thing each time. The kernel walk
+    /// therefore keeps counting every unreadable page against its coverage, which on a target
+    /// trimming paged pool is the truth: those pages are committed and the walk really did
+    /// miss what was in them (`windbg-mcp` FOLLOWUPS item 100).
+    ///
+    /// Every other answer that is not plainly *committed* or *not committed* — a query that
+    /// fails, a zero-length run, a state this crate does not name — is `None` rather than a
+    /// guess, because the guess is what would make this lie: read as uncommitted it excuses a
+    /// gap that is real.
+    fn committed_run(&self, address: u64) -> Option<CommitRun> {
+        if crate::dbgeng::DebugEngine::is_kernel_target(self).ok()? {
+            return None;
+        }
+        let region = self.virtual_region(address).ok()?;
+        if !region.contains(address) {
+            return None;
+        }
+        Some(CommitRun {
+            end: region.end()?,
+            committed: region.state.committed()?,
         })
     }
 }
@@ -2301,14 +2356,21 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 }
             };
             let valid_base = reported_base.max(cursor).min(requested_end);
-            if valid_base > cursor {
+            // Reported only when some of that space is memory the target **has** — which,
+            // before `committed_run` could be asked, was the only reading available. On a
+            // healthy live user-mode heap the whole of it is reserved subsegment tails, and
+            // saying "unreadable space extends" about address space holding nothing is a
+            // diagnostic that both describes nothing wrong and is wrong about what it
+            // describes. Emitting it after the spans rather than before them is what lets it
+            // be conditional at all: only filing them establishes which kind this is.
+            if valid_base > cursor && self.unreadable(region, cursor, valid_base - cursor, snapshot)
+            {
                 snapshot.diagnostics.push(format!(
                     "region {:#x}+{:#x} is only committed through {cursor:#x}; unreadable space extends {:#x} bytes",
                     region.address,
                     region.size,
                     valid_base - cursor
                 ));
-                self.unreadable(region, cursor, valid_base - cursor, snapshot);
             }
             let valid_end = reported_base
                 .saturating_add(reported_size as u64)
@@ -2547,24 +2609,89 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
         }
     }
 
+    /// Files address space the walk did not decode, split by what the memory manager says is
+    /// behind it.
+    ///
+    /// Every caller reaches this having failed to read something, which is where the walk used
+    /// to stop reasoning: it recorded one [`PoolState::Unreadable`] span and cleared
+    /// `complete`. That is right for a page the target has and wrong for address space that
+    /// holds nothing, and the two are not distinguishable from the failure — a reserved tail
+    /// and a trimmed page fail a read identically. [`PoolMemory::committed_run`] is what
+    /// separates them, and it is asked **per run** rather than per page, so one reserved tail
+    /// of any size costs one query.
+    ///
+    /// Split rather than classified whole: a span can cross the boundary — the tail of a
+    /// committed run and the reserved space after it arrive here as one failure — and calling
+    /// the whole of it by either name misreports the other half. Splitting also keeps the byte
+    /// totals addable, which is the only way the figure downstream means anything.
+    ///
+    /// Answers **whether any of it counted against coverage**, so a caller whose diagnostic is
+    /// about missed memory can stay quiet when nothing was missed.
     fn unreadable(
         &self,
         region: &PoolRegion,
         address: u64,
         size: u64,
         snapshot: &mut PoolSnapshot,
-    ) {
-        if size != 0 {
-            snapshot.complete = false;
-            snapshot.record_span(self.base_span(
-                region,
-                address,
-                address,
-                size,
-                0,
-                PoolState::Unreadable,
-            ));
+    ) -> bool {
+        let Some(end) = (size != 0).then(|| address.saturating_add(size)) else {
+            return false;
+        };
+        let mut cursor = address;
+        let mut missed = false;
+        while cursor < end {
+            // `> cursor` is not a formality: a run that does not advance would spin here, and
+            // the engine answering about a *preceding* run is exactly the shape `walk_region`
+            // already has to defend against. An answer that cannot move the cursor is no
+            // answer, so the rest of the span is filed the conservative way and the loop ends.
+            let Some(run) = self
+                .memory
+                .committed_run(cursor)
+                .filter(|run| run.end > cursor)
+            else {
+                return self.gap(
+                    region,
+                    cursor,
+                    end - cursor,
+                    PoolState::Unreadable,
+                    snapshot,
+                ) || missed;
+            };
+            let stop = run.end.min(end);
+            let state = if run.committed {
+                PoolState::Unreadable
+            } else {
+                PoolState::Uncommitted
+            };
+            missed |= self.gap(region, cursor, stop - cursor, state, snapshot);
+            cursor = stop;
         }
+        missed
+    }
+
+    /// Records one gap span and, when it is a gap in *coverage*, clears `complete`; answers
+    /// whether it was one.
+    ///
+    /// The clearing is here rather than at the call sites so the two can never disagree:
+    /// `complete` means "no span says something may have been missed", and
+    /// [`PoolState::is_coverage_gap`] is the one definition of which states say that.
+    fn gap(
+        &self,
+        region: &PoolRegion,
+        address: u64,
+        size: u64,
+        state: PoolState,
+        snapshot: &mut PoolSnapshot,
+    ) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let missed = state.is_coverage_gap();
+        if missed {
+            snapshot.complete = false;
+        }
+        snapshot.record_span(self.base_span(region, address, address, size, 0, state));
+        missed
     }
 
     /// Decodes a Driver Verifier special-pool region, one allocation per page.
@@ -2863,16 +2990,38 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 snapshot.complete = false;
             }
             let chunk_size = chunk.size;
-            if offset.saturating_add(chunk_size) > bytes.len() {
-                // The chunk reaches past the committed extent, which after the bound check in
-                // `decode_vs_chunk` can only mean a hole ahead of it inside the subsegment —
-                // so this is the ordinary free chunk with a decommitted interior, not a walk
-                // running out of bytes. It carries the chain over the hole, which is the whole
-                // reason the expectation is returned rather than recomputed per extent.
-                //
-                // Still incomplete, and for the reason `complete` exists: no span is emitted for
-                // this chunk, so the snapshot omits it however well the walk understands it.
+            // The chunk reaches past the committed extent, which after the bound check in
+            // `decode_vs_chunk` can only mean a hole ahead of it inside the subsegment — so
+            // this is the ordinary free chunk with a decommitted interior, not a walk running
+            // out of bytes. It carries the chain over the hole, which is the whole reason the
+            // expectation is returned rather than recomputed per extent.
+            //
+            // **What the walk loses by it depends on what is in the hole**, and the same
+            // question the gap spans ask answers this one. A chunk's span is geometry and
+            // state, not contents: its header was read, its size came out of that header and
+            // passed the bound check, and its state comes from the free tree — so where the
+            // tail holds nothing, nothing about the chunk is unknown and the span is emitted
+            // below like any other. Where the tail is memory the process has, the walk really
+            // did fail to see part of this chunk, and then no span is emitted and `complete`
+            // clears.
+            //
+            // Measured on `sihost` (26200, 2026-09-24): five free chunks of 0x1660 to 0xfe70
+            // bytes, each with a decommitted middle, were the *only* thing left holding that
+            // walk at `Partial` once the gap spans were classified — and this site cleared
+            // `complete` without a diagnostic, so nothing in the answer said why.
+            if offset.saturating_add(chunk_size) > bytes.len()
+                && !self
+                    .memory
+                    .committed_run(base.saturating_add(bytes.len() as u64))
+                    .is_some_and(|run| !run.committed)
+            {
                 resume = header_address.saturating_add(chunk_size as u64);
+                snapshot.diagnostics.push(format!(
+                    "VS chunk at {header_address:#x} is {chunk_size:#x} bytes and runs \
+                     {:#x} past the committed extent at {:#x}; no span is emitted for it",
+                    offset.saturating_add(chunk_size) - bytes.len(),
+                    base.saturating_add(bytes.len() as u64)
+                ));
                 snapshot.complete = false;
                 break;
             }
@@ -4213,7 +4362,16 @@ mod tests {
         /// something and failing to size it. The two look alike at the call site and mean
         /// opposite things about what lies behind them.
         blind: HashSet<u64>,
+        /// What the *memory manager* says, which is a separate axis from every field above:
+        /// those decide what reads, this decides whether there was anything there to read.
+        ///
+        /// `None` is a source that cannot answer — the debugger against a kernel target, or a
+        /// dump recording no memory information — and is the default, so every test written
+        /// before this existed keeps its old meaning. `Some` names the pages with no pages
+        /// behind them.
+        uncommitted: Option<HashSet<u64>>,
         queries: Cell<usize>,
+        commit_queries: Cell<usize>,
     }
 
     impl HoleyMemory {
@@ -4224,8 +4382,16 @@ mod tests {
                 holes: HashSet::new(),
                 stalls: HashSet::new(),
                 blind: HashSet::new(),
+                uncommitted: None,
                 queries: Cell::new(0),
+                commit_queries: Cell::new(0),
             }
+        }
+
+        /// Give this source a memory manager, telling it which pages hold nothing.
+        fn with_memory_manager(mut self, uncommitted: &[u64]) -> Self {
+            self.uncommitted = Some(uncommitted.iter().copied().collect());
+            self
         }
 
         fn end(&self) -> u64 {
@@ -4280,6 +4446,33 @@ mod tests {
 
         fn interrupted(&self) -> Result<bool, SnapshotError> {
             Ok(false)
+        }
+
+        /// Answers in **runs**, as the memory manager does: like pages are merged, so a walk
+        /// stepping a gap of any length costs one query per run and not one per page. The
+        /// counter is what lets a test say so.
+        fn committed_run(&self, address: u64) -> Option<CommitRun> {
+            let uncommitted = self.uncommitted.as_ref()?;
+            self.commit_queries.set(self.commit_queries.get() + 1);
+            let mut page = address & !(PAGE_SIZE - 1);
+            let committed = !uncommitted.contains(&page);
+            loop {
+                page += PAGE_SIZE;
+                if page >= self.end() {
+                    // Past the fixture the whole rest of the address space is one run of the
+                    // same kind, which keeps a run always able to advance the caller.
+                    return Some(CommitRun {
+                        end: u64::MAX,
+                        committed,
+                    });
+                }
+                if !uncommitted.contains(&page) != committed {
+                    return Some(CommitRun {
+                        end: page,
+                        committed,
+                    });
+                }
+            }
         }
     }
 
@@ -4388,6 +4581,221 @@ mod tests {
         );
     }
 
+    /// The gap spans of a walk, as `(state, address, size)`, in address order.
+    fn gaps(snapshot: &PoolSnapshot) -> Vec<(PoolState, u64, u64)> {
+        let mut gaps: Vec<_> = snapshot
+            .spans
+            .iter()
+            .filter(|span| !span.state.is_chunk())
+            .map(|span| (span.state, span.header_address, span.size))
+            .collect();
+        gaps.sort_by_key(|&(_, address, _)| address);
+        gaps
+    }
+
+    /// `windbg-mcp` FOLLOWUPS item 98. The same page that does not read is a hole in the walk's
+    /// coverage or is nothing at all, and **only the memory manager can say which** — so this
+    /// runs one fixture past three memory managers and changes nothing else.
+    ///
+    /// The three answers are the whole rule. A source that says the page holds nothing files
+    /// [`PoolState::Uncommitted`] and leaves `complete` alone; one that says the page is
+    /// committed files [`PoolState::Unreadable`] and clears it; and one that cannot say keeps
+    /// the second reading, because *unknown* has to fall on the conservative side or the
+    /// excuse is being granted by the absence of evidence.
+    ///
+    /// Measured live before it was written: on `sihost` (26200, 4 Segment Heaps, 19,459
+    /// chunks, 2026-09-24) every one of the 45 unreadable spans holding the walk at `Partial`
+    /// was `MEM_RESERVE`, and both controls — an allocated chunk and a free one — were
+    /// `MEM_COMMIT`.
+    #[test]
+    fn test_only_the_memory_manager_decides_whether_a_gap_costs_coverage() {
+        let gap = SPECIAL_PAGE + PAGE_SIZE;
+        let walk = |memory: HoleyMemory| {
+            let mut memory = memory;
+            memory.holes.insert(gap);
+            let snapshot = walk_holey(&memory, &special_region(SPECIAL_PAGE, 4));
+            // The pages on either side are walked whatever the answer is: this changes how a
+            // gap is *described*, never how much is read.
+            assert_eq!(
+                snapshot
+                    .spans
+                    .iter()
+                    .filter(|span| span.state == PoolState::Allocated)
+                    .count(),
+                3,
+                "the gap is one page of four"
+            );
+            (snapshot, memory.commit_queries.get())
+        };
+
+        let (nothing_there, queries) =
+            walk(HoleyMemory::new(SPECIAL_PAGE, special_pages(4)).with_memory_manager(&[gap]));
+        assert_eq!(
+            gaps(&nothing_there),
+            [(PoolState::Uncommitted, gap, PAGE_SIZE)],
+            "a page with nothing behind it is not a hole in what the walk saw"
+        );
+        assert!(
+            nothing_there.complete,
+            "and so the walk covered everything it set out to"
+        );
+        assert_eq!(
+            queries, 1,
+            "asked per run, not per page — a reserved tail of any length costs one query"
+        );
+
+        let (really_missed, _) =
+            walk(HoleyMemory::new(SPECIAL_PAGE, special_pages(4)).with_memory_manager(&[]));
+        assert_eq!(
+            gaps(&really_missed),
+            [(PoolState::Unreadable, gap, PAGE_SIZE)],
+            "a committed page that will not read is memory the target has and we did not see"
+        );
+        assert!(!really_missed.complete);
+
+        let (cannot_say, _) = walk(HoleyMemory::new(SPECIAL_PAGE, special_pages(4)));
+        assert_eq!(
+            gaps(&cannot_say),
+            gaps(&really_missed),
+            "a source with no answer keeps the conservative reading, not the convenient one"
+        );
+        assert!(!cannot_say.complete);
+    }
+
+    /// The diagnostic that goes with the gap, which is about *missed memory* and so has to be
+    /// as conditional as the coverage is.
+    ///
+    /// It fired on every reserved tail before this, which on a live user-mode heap is all of
+    /// them — a line per gap describing nothing wrong, and wrong about what it describes
+    /// ("unreadable space" for address space that holds nothing). The same failure mode as
+    /// glslang/dbgscope#94, where 3,285 such lines drowned out the diagnostics that meant
+    /// something.
+    #[test]
+    fn test_a_gap_with_nothing_behind_it_is_not_worth_a_diagnostic() {
+        let gap = SPECIAL_PAGE + PAGE_SIZE;
+        let complains = |memory: HoleyMemory| {
+            let mut memory = memory;
+            memory.holes.insert(gap);
+            let snapshot = walk_holey(&memory, &special_region(SPECIAL_PAGE, 4));
+            snapshot
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|message| message.contains("only committed through"))
+        };
+
+        assert!(
+            !complains(
+                HoleyMemory::new(SPECIAL_PAGE, special_pages(4)).with_memory_manager(&[gap])
+            ),
+            "nothing was missed, so there is nothing to report"
+        );
+        assert!(
+            complains(HoleyMemory::new(SPECIAL_PAGE, special_pages(4)).with_memory_manager(&[])),
+            "a committed page that would not read is still worth saying"
+        );
+        assert!(
+            complains(HoleyMemory::new(SPECIAL_PAGE, special_pages(4))),
+            "and so is one nothing could be asked about"
+        );
+    }
+
+    /// A gap that crosses the boundary is **split**, because calling the whole of it by either
+    /// name misreports the other half — and the half that is really missed still costs the
+    /// walk its `complete`.
+    ///
+    /// This is the shape a live target actually produces: a subsegment's committed pages end
+    /// part-way through the range that holds it, so the tail of a committed run and the
+    /// reserved space after it reach the walk as one failed read.
+    #[test]
+    fn test_a_gap_straddling_the_commit_boundary_is_split_at_it() {
+        let mut memory = HoleyMemory::new(SPECIAL_PAGE, special_pages(4))
+            // Only the second of the two pages that will not read holds nothing.
+            .with_memory_manager(&[SPECIAL_PAGE + 2 * PAGE_SIZE]);
+        memory.holes.insert(SPECIAL_PAGE + PAGE_SIZE);
+        memory.holes.insert(SPECIAL_PAGE + 2 * PAGE_SIZE);
+        let snapshot = walk_holey(&memory, &special_region(SPECIAL_PAGE, 4));
+
+        assert_eq!(
+            gaps(&snapshot),
+            [
+                (PoolState::Unreadable, SPECIAL_PAGE + PAGE_SIZE, PAGE_SIZE),
+                (
+                    PoolState::Uncommitted,
+                    SPECIAL_PAGE + 2 * PAGE_SIZE,
+                    PAGE_SIZE
+                ),
+            ],
+            "two spans, each the size of what it describes"
+        );
+        assert!(
+            !snapshot.complete,
+            "half of it was memory the target has, and that half is still missing"
+        );
+    }
+
+    /// A memory manager whose answer cannot advance the walk, which is the one way this loop
+    /// could hang rather than misreport.
+    ///
+    /// Not hypothetical: `walk_region` already defends against the engine naming a region
+    /// *behind* the cursor, and the same answer reaches here. The rest of the span is filed
+    /// the conservative way and the loop ends.
+    ///
+    /// **Deleting the guard hangs this test rather than failing it** — verified 2026-09-24,
+    /// which is the point: without it a walk that met such an answer would never return, and
+    /// a wedged engine process is the one failure this module cannot report its way out of.
+    #[test]
+    fn test_a_commit_run_that_cannot_advance_is_no_answer_at_all() {
+        struct Stuck(HoleyMemory);
+        impl PoolMemory for Stuck {
+            fn read_exact(&self, address: u64, size: usize) -> Result<Vec<u8>, SnapshotError> {
+                self.0.read_exact(address, size)
+            }
+            fn valid_region(
+                &self,
+                address: u64,
+                size: usize,
+            ) -> Result<(u64, usize), SnapshotError> {
+                self.0.valid_region(address, size)
+            }
+            fn interrupted(&self) -> Result<bool, SnapshotError> {
+                Ok(false)
+            }
+            fn committed_run(&self, address: u64) -> Option<CommitRun> {
+                // Names the address it was given, so a caller that trusted it would ask the
+                // same question forever.
+                Some(CommitRun {
+                    end: address,
+                    committed: false,
+                })
+            }
+        }
+
+        let mut inner = HoleyMemory::new(SPECIAL_PAGE, special_pages(4));
+        inner.holes.insert(SPECIAL_PAGE + PAGE_SIZE);
+        let memory = Stuck(inner);
+        let layout = vs_layout(VsFixture::Inline);
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+        let mut snapshot = PoolSnapshot {
+            complete: true,
+            ..PoolSnapshot::default()
+        };
+        walker
+            .walk_region(&special_region(SPECIAL_PAGE, 4), &mut snapshot)
+            .unwrap();
+
+        assert_eq!(
+            gaps(&snapshot),
+            [(PoolState::Unreadable, SPECIAL_PAGE + PAGE_SIZE, PAGE_SIZE)],
+            "an answer that cannot advance is discarded, not acted on"
+        );
+        assert!(!snapshot.complete);
+    }
+
     /// A VS subsegment with a hole in it, walked in two committed extents.
     ///
     /// `bytes` tiles the whole region with chunks the way the allocator does; `holes` names the
@@ -4396,10 +4804,20 @@ mod tests {
     /// ranges anywhere inside the subsegment and tracks them in `_HEAP_VS_SUBSEGMENT.CommitBitmap`
     /// — and it is the shape the old walk had no way to survive.
     fn walk_vs_with_holes(chunks: &[(usize, usize)], holes: &[u64]) -> PoolSnapshot {
+        walk_vs_holes(chunks, holes, false)
+    }
+
+    /// `walk_vs_with_holes`, plus a memory manager that confirms the holes hold nothing —
+    /// which is what a live target's does, and what the walk needs before it can treat a
+    /// chunk running into one as fully understood.
+    fn walk_vs_holes(chunks: &[(usize, usize)], holes: &[u64], asked: bool) -> PoolSnapshot {
         let bytes = vs_extent(chunks);
         let region = vs_region(bytes.len());
         let mut memory = HoleyMemory::new(VS_BASE, bytes);
         memory.holes.extend(holes.iter().copied());
+        if asked {
+            memory = memory.with_memory_manager(holes);
+        }
         walk_holey(&memory, &region)
     }
 
@@ -4510,6 +4928,69 @@ mod tests {
                 .any(|message| message.contains("does not begin on a chunk boundary")),
             "{:?}",
             snapshot.diagnostics.examples()
+        );
+    }
+
+    /// The chunk in the test above **is** billed as coverage the walk gave up, and that is the
+    /// other half of `windbg-mcp` FOLLOWUPS item 98: a free chunk whose middle the allocator
+    /// decommitted runs past the committed extent, so no span was emitted for it and
+    /// `complete` cleared — silently, with no diagnostic saying which chunk or why.
+    ///
+    /// A span is geometry and state, and both are known here: the header was read, the size
+    /// came out of it and passed the subsegment bound, and the state comes from the free tree.
+    /// The only thing the walk could not see is the chunk's *contents*, which no span carries
+    /// — so where the tail holds nothing the chunk is emitted like any other.
+    ///
+    /// The control is the same fixture with no memory manager, and it must still refuse: a
+    /// tail the walk cannot ask about may be memory the target has, and a chunk that large
+    /// with an unread middle is a real hole in what was seen.
+    ///
+    /// On `sihost` (26200, 2026-09-24) this was the last thing between a healthy live walk and
+    /// `Complete` — five chunks, 0x1660 to 0xfe70 bytes, after all 48 gap spans had been
+    /// classified.
+    #[test]
+    fn test_a_chunk_running_into_nothing_is_still_a_chunk() {
+        let chunks = [(0x1000usize, 0usize), (0x3000, 0x1000)];
+        let holes = [VS_BASE + 0x2000];
+
+        let asked = walk_vs_holes(&chunks, &holes, true);
+        assert_eq!(
+            asked
+                .spans
+                .iter()
+                .filter(|span| span.state.is_chunk())
+                .map(|span| (span.header_address, span.size))
+                .collect::<Vec<_>>(),
+            [(VS_BASE + 0x10, 0xfe0), (VS_BASE + 0x1010, 0x2fe0)],
+            "the chunk that spans the hole is understood, so it is reported"
+        );
+        assert!(
+            asked.complete,
+            "and nothing about it is unknown, so the walk covered everything: {:?}",
+            asked.diagnostics.examples()
+        );
+
+        let unasked = walk_vs_holes(&chunks, &holes, false);
+        assert_eq!(
+            unasked
+                .spans
+                .iter()
+                .filter(|span| span.state.is_chunk())
+                .map(|span| span.header_address)
+                .collect::<Vec<_>>(),
+            [VS_BASE + 0x10],
+            "with no answer about the tail the chunk is not invented"
+        );
+        assert!(!unasked.complete);
+        assert!(
+            unasked
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|message| message.contains("runs")
+                    && message.contains("past the committed extent")),
+            "and the walk says which chunk it dropped: {:?}",
+            unasked.diagnostics.examples()
         );
     }
 

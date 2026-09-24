@@ -74,6 +74,10 @@ fn glyph(span: &PoolSpan, selected: bool) -> (char, &'static str) {
             PoolState::ReusableFree => ('.', "0xf4d03f"),
             PoolState::CachedFree => ('c', "0xe67e22"),
             PoolState::Unreadable => ('?', "0x7f8c8d"),
+            // Distinct from `?` on purpose: the two look the same to a reader of the map and
+            // mean opposite things. `?` is a hole in what the walk saw; `-` is address space
+            // with nothing behind it, which the map should show as the empty span it is.
+            PoolState::Uncommitted => ('-', "0x566573"),
         }
     }
 }
@@ -259,7 +263,7 @@ pub(crate) fn render_pool_map(
     }
     push_chunked(
         &mut chunks,
-        "Legend: S selected tag, A unrelated allocation, . reusable hole, c cached/delay-free, ? unreadable\n",
+        "Legend: S selected tag, A unrelated allocation, . reusable hole, c cached/delay-free, ? unreadable, - uncommitted\n",
         options.dml,
     );
     if let Some(tag) = options.tag {
@@ -365,6 +369,7 @@ pub(crate) fn render_advice(index: &PoolIndex, tag: u32, dml: bool) -> String {
                         PoolState::ReusableFree => "reusable",
                         PoolState::CachedFree => "cached/delay-free",
                         PoolState::Unreadable => "unreadable",
+                        PoolState::Uncommitted => "uncommitted",
                         PoolState::Allocated => "allocated",
                     },
                     hole.address,
