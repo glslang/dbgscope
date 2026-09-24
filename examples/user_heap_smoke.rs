@@ -1,7 +1,8 @@
 //! Opt-in live smoke helper for the typed user Segment Heap walker, on x64 and ARM64.
 //!
 //! `cargo run --example user_heap_smoke` launches a child under DbgEng. The child creates a
-//! Segment Heap, makes allocations spanning the four backends, walks the heap itself with
+//! Segment Heap — through `RtlCreateHeap`, because `HeapCreate` will not pass the flag on; see
+//! the comment on that import — makes allocations spanning the four backends, walks it with
 //! `HeapWalk`, and breaks in; the controller lists roots and checks the walker against both —
 //! each witness pointer is covered by an allocation of the backend it was sized for, and the
 //! allocated chunks on the created heap are exactly the blocks `HeapWalk` calls busy. It then
@@ -10,20 +11,94 @@
 //! `srv*C:\ProgramData\dbg\sym*https://msdl.microsoft.com/download/symbols`; when it is unset,
 //! the helper uses `_NT_SYMBOL_PATH` and then that public-server path.
 
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::hint::black_box;
 use std::time::Duration;
 
 use dbgscope::dbgeng::DebugEngine;
 use dbgscope::heap::{self, HeapAllocation, HeapBackend, HeapKind, HeapState, HeapWalk};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::{DebugBreak, OutputDebugStringA};
 use windows::Win32::System::Memory::{
-    HEAP_FLAGS, HeapAlloc, HeapCreate, HeapLock, HeapUnlock, HeapWalk as OsHeapWalk,
-    PROCESS_HEAP_ENTRY,
+    HEAP_FLAGS, HeapAlloc, HeapLock, HeapUnlock, HeapWalk as OsHeapWalk, PROCESS_HEAP_ENTRY,
 };
 use windows::core::PCSTR;
 
-const SEGMENT_HEAP_FLAG: HEAP_FLAGS = HEAP_FLAGS(0x100);
+// **`HeapCreate` cannot make a Segment Heap on a build that masks its flags, and this one does.**
+//
+// `HEAP_CREATE_SEGMENT_HEAP` is documented as a `HeapCreate` option and is not one:
+// `KERNELBASE!HeapCreate` opens with `and ecx,40005h` — `HEAP_CREATE_ENABLE_EXECUTE |
+// HEAP_GENERATE_EXCEPTIONS | HEAP_NO_SERIALIZE` — so 0x100 is dropped before `RtlCreateHeap` is
+// reached. Measured on x64 26200 (2026-09-24): the three `HeapCreate` shapes that could
+// plausibly matter — growable, with an initial size, with a fixed maximum — all returned a
+// classic NT heap, and the call below returned a Segment Heap **in the same process, moments
+// apart**, so the wrapper is the whole of the difference.
+//
+// This example asked through `HeapCreate` until then, so on such a host it built an NT heap and
+// failed two hundred lines later saying the created heap was not among the roots — which reads
+// as a defect in root enumeration and is not one.
+//
+// The flags mirror what `HeapCreate` composes for `(_, 0, 0)` — `HEAP_GROWABLE`, and heap class
+// 1 from its `bts ecx,0Ch`, which marks a caller-created heap rather than the process heap —
+// plus the one it will not pass on.
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn RtlCreateHeap(
+        flags: u32,
+        base: *mut c_void,
+        reserve: usize,
+        commit: usize,
+        lock: *mut c_void,
+        parameters: *mut c_void,
+    ) -> *mut c_void;
+}
+
+const HEAP_GROWABLE: u32 = 0x2;
+const HEAP_CLASS_1: u32 = 0x1000;
+const HEAP_CREATE_SEGMENT_HEAP: u32 = 0x100;
+/// `_SEGMENT_HEAP.Signature`, and `_HEAP.SegmentSignature`, both at `+0x10` on x64 and ARM64.
+/// `_HEAP` has a `Signature` of its own, `0xeeffeeff`, but at `+0x98`; the two are easy to
+/// mistake for each other and only one of them is at the offset this reads.
+const SIGNATURE_OFFSET: usize = 0x10;
+const SEGMENT_HEAP_SIGNATURE: u32 = 0xddee_ddee;
+const NT_HEAP_SEGMENT_SIGNATURE: u32 = 0xffee_ffee;
+
+/// Creates a Segment Heap, and checks it got one **here** rather than leaving the controller to
+/// discover it as a missing root.
+///
+/// Read back because the request can be answered with the other kind of heap and nothing in the
+/// return value says so. `RtlpCreateHeap` reaches its Segment path from either this flag or
+/// `ntdll!RtlpHpHeapFeatures` bit 0 — a per-process opt-in, 1 for images the system enables it
+/// for and 0 for an ordinary one — so a build that stopped honouring the flag would quietly put
+/// the whole of this example on a heap the v1 walker does not decode.
+fn create_segment_heap() -> HANDLE {
+    let heap = unsafe {
+        RtlCreateHeap(
+            HEAP_GROWABLE | HEAP_CLASS_1 | HEAP_CREATE_SEGMENT_HEAP,
+            std::ptr::null_mut(),
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert!(!heap.is_null(), "RtlCreateHeap returned nothing");
+    let signature = unsafe { *heap.cast::<u8>().add(SIGNATURE_OFFSET).cast::<u32>() };
+    assert_eq!(
+        signature,
+        SEGMENT_HEAP_SIGNATURE,
+        "this is not a Segment Heap ({signature:#010x}{}), so the example has nothing the walker \
+         decodes. Read `KERNELBASE!HeapCreate` and `ntdll!RtlpCreateHeap` on this build before \
+         changing anything here",
+        if signature == NT_HEAP_SEGMENT_SIGNATURE {
+            ", which is a classic NT heap"
+        } else {
+            ""
+        }
+    );
+    HANDLE(heap)
+}
+
 /// `PROCESS_HEAP_ENTRY_BUSY`: the entry is an allocated block, not a region or a free one.
 const HEAP_ENTRY_BUSY: u16 = 0x4;
 
@@ -34,7 +109,7 @@ fn emit(message: String) {
 }
 
 fn target() {
-    let heap = unsafe { HeapCreate(SEGMENT_HEAP_FLAG, 0, 0) }.expect("create Segment Heap");
+    let heap = create_segment_heap();
     let mut keep_alive = Vec::new();
     // Exercise the 0x20 bucket until it transitions to LFH, then retain the last slot as the
     // LFH witness. The other three sizes sit well inside their backend's range rather than at

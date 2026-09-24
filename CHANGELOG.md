@@ -22,6 +22,21 @@ All notable changes to this project are documented here. The format follows
   testing this on a dump proves nothing about it. Measured on 26200, 2026-09-24
   (`dbgeng!Ordinal367+0x14f96`, `movaps xmmword ptr [rbx],xmm0`).
 
+- **`examples/user_heap_smoke.rs` creates its Segment Heap through `RtlCreateHeap`**, because
+  `HeapCreate` will not pass the flag on. `HEAP_CREATE_SEGMENT_HEAP` is documented as a
+  `HeapCreate` option and is not one: `KERNELBASE!HeapCreate` opens with `and ecx,40005h` —
+  `HEAP_CREATE_ENABLE_EXECUTE | HEAP_GENERATE_EXCEPTIONS | HEAP_NO_SERIALIZE` — so 0x100 is
+  dropped before `RtlCreateHeap` is reached. Measured on x64 26200 (2026-09-24): growable, with
+  an initial size and with a fixed maximum all came back a classic NT heap through `HeapCreate`,
+  and the direct call returned a Segment Heap **in the same process moments later**, so the
+  wrapper is the whole of the difference. Until now this example built an NT heap on such a host
+  and failed two hundred lines later saying the created heap was not among the roots — which
+  reads as a defect in root enumeration and is not one, and which is why an earlier note here
+  blamed ARM64 and the debug heap. It now reads the heap's signature back at creation and says
+  so there instead. The separate per-process switch, which governs the heaps an image gets
+  *without* asking, is `ntdll!RtlpHpHeapFeatures` bit 0: 1 in `sihost`, whose four heaps are
+  Segment, and 0 in `cmd.exe`.
+
 - **`examples/heap_coverage.rs`** — what, if anything, holds a user heap walk short of
   `Complete`: every gap it filed, put back to the memory manager, with an allocated chunk and a
   free one as controls. An address as a second argument answers that one question, which is how
