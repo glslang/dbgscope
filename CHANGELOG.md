@@ -24,6 +24,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Every big-pool allocation was reported with a tag read out of the caller's own data.**
+  `ExAllocatePoolWithTag` sends anything that will not fit inside a page to `ExpAllocateBigPool`,
+  which takes whole pages from the segment allocator and records the tag and length in
+  `nt!PoolBigPageTable` **instead of** in a `_POOL_HEADER`. Nothing in the page range descriptor
+  distinguishes one from a plain page-range allocation — both are `RangeFlags` `0x03` — so the
+  walker decoded the page as though a header were there, which reads the caller's first sixteen
+  bytes as `PreviousSize`/`BlockSize`/`PoolType`/`PoolTag` and then reports the block as starting
+  0x10 in and 0x10 short. Measured on a live 26100.33438 kernel (2026-09-24): `!pool` calls
+  `ffffac09dd0f5000` a 0x1000-byte `CM25` allocation and the walk called it a 4080-byte block at
+  `+0x10` tagged `..N.` — those being the bytes of the registry hive bin's own `hbin` header. An
+  allocated kernel page range is now looked up in that table, and where it is named it carries the
+  table's tag, no header, and the length the caller asked for rather than the pages it was given.
+  `windbg-mcp` `FOLLOWUPS.md` item 99.
+
+- **A freed big-page entry answered for its address, with the tag it used to have.** The lookup
+  matched on `Va & !1`, and bit 0 of `Va` is `POOL_BIG_TABLE_ENTRY_FREE`: `ExpRemoveTagForBigPages`
+  frees an entry with `lock inc qword ptr [rax]`, so a released allocation stays in the table under
+  `address | 1` with its old tag and size until something claims the slot. `nt`'s own comparison is
+  `cmp rcx,rdi` — exact — and so is this one now. On the same kernel `ffffac09e50f5001` sat one slot
+  from a live entry and its page would not even read.
+
+- **The probe's stop condition never fired, so a miss read the whole table.** It stopped at
+  `Va == 0`, and a slot the allocator has never used reads `1`, not `0`. Every lookup that found
+  nothing therefore scanned all 32,768 entries. It stops at a never-used slot now, which is sound
+  because `ExpAddTagForBigPages` claims the first bit-0-set slot from the hash and so cannot have
+  walked past one. The table is also read a batch at a time and **kept**, which is what makes
+  asking this question of every page range affordable rather than of large allocations only.
+
 - **The heap walker read an LFH subsegment's busy blocks from the wrong bits, on every current
   build.** `_HEAP_LFH_SUBSEGMENT.BlockBitmap` was read as two adjacent bits per block, busy the
   lower. `ntdll` packs it otherwise: each 64-bit word covers 32 blocks, busy bits in its low half

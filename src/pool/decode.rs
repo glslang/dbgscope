@@ -715,34 +715,6 @@ pub(crate) fn big_page_hash(address: u64, table_size: usize) -> Option<usize> {
     }
 }
 
-pub(crate) struct BigPageProbe {
-    next: usize,
-    remaining: usize,
-    mask: usize,
-}
-
-impl Iterator for BigPageProbe {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let current = self.next;
-        self.next = (self.next + 1) & self.mask;
-        self.remaining -= 1;
-        Some(current)
-    }
-}
-
-pub(crate) fn big_page_probe(address: u64, table_size: usize) -> Option<BigPageProbe> {
-    Some(BigPageProbe {
-        next: big_page_hash(address, table_size)?,
-        remaining: table_size,
-        mask: table_size - 1,
-    })
-}
-
 pub(crate) fn display_tag(tag: u32) -> String {
     tag.to_le_bytes()
         .into_iter()
@@ -1343,16 +1315,8 @@ mod tests {
             0xffff_8000_0100_0000
         ));
         assert!(valid_descriptor_tree_signature(DESCRIPTOR_TREE_SIGNATURE));
-        let first = big_page_hash(0x9000, 8).unwrap();
-        assert_eq!(
-            big_page_probe(0x9000, 8).unwrap().collect::<Vec<_>>(),
-            (0..8)
-                .map(|offset| (first + offset) % 8)
-                .collect::<Vec<_>>()
-        );
         assert_eq!(big_page_hash(0, 0), None);
         assert_eq!(big_page_hash(0x9000, 3), None);
-        assert!(big_page_probe(0x9000, 3).is_none());
         // Literals, not the formula recomputed: this assertion used to build `expected` the
         // same truncating way `big_page_hash` did, so it agreed with the bug instead of
         // catching it. These indices are `nt`'s, worked out by hand from
