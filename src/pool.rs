@@ -57,10 +57,18 @@ pub enum PoolState {
     Allocated,
     ReusableFree,
     CachedFree,
-    /// Memory the walk could not read, and which the target *has*: a page that is committed
-    /// and paged out, one missing from a dump, or one the debugger refused. Something may have
-    /// been there, so this is a hole in the walk's coverage and clears
+    /// A span the walk could not read and **nothing established was empty**. Something may have
+    /// been there, so it is a hole in the walk's coverage and clears
     /// [`query::WalkCoverage::complete`].
+    ///
+    /// **It is the conservative bucket, not a claim that the target has the memory.** Two very
+    /// different things land here: a page the memory manager confirms is committed — paged out,
+    /// missing from a dump, refused by the debugger — and a page no commitment query could be
+    /// made about at all, which is every kernel walk and any target
+    /// [`snapshot::PoolMemory::committed_run`] answers `None` for. Only
+    /// [`Self::Uncommitted`] carries a positive answer; this one carries the absence of one, and
+    /// reading it as confirmed memory would turn *we could not tell* into a fact about the
+    /// target.
     Unreadable,
     /// Address space inside a region with **no pages behind it** — reserved, or committed and
     /// since released — as the target's memory manager says, not as the walk inferred from

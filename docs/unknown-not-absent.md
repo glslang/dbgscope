@@ -87,6 +87,12 @@ Three states hide behind that one observation, and the failed read does not sepa
 | Committed and paged out, or absent from a dump | The target has this memory and the walk did not see it. A real gap. |
 | Committed and present | Not a gap at all — it read. |
 
+`Uncommitted` is the first row and **only** the first row, because only it can be established. The
+other two, and every case where no commitment query could be made at all — a kernel walk, a dump
+recording no memory information, a query that failed — stay `Unreadable`. So `Unreadable` is the
+conservative bucket rather than a claim that the target has the memory, and prose about it that
+says *memory the process has* is overstating exactly the half that was not measured.
+
 The allocator's own records can answer the first distinction: a page range descriptor's
 `CommittedPageCount`, a VS subsegment's `CommitBitmap`, an LFH subsegment's commit state at
 `CommitStateOffset`. That is three structures, each of which moves between builds, to learn
@@ -112,7 +118,8 @@ runs past the committed extent it starts in, and `walk_vs` emitted no span for i
 geometry and state, both of which are known there — the header was read, the size came out of
 it and passed the subsegment bound, the state comes from the free tree — and the only thing
 missing is the chunk's *contents*, which no span carries. So where the tail holds nothing the
-chunk is reported; where it is memory the process has, it is not, and now the walk says so.
+chunk is reported; where that could not be established — memory the process has, or memory
+nothing could be asked about — it is not, and now the walk says so.
 
 Measured on a live 26200 process (`sihost`, four Segment Heaps, 19,448 chunks, 2026-09-24): all
 48 gaps were `MEM_RESERVE`, both controls — an allocated chunk and a free one — were
