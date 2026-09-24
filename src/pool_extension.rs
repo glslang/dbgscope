@@ -8,7 +8,7 @@ use windows::core::{HRESULT, IUnknown, Interface, PCSTR};
 use crate::dbgeng::DebugEngine;
 use crate::pool::decode::parse_tag;
 use crate::pool::query;
-use crate::pool::render::{RenderOptions, render_pool_map};
+use crate::pool::render::{RenderOptions, render_pool_map, render_walk_summary};
 
 const DEBUG_NOTIFY_SESSION_ACTIVE: u32 = 0x0000_0000;
 const DEBUG_NOTIFY_SESSION_INACTIVE: u32 = 0x0000_0001;
@@ -127,6 +127,9 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
     // have no such control; see `query::DEFAULT_WALK_BUDGET`.
     let walk = query::PoolWalk::from(command.refresh).unbounded();
     let index = query::prepare_index(engine, walk).map_err(|error| error.to_string())?;
+    // Taken before the filter below, because coverage describes the walk and not what was
+    // retained from its result — a `--paged` map still walked the whole pool.
+    let walked = query::report_of(&index);
 
     if let Some(address) = command.address {
         let detail = index
@@ -148,7 +151,14 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
                     span.backend
                 )
             })
-            .unwrap_or_else(|| format!("{address:#x} is not in the cached pool snapshot\n"));
+            // A miss is only an answer if the walk covered the address. "No chunk holds it" and
+            // "the walk never reached it" are the same sentence otherwise, so the walk's own
+            // coverage goes out with the miss — including when it is `complete`, which is what
+            // turns the miss into a real negative.
+            .unwrap_or_else(|| {
+                format!("{address:#x} is not in the cached pool snapshot\n")
+                    + &render_walk_summary(&walked)
+            });
         engine.output(&detail).map_err(|error| error.to_string())?;
         return Ok(());
     }
@@ -179,6 +189,7 @@ fn command_poolmap(engine: &DebugEngine, args: &str) -> Result<(), String> {
     }
     for chunk in render_pool_map(
         &filtered,
+        &walked,
         RenderOptions {
             tag: command.tag,
             dml: true,

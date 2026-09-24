@@ -316,7 +316,13 @@ pub fn snapshot_report(
     Ok(report_of(&index))
 }
 
-fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
+/// The walk's own assessment of an index, which every surface reads rather than re-deriving.
+///
+/// `pub(crate)` so the `!poolmap` renderer takes its coverage from here too. The map and the
+/// programmatic answer describe one walk, and the only way they cannot disagree about it is to
+/// compute it once — which is the whole reason this is a function rather than four field reads
+/// repeated at each call site.
+pub(crate) fn report_of(index: &PoolIndex) -> PoolSnapshotReport {
     PoolSnapshotReport {
         layout: index.layout.clone(),
         total_chunks: index.spans.len(),
