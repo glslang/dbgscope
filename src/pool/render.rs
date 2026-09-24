@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::index::{Direction, PoolIndex};
+use super::query::{PoolSnapshotReport, WalkCoverage};
 use super::{HeapIdentity, PoolBackend, PoolKind, PoolSpan, PoolState};
 
 const OUTPUT_CHUNK: usize = 7_500;
@@ -168,7 +169,17 @@ fn safe_dml_boundary(text: &str, limit: usize) -> usize {
     boundary
 }
 
-pub(crate) fn render_pool_map(index: &PoolIndex, options: RenderOptions) -> Vec<String> {
+/// Render the pool map, then what the walk behind it managed.
+///
+/// `walk` is the report for the walk that produced `index`, and on a filtered map it is
+/// deliberately **not** a report of `index`: how much of the pool was covered is a property of the
+/// walk, not of what was retained from its result, so a `--paged` map must still say how many
+/// chunks were walked rather than how many survived the filter.
+pub(crate) fn render_pool_map(
+    index: &PoolIndex,
+    walk: &PoolSnapshotReport,
+    options: RenderOptions,
+) -> Vec<String> {
     let selected_indices = options
         .tag
         .map(|tag| index.context_for_tag(tag))
@@ -207,6 +218,9 @@ pub(crate) fn render_pool_map(index: &PoolIndex, options: RenderOptions) -> Vec<
             "No matching pool allocations in the stopped-target snapshot.\n",
             options.dml,
         );
+        // The summary matters most here: without it "nothing matched" and "the walk never
+        // reached the pool" are the same two lines of output.
+        push_chunked(&mut chunks, &render_walk_summary(walk), options.dml);
         return chunks;
     }
     for (key, indices) in rows {
@@ -255,7 +269,72 @@ pub(crate) fn render_pool_map(index: &PoolIndex, options: RenderOptions) -> Vec<
             options.dml,
         );
     }
+    push_chunked(&mut chunks, &render_walk_summary(walk), options.dml);
     chunks
+}
+
+/// What the walk itself managed, rendered after the map.
+///
+/// Without it the map is ambiguous in the worst way: a pool the walk covered completely and one it
+/// reached a fraction of draw the same picture, and an *empty* map is worse still — "no allocation
+/// matches" and "the walk never got there" render identically. The diagnostics above say what went
+/// wrong without ever saying how much it cost, and a real walk emits thousands of them, so scrolling
+/// is not a substitute for a total.
+///
+/// Measured on a live 29671 kernel (`FOLLOWUPS.md` item 100 in `windbg-mcp`): 3,616 diagnostics and
+/// 15,626,240 bytes the walk could not place a chunk boundary in, none of which this map said. The
+/// structured surface carried `coverage: partial` and `gaps.unplaced_bytes` for the same walk.
+///
+/// Taken from [`query::report_of`](super::query::report_of) rather than from the index's fields, so
+/// the two surfaces cannot disagree about one walk — `coverage` in particular has three states
+/// collapsed from two flags, and re-deriving that here is how they would drift apart.
+pub(crate) fn render_walk_summary(walk: &PoolSnapshotReport) -> String {
+    let mut out = format!(
+        "\n--- pool walk ---\nchunks walked: {} ({} allocated), coverage: {}\n",
+        walk.total_chunks,
+        walk.allocated_chunks,
+        match (walk.stopped_after_matches, walk.coverage) {
+            (Some(matches), _) => format!(
+                "match_limit_reached - stopped after {matches} matching allocated chunk(s), so \
+                 what is above is intentionally partial"
+            ),
+            (None, WalkCoverage::Complete) => "complete".into(),
+            // Kept apart because they tell an operator to do different things: a deadline is
+            // worth re-running with more time, and a partial walk is not.
+            (None, WalkCoverage::BudgetExpired) =>
+                "INCOMPLETE - the walk's deadline passed; more time reaches more of it".into(),
+            (None, WalkCoverage::Partial) =>
+                "INCOMPLETE - the walk did not reach everything it set out to, and more time \
+                 changes nothing"
+                    .into(),
+        }
+    );
+    // Only when there is something to say, so a clean walk stays quiet and the line means
+    // something when it does appear.
+    if walk.unplaced_bytes > 0 {
+        out.push_str(&format!(
+            "not decoded: {:#x} bytes the walk could not place a chunk boundary in\n",
+            walk.unplaced_bytes
+        ));
+    }
+    if walk.stalls.pages > 0 {
+        out.push_str(&format!(
+            "stalled: {} page(s), {:#x} bytes skipped, {:#x} bytes recovered after the stall\n",
+            walk.stalls.pages, walk.stalls.skipped_bytes, walk.stalls.recovered_bytes
+        ));
+    }
+    if walk.refused_chunks > 0 {
+        out.push_str(&format!(
+            "refused: {} chunk header(s) that did not decode\n",
+            walk.refused_chunks
+        ));
+    }
+    out.push_str(&match walk.diagnostics.emitted() {
+        0 => "the walk reported no diagnostics.\n".into(),
+        1 => "1 diagnostic, listed above.\n".into(),
+        emitted => format!("{emitted} diagnostics, listed above.\n"),
+    });
+    out
 }
 
 pub(crate) fn render_advice(index: &PoolIndex, tag: u32, dml: bool) -> String {
@@ -424,6 +503,7 @@ mod tests {
         });
         let plain = render_pool_map(
             &index,
+            &crate::pool::query::report_of(&index),
             RenderOptions {
                 tag: Some(tag),
                 dml: false,
@@ -444,6 +524,7 @@ mod tests {
         assert!(!plain.contains("A&lt;&amp;&quot;"));
         let dml = render_pool_map(
             &index,
+            &crate::pool::query::report_of(&index),
             RenderOptions {
                 tag: Some(tag),
                 dml: true,
@@ -480,6 +561,7 @@ mod tests {
         assert!(
             render_pool_map(
                 &index,
+                &crate::pool::query::report_of(&index),
                 RenderOptions {
                     tag: Some(tag),
                     dml: true
@@ -520,6 +602,7 @@ mod tests {
         });
         let dml_chunks = render_pool_map(
             &many_index,
+            &crate::pool::query::report_of(&many_index),
             RenderOptions {
                 tag: Some(tag),
                 dml: true,
@@ -537,5 +620,157 @@ mod tests {
             );
             assert!(chunk.len() <= OUTPUT_CHUNK);
         }
+    }
+
+    /// Build an index whose walk state is set by the caller, so a test can pin what the summary
+    /// says about a walk rather than about the spans it happened to produce.
+    fn index_with(
+        spans: Vec<PoolSpan>,
+        complete: bool,
+        budget_expired: bool,
+        unplaced_bytes: u64,
+        diagnostics: PoolDiagnostics,
+    ) -> PoolIndex {
+        PoolIndex::build(PoolSnapshot {
+            layout: Default::default(),
+            spans,
+            complete,
+            budget_expired,
+            stopped_after_matches: None,
+            match_limit: None,
+            matched_allocations: 0,
+            stalls: Default::default(),
+            refused_chunks: 0,
+            unplaced_bytes,
+            diagnostics,
+        })
+    }
+
+    fn one_span() -> Vec<PoolSpan> {
+        vec![span(
+            0x1000,
+            u32::from_le_bytes(*b"Abcd"),
+            PoolKind::Paged,
+            PoolBackend::Vs,
+            PoolState::Allocated,
+        )]
+    }
+
+    fn render(index: &PoolIndex) -> String {
+        render_pool_map(
+            index,
+            &crate::pool::query::report_of(index),
+            RenderOptions::default(),
+        )
+        .join("")
+    }
+
+    /// A map drawn from a walk that fell short has to say so on the map.
+    ///
+    /// This is `FOLLOWUPS.md` item 100 in `windbg-mcp`: on a live 29671 kernel the walk left
+    /// 15,626,240 bytes undecoded and the structured surface reported `coverage: partial` with
+    /// `gaps.unplaced_bytes`, while `!poolmap` drew the same walk as a finished picture. The
+    /// assertion is on the *shortfall being stated*, not on the wording: coverage must not read
+    /// as complete, and the byte total must be reachable.
+    #[test]
+    fn test_poolmap_states_a_walk_that_fell_short() {
+        let text = render(&index_with(
+            one_span(),
+            false,
+            false,
+            0xee6000,
+            PoolDiagnostics::from_iter(["VS extent at 0x1 cannot be placed".to_string()]),
+        ));
+        assert!(text.contains("INCOMPLETE"), "{text}");
+        assert!(!text.contains("coverage: complete"), "{text}");
+        assert!(text.contains("0xee6000"), "{text}");
+        assert!(text.contains("1 diagnostic, listed above."), "{text}");
+    }
+
+    /// A clean walk says so and stays quiet about gaps it does not have, or the line that reports
+    /// a shortfall means nothing when it appears.
+    #[test]
+    fn test_poolmap_clean_walk_reports_complete_and_no_gaps() {
+        let text = render(&index_with(
+            one_span(),
+            true,
+            false,
+            0,
+            PoolDiagnostics::default(),
+        ));
+        assert!(text.contains("coverage: complete"), "{text}");
+        assert!(!text.contains("INCOMPLETE"), "{text}");
+        assert!(!text.contains("not decoded:"), "{text}");
+        assert!(!text.contains("stalled:"), "{text}");
+        assert!(!text.contains("refused:"), "{text}");
+        assert!(text.contains("no diagnostics"), "{text}");
+    }
+
+    /// An expired deadline and a partial walk are different advice — re-run with more time, or
+    /// do not bother — so the summary must not collapse them into one word.
+    #[test]
+    fn test_poolmap_separates_an_expired_budget_from_a_partial_walk() {
+        let expired = render(&index_with(
+            one_span(),
+            false,
+            true,
+            0,
+            PoolDiagnostics::default(),
+        ));
+        let partial = render(&index_with(
+            one_span(),
+            false,
+            false,
+            0,
+            PoolDiagnostics::default(),
+        ));
+        assert!(expired.contains("deadline"), "{expired}");
+        assert!(partial.contains("more time changes nothing"), "{partial}");
+        assert_ne!(
+            expired, partial,
+            "an expired budget and a partial walk rendered identically"
+        );
+    }
+
+    /// The case the summary exists for: with nothing to draw, "no allocation matches" and "the
+    /// walk never reached the pool" are otherwise the same two lines.
+    #[test]
+    fn test_poolmap_empty_map_still_carries_the_walk() {
+        let text = render(&index_with(
+            Vec::new(),
+            false,
+            false,
+            0x1000,
+            PoolDiagnostics::default(),
+        ));
+        assert!(text.contains("No matching pool allocations"), "{text}");
+        assert!(text.contains("INCOMPLETE"), "{text}");
+        assert!(text.contains("0x1000"), "{text}");
+    }
+
+    /// Coverage describes the walk, not what survived a filter.
+    ///
+    /// `!poolmap --paged` retains a subset of the spans and rebuilds the index, so a summary
+    /// derived from the *rendered* index would report the filtered count as the number of chunks
+    /// walked and shrink the pool to whatever was asked for. The extension takes the report
+    /// before filtering for this reason; this pins that the renderer honours it.
+    #[test]
+    fn test_poolmap_filtered_map_reports_the_whole_walk() {
+        let mut spans = one_span();
+        spans.push(span(
+            0x2000,
+            u32::from_le_bytes(*b"Efgh"),
+            PoolKind::NonPagedNx,
+            PoolBackend::Lfh,
+            PoolState::Allocated,
+        ));
+        let walked = index_with(spans, true, false, 0, PoolDiagnostics::default());
+        let report = crate::pool::query::report_of(&walked);
+        assert_eq!(report.total_chunks, 2);
+
+        let kept = index_with(one_span(), true, false, 0, PoolDiagnostics::default());
+        let text = render_pool_map(&kept, &report, RenderOptions::default()).join("");
+        assert!(text.contains("chunks walked: 2"), "{text}");
+        assert!(!text.contains("chunks walked: 1"), "{text}");
     }
 }
