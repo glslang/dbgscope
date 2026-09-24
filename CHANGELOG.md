@@ -41,10 +41,17 @@ All notable changes to this project are documented here. The format follows
   what one allocator believes, while the memory manager answers about the target in one call.
   Only a positive `MEM_RESERVE`/`MEM_FREE` excuses a gap — a failed query, a run that cannot
   advance, an unnamed state and a source that cannot be asked are each conservative, so the
-  excuse is never granted by an absence of evidence. The kernel pool walk is not asked at all
-  and is unchanged. Which also fixes what `Unreadable` *means*: it is now everything that could
-  not be established as empty, including every case nothing could be asked about, so it is the
-  conservative bucket rather than a claim that the target has the memory.
+  excuse is never granted by an absence of evidence. The kernel pool walk is not asked at all, so
+  it **classifies** exactly as before — not quite the same as *unchanged*, which this entry said
+  until a live kernel was walked on the new pin: the `walk_vs` site below is silent on a kernel
+  too, and now names what it drops. On `ctf-vm` (live 26100 over KDNET, 2026-09-24, 633,665
+  chunks walked, `coverage: partial`, 42.3s) that is the largest diagnostic shape on the target,
+  2,768 occurrences, beside 2,617 of the unchanged `region # is only committed through #`. Those
+  chunks were dropped before this change as well and already cleared `complete`; nothing in the
+  answer said which, or how many. So coverage is unchanged on a kernel and
+  `PoolDiagnostics::emitted` rises. Which also fixes what `Unreadable` *means*: it is now
+  everything that could not be established as empty, including every case nothing could be asked
+  about, so it is the conservative bucket rather than a claim that the target has the memory.
 
   A free chunk whose middle the allocator decommitted is the same question reached another way:
   it runs past the committed extent it starts in, and `walk_vs` emitted no span for it and
