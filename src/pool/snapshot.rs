@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::decode::{
-    PAGE_SIZE, PoolHeaderLayout, SpecialPoolHeader, adjust_page_end_header, big_page_hash,
-    decode_descriptor_at, decode_large_requested_size, decode_lfh_subsegment, decode_pool_header,
-    decode_rb_root_for, decode_slist_header_next, decode_special_pool_header, decode_vs_chunk,
-    descriptor_backend, lfh_bitmap_state, read_u16, read_u32, read_u64,
+    MAX_POOL_HEADER_CHUNK, PAGE_SIZE, PoolHeaderLayout, SpecialPoolHeader, adjust_page_end_header,
+    big_page_hash, decode_descriptor_at, decode_large_requested_size, decode_lfh_subsegment,
+    decode_pool_header, decode_rb_root_for, decode_slist_header_next, decode_special_pool_header,
+    decode_vs_chunk, descriptor_backend, lfh_bitmap_state, read_u16, read_u32, read_u64,
     valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
 };
 use super::{
@@ -126,6 +126,13 @@ pub(crate) struct PoolRegion {
     /// VS chunk-header addresses present in delay-free/lookaside lists. Shared for the
     /// reason [`Self::reusable_chunks`] is.
     pub cached_chunks: SharedChunks,
+    /// Every `nt!PoolBigPageTable` entry whose allocation begins inside this region, by the
+    /// address it begins at.
+    ///
+    /// Resolved during discovery, where the table is, so that walking a chunk needs no reads of
+    /// its own. Empty on every region that holds no such allocation, which is most of them — and
+    /// on every user-mode one, which has no such table.
+    pub big_pool: Arc<HashMap<u64, BigPageEntry>>,
 }
 
 pub(crate) trait PoolMemory {
@@ -1353,6 +1360,27 @@ fn discover_segment_context(
             // Free ranges are deliberately not looked up: `ExpRemoveTagForBigPages` takes the
             // entry out as the allocation goes away, so a miss there would be the expected
             // answer rather than a finding.
+            // Every big-pool allocation inside a VS subsegment, resolved here because the table
+            // is here and a chunk walk has no reads to spare. `_POOL_HEADER.BlockSize` cannot
+            // describe a chunk of `MAX_POOL_HEADER_CHUNK` or more, so `nt` gives those no header
+            // at all and records them in `nt!PoolBigPageTable` — **wherever they came from**.
+            // They are not only the plain page ranges below: a VS subsegment holds them too, and
+            // every entry's `Va` is page-aligned, so one probe per page of the chunk area finds
+            // each one. Measured on a live 26100 kernel, where `0xffffac09da29f000` is an
+            // `MiRr` allocation of `0xe1c0` bytes inside the 17-page VS range at page 0x53 of
+            // its segment (`windbg-mcp` FOLLOWUPS item 99).
+            let mut big_pool = HashMap::new();
+            if backend == PoolBackend::Vs && !identity.special {
+                let mut page = region_address.next_multiple_of(PAGE_SIZE);
+                let end = region_address.saturating_add(region_size as u64);
+                while page < end {
+                    if let Some(entry) = discovery.big_page(memory, page)? {
+                        big_pool.insert(page, entry);
+                    }
+                    page = page.saturating_add(PAGE_SIZE);
+                }
+            }
+            let big_pool = Arc::new(big_pool);
             let mut pool_header = layout.pool_header_layout()?;
             let mut known_tag = None;
             if backend == PoolBackend::Segment
@@ -1389,6 +1417,7 @@ fn discover_segment_context(
                 states: vec![state],
                 reusable_chunks: Arc::clone(reusable_chunks),
                 cached_chunks: Arc::clone(cached_chunks),
+                big_pool: Arc::clone(&big_pool),
             });
             descriptor_index += unit_size;
         }
@@ -1511,6 +1540,7 @@ fn discover_large_allocations(
             states: vec![PoolState::Allocated],
             reusable_chunks: Arc::default(),
             cached_chunks: Arc::default(),
+            big_pool: Arc::default(),
         });
     }
     Ok(())
@@ -1527,11 +1557,11 @@ const BIG_PAGE_BATCH: usize = 256;
 
 /// What `nt!PoolBigPageTable` records about one allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BigPageEntry {
-    tag: u32,
+pub(crate) struct BigPageEntry {
+    pub tag: u32,
     /// The length the caller asked for, which is *not* the length of the pages it was given:
     /// a 0xa270-byte request occupies 0xb000 of pool and this field says 0xa270.
-    size: u64,
+    pub size: u64,
 }
 
 /// `nt!PoolBigPageTable`: where the kernel keeps the tag of every allocation too large to
@@ -2846,6 +2876,49 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 snapshot.complete = false;
                 break;
             }
+            let state = if region.cached_chunks.contains(&header_address) {
+                PoolState::CachedFree
+            } else if region.reusable_chunks.contains(&header_address) {
+                PoolState::ReusableFree
+            } else if chunk.allocated {
+                PoolState::Allocated
+            } else {
+                PoolState::ReusableFree
+            };
+            // **A chunk too large for `_POOL_HEADER.BlockSize` carries no header**, so decoding
+            // one out of it reads the caller's own first sixteen bytes as a tag. Its name is in
+            // `nt!PoolBigPageTable`, which discovery resolved into `region.big_pool`.
+            //
+            // Matched by **containment** rather than by arithmetic on the chunk header: the
+            // table's `Va` is where the allocation starts, and taking it as given costs nothing
+            // and assumes nothing about what sits between the two — which is the one thing here
+            // that is measured and not yet explained (`windbg-mcp` FOLLOWUPS item 99). The size
+            // has to fit inside the chunk as well, so an entry can only be claimed by a chunk
+            // that could really hold it.
+            let big_pool = (chunk_size as u64 > MAX_POOL_HEADER_CHUNK)
+                .then(|| {
+                    let end = header_address.saturating_add(chunk_size as u64);
+                    region.big_pool.iter().find(|(address, entry)| {
+                        (header_address..end).contains(*address)
+                            && address.saturating_add(entry.size) <= end
+                    })
+                })
+                .flatten()
+                .map(|(address, entry)| (*address, *entry));
+            if let Some((address, entry)) = big_pool {
+                let mut span =
+                    self.base_span(region, address, address, entry.size, entry.tag, state);
+                span.size_class = chunk_size.min(u32::MAX as usize) as u32;
+                snapshot.record_span(span);
+                previous_chunk = Some(chunk_size);
+                offset += chunk_size;
+                resume = base + offset as u64;
+                chunks += 1;
+                if snapshot.match_limit_reached() {
+                    break;
+                }
+                continue;
+            }
             let candidate = header_address + region.vs_header_size as u64;
             let physical_header = if region.pool_header.size == 0 {
                 candidate
@@ -2866,15 +2939,6 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             let pool_offset = physical_header.saturating_sub(base) as usize;
             let tag = decode_pool_header(bytes, pool_offset, region.pool_header)
                 .map_or(0, |header| header.tag);
-            let state = if region.cached_chunks.contains(&header_address) {
-                PoolState::CachedFree
-            } else if region.reusable_chunks.contains(&header_address) {
-                PoolState::ReusableFree
-            } else if chunk.allocated {
-                PoolState::Allocated
-            } else {
-                PoolState::ReusableFree
-            };
             let overhead = physical_header
                 .saturating_sub(header_address)
                 .saturating_add(region.pool_header.size as u64);
@@ -3087,6 +3151,7 @@ mod tests {
             states: Vec::new(),
             reusable_chunks: Arc::default(),
             cached_chunks: Arc::default(),
+            big_pool: Arc::default(),
         }
     }
 
@@ -3838,6 +3903,7 @@ mod tests {
             states: Vec::new(),
             reusable_chunks: Arc::default(),
             cached_chunks: Arc::default(),
+            big_pool: Arc::default(),
         }
     }
 
@@ -3868,6 +3934,7 @@ mod tests {
             states: Vec::new(),
             reusable_chunks: Arc::default(),
             cached_chunks: Arc::default(),
+            big_pool: Arc::default(),
         }
     }
 
@@ -3905,6 +3972,118 @@ mod tests {
         };
         walker.walk_vs(&region, VS_BASE, bytes, Some(VS_BASE), &mut snapshot);
         snapshot
+    }
+
+    /// A VS chunk too large for `_POOL_HEADER.BlockSize` carries no header, and its tag is in
+    /// the big-page table like any other big-pool allocation.
+    ///
+    /// `BlockSize` is eight bits of sixteen-byte units, so 4080 bytes -- header included -- is
+    /// the most it can describe and anything needing a page has no header at all. The two
+    /// allocators that produce such a chunk are indistinguishable by their page range
+    /// descriptors, which is why the size answers this rather than the backend: measured on a
+    /// live 26100 kernel, `!pool` calls `0xffffac09da29f000` an `MiRr` allocation of `0xe1c0`
+    /// bytes and the walk called it 57,792 untagged bytes -- the same length, with the name
+    /// lost (`windbg-mcp` FOLLOWUPS item 99).
+    ///
+    /// The fixture writes a *valid* pool header into the big chunk on purpose. Without one the
+    /// wrong answer would be an absent tag, which a fixture of zeroes cannot tell from the right
+    /// one -- and the tag it writes is the one the small chunk beside it legitimately carries,
+    /// so a walk that reads the header anyway reports something entirely plausible.
+    #[test]
+    fn test_a_vs_chunk_too_large_for_a_pool_header_is_tagged_from_the_big_page_table() {
+        // One chunk of 0x2000 -- far past what `BlockSize` can encode -- then an ordinary one.
+        let mut bytes = vs_extent(&[(0x2000, 0), (0x40, 0x2000)]);
+        let mut region = vs_region(bytes.len());
+        // The allocation the table names: page-aligned, as every live entry's `Va` is, and
+        // short of the chunk that holds it by the header space `nt` did not need.
+        let allocation = (VS_BASE + 0x10).next_multiple_of(PAGE_SIZE);
+        region.big_pool = Arc::new(HashMap::from([(
+            allocation,
+            BigPageEntry {
+                tag: u32::from_le_bytes(*b"BIGV"),
+                size: 0x1000,
+            },
+        )]));
+        // And a second entry, for an allocation this extent does not hold, so the match has to
+        // be by containment rather than by "the region names exactly one".
+        Arc::get_mut(&mut region.big_pool)
+            .unwrap()
+            .insert(VS_BASE + 0x9000, BigPageEntry { tag: 0, size: 0x10 });
+        let _ = &mut bytes;
+        let memory = FlatMemory::new(VS_BASE, bytes.len());
+        let layout = vs_layout(VsFixture::Inline);
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+        let mut snapshot = PoolSnapshot {
+            complete: true,
+            ..PoolSnapshot::default()
+        };
+
+        walker.walk_vs(&region, VS_BASE, &bytes, Some(VS_BASE), &mut snapshot);
+
+        let big = snapshot
+            .spans
+            .iter()
+            .find(|span| span.size_class == 0x2000)
+            .unwrap_or_else(|| panic!("the large chunk is missing: {:?}", snapshot.spans));
+        assert_eq!(super::super::decode::display_tag(big.raw_tag), "BIGV");
+        // The table's `Va` is where the allocation begins and `NumberOfBytes` is how long it is;
+        // neither is the chunk, and the phantom header is gone from both.
+        assert_eq!(big.header_address, allocation);
+        assert_eq!(big.usable_address, allocation);
+        assert_eq!(big.size, 0x1000);
+        // The chunk beside it is under the limit, so it keeps the header it really has.
+        let small = snapshot
+            .spans
+            .iter()
+            .find(|span| span.size_class == 0x40)
+            .unwrap_or_else(|| panic!("the small chunk is missing: {:?}", snapshot.spans));
+        assert_eq!(super::super::decode::display_tag(small.raw_tag), "VS!!");
+    }
+
+    /// An entry a chunk could not really hold is not that chunk's, however well it lines up.
+    ///
+    /// Containment alone is the cheap half of the match: an address inside the chunk. The length
+    /// is what says the two are the same allocation, and without it a chunk would adopt the
+    /// entry of whatever happens to begin inside it -- reporting somebody else's tag against a
+    /// length that does not fit, which is worse than the untagged answer it replaces.
+    #[test]
+    fn test_a_big_page_entry_too_long_for_its_chunk_is_not_claimed_by_it() {
+        let bytes = vs_extent(&[(0x2000, 0), (0x40, 0x2000)]);
+        let mut region = vs_region(bytes.len());
+        let allocation = (VS_BASE + 0x10).next_multiple_of(PAGE_SIZE);
+        region.big_pool = Arc::new(HashMap::from([(
+            allocation,
+            BigPageEntry {
+                tag: u32::from_le_bytes(*b"BIGV"),
+                // One byte past what the chunk holding `allocation` can contain.
+                size: (VS_BASE + 0x2000 - allocation) + 1,
+            },
+        )]));
+        let memory = FlatMemory::new(VS_BASE, bytes.len());
+        let layout = vs_layout(VsFixture::Inline);
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1000,
+        };
+        let mut snapshot = PoolSnapshot {
+            complete: true,
+            ..PoolSnapshot::default()
+        };
+
+        walker.walk_vs(&region, VS_BASE, &bytes, Some(VS_BASE), &mut snapshot);
+
+        let big = snapshot
+            .spans
+            .iter()
+            .find(|span| span.size_class == 0x2000)
+            .unwrap_or_else(|| panic!("the large chunk is missing: {:?}", snapshot.spans));
+        assert_ne!(super::super::decode::display_tag(big.raw_tag), "BIGV");
+        assert_eq!(big.header_address, VS_BASE + 0x10);
     }
 
     /// glslang/dbgscope#93: "884x rejecting implausible VS chunk size # at #" counted the
