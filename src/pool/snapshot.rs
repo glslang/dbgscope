@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::decode::{
-    PAGE_SIZE, PoolHeaderLayout, SpecialPoolHeader, adjust_page_end_header, big_page_probe,
+    PAGE_SIZE, PoolHeaderLayout, SpecialPoolHeader, adjust_page_end_header, big_page_hash,
     decode_descriptor_at, decode_large_requested_size, decode_lfh_subsegment, decode_pool_header,
     decode_rb_root_for, decode_slist_header_next, decode_special_pool_header, decode_vs_chunk,
     descriptor_backend, lfh_bitmap_state, read_u16, read_u32, read_u64,
@@ -468,6 +468,29 @@ fn insert_cached_chunk_candidates(
 struct Discovery {
     regions: Vec<PoolRegion>,
     diagnostics: Vec<String>,
+    /// `nt!PoolBigPageTable`, opened once for the whole walk. `None` on a target that has
+    /// none — a user-mode heap, or a kernel whose symbols do not carry it.
+    big_pages: Option<BigPageTable>,
+}
+
+impl Discovery {
+    /// What the big-page table says about the allocation at `address`, reading whichever
+    /// part of the table that question lands in and keeping it for the next one.
+    fn big_page(
+        &mut self,
+        memory: &impl PoolMemory,
+        address: u64,
+    ) -> Result<Option<BigPageEntry>, SnapshotError> {
+        let Self {
+            diagnostics,
+            big_pages,
+            ..
+        } = self;
+        let Some(table) = big_pages.as_mut() else {
+            return Ok(None);
+        };
+        table.lookup(memory, address, diagnostics)
+    }
 }
 
 const SPECIAL_POOL_KINDS: [PoolKind; 4] = [
@@ -579,6 +602,9 @@ fn discover_pool_regions(
         globals_address + layout.field("_RTLP_HP_HEAP_GLOBALS", "LfhKey")? as u64,
         8,
     )?;
+    // Opened before the heaps because every one of them will ask: on a kernel, an allocated
+    // page range that holds no subsegment is a big-pool allocation whose tag is only here.
+    discovery.big_pages = BigPageTable::open(memory, layout, &mut discovery.diagnostics)?;
     for (heap_address, numa_node, pool_kind, special, dynamic_lookaside) in heaps {
         let identity = HeapIdentity {
             pool_state: state_address,
@@ -1307,6 +1333,43 @@ fn discover_segment_context(
             } else {
                 PoolState::Allocated
             };
+            // **An allocated kernel page range with no subsegment in it is a big-pool
+            // allocation, and big-pool allocations carry no `_POOL_HEADER` at all.**
+            // `ExAllocatePoolWithTag` sends anything that will not fit inside a page to
+            // `ExpAllocateBigPool`, which takes whole pages from this same segment allocator
+            // and records the caller's tag and length in `nt!PoolBigPageTable` instead of in
+            // a header — which is why `!pool` calls these "large page allocation" and reads
+            // their tag out of that table rather than out of the page.
+            //
+            // Decoding one as though it began with a header reads the caller's *own first
+            // sixteen bytes* as `PreviousSize`/`BlockSize`/`PoolType`/`PoolTag`, and then
+            // reports the block as starting 0x10 in and 0x10 short. Measured on a live
+            // 26100 kernel (`ctf-vm`, 2026-09-24): `ffffac09dd0f5000` is a 0x1000-byte
+            // `CM25` registry hive bin, and the walk called it a 4080-byte block at
+            // `+0x10` tagged `..N.` — from `hbin`'s own header bytes. Where those bytes
+            // happened to be zero the tag came out `0x00000000`, which is how this
+            // presented: as tens of thousands of untagged allocations (`FOLLOWUPS` item 99).
+            //
+            // Free ranges are deliberately not looked up: `ExpRemoveTagForBigPages` takes the
+            // entry out as the allocation goes away, so a miss there would be the expected
+            // answer rather than a finding.
+            let mut pool_header = layout.pool_header_layout()?;
+            let mut known_tag = None;
+            if backend == PoolBackend::Segment
+                && !identity.special
+                && state == PoolState::Allocated
+                && let Some(big_page) = discovery.big_page(memory, region_address)?
+            {
+                known_tag = Some(big_page.tag);
+                pool_header.size = 0;
+                // The table holds the length the caller asked for; the range is that rounded
+                // up to whole pages. Report the request, as `!pool` does, and leave the
+                // rounding out of the walk rather than inflating the allocation by it.
+                if big_page.size != 0 && big_page.size < region_size as u64 {
+                    region_size = big_page.size as usize;
+                    block_size = region_size.min(u32::MAX as usize) as u32;
+                }
+            }
             discovery.regions.push(PoolRegion {
                 address: region_address,
                 size: region_size,
@@ -1319,10 +1382,10 @@ fn discover_segment_context(
                 unit_size: block_size,
                 bitmap,
                 heap_key,
-                pool_header: layout.pool_header_layout()?,
+                pool_header,
                 vs_header_size: layout.type_layout("_HEAP_VS_CHUNK_HEADER")?.size as usize,
                 vs_sizes_offset: layout.field("_HEAP_VS_CHUNK_HEADER", "Sizes")?,
-                known_tag: None,
+                known_tag,
                 states: vec![state],
                 reusable_chunks: Arc::clone(reusable_chunks),
                 cached_chunks: Arc::clone(cached_chunks),
@@ -1415,14 +1478,14 @@ fn discover_large_allocations(
         let (tag, tracked_size) = if layout.is_user() {
             (0, bytes)
         } else {
-            match lookup_big_page_target(
-                memory,
-                layout,
-                virtual_address,
-                &mut discovery.diagnostics,
-            )? {
-                Some(value) => value,
-                None => (0, bytes),
+            match discovery.big_page(memory, virtual_address)? {
+                Some(big_page) => (big_page.tag, big_page.size),
+                None => {
+                    discovery.diagnostics.push(format!(
+                        "no validated big-page entry for large allocation {virtual_address:#x}"
+                    ));
+                    (0, bytes)
+                }
             }
         };
         let size = tracked_size.min(bytes).min(usize::MAX as u64) as usize;
@@ -1453,114 +1516,194 @@ fn discover_large_allocations(
     Ok(())
 }
 
-const BIG_PAGE_PROBE_BATCH: usize = 256;
+/// How many entries one read of the big-page table covers.
+///
+/// Batches are cut on multiples of this rather than on wherever a probe started, so that the
+/// second lookup landing anywhere inside a batch the first one read costs no read at all —
+/// which is what makes asking this question of *every* allocated page range affordable. At
+/// 32 bytes an entry a batch is 8 KiB, and a whole 26100 table — 0x8000 entries on a 4 GiB
+/// guest — is 128 of them.
+const BIG_PAGE_BATCH: usize = 256;
 
-fn lookup_big_page_target(
-    memory: &impl PoolMemory,
-    layout: &PoolLayout,
-    address: u64,
-    diagnostics: &mut Vec<String>,
-) -> Result<Option<(u32, u64)>, SnapshotError> {
-    let Ok(entry) = layout.type_layout("_POOL_TRACKER_BIG_PAGES") else {
-        return Ok(None);
-    };
-    let entry_size = entry.size as usize;
-    let Ok(va_offset) = layout.field("_POOL_TRACKER_BIG_PAGES", "Va") else {
-        return Ok(None);
-    };
-    let Ok(tag_offset) = layout.field("_POOL_TRACKER_BIG_PAGES", "Key") else {
-        return Ok(None);
-    };
-    let Ok(size_offset) = layout.field("_POOL_TRACKER_BIG_PAGES", "NumberOfBytes") else {
-        return Ok(None);
-    };
-    let Some(&table_pointer_address) = layout.globals.get("PoolBigPageTable") else {
-        return Ok(None);
-    };
-    let table = match scalar(memory, table_pointer_address, 8) {
-        Ok(value) => value,
-        Err(error) => {
-            diagnostics.push(format!("cannot read big-page table pointer: {error}"));
+/// What `nt!PoolBigPageTable` records about one allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BigPageEntry {
+    tag: u32,
+    /// The length the caller asked for, which is *not* the length of the pages it was given:
+    /// a 0xa270-byte request occupies 0xb000 of pool and this field says 0xa270.
+    size: u64,
+}
+
+/// `nt!PoolBigPageTable`: where the kernel keeps the tag of every allocation too large to
+/// carry a `_POOL_HEADER`, read as `nt` reads it and cached a batch at a time.
+///
+/// **Placement.** `nt!ExpAddTagForBigPages` hashes the address and linear-probes forward from
+/// there, wrapping at the end of the table, claiming the first entry whose `Va` has bit 0
+/// set; `nt!ExpRemoveTagForBigPages` repeats the same walk and compares `Va` against the
+/// address **exactly**. Both were read on x64 26100.33438 (2026-09-24), and the hash is the
+/// one [`big_page_hash`] mirrors.
+///
+/// **Bit 0 of `Va` is the free flag, and the address stays behind it.** A free is a
+/// `lock inc` of the whole `Va` word, so a slot that held `0xffffac09e50f5000` reads
+/// `0xffffac09e50f5001` afterwards and keeps its old tag and size until something else claims
+/// it. Matching on `Va & !1` therefore answers for a *freed* allocation with the tag it used
+/// to have — measured on the same kernel, where `ffffac09e50f5001` sat one slot from a live
+/// entry and its page would not even read. The comparison here is `nt`'s: exact.
+///
+/// **A never-used slot is `1`, not `0`**, which is why the probe below stops at `Va <= 1`
+/// rather than at zero, and why the zero test it used to have never once fired: a miss
+/// scanned all 32,768 entries. Stopping at a never-used slot is sound because the allocator
+/// would have claimed it — it is bit-0-set, and the probe that placed the entry being looked
+/// for passed over this slot to reach wherever it went. Stopping at a *freed* slot would not
+/// be sound, since it may well have been occupied when that entry was placed.
+struct BigPageTable {
+    base: u64,
+    count: usize,
+    entry_size: usize,
+    va_offset: usize,
+    tag_offset: usize,
+    size_offset: usize,
+    /// One slot per batch, filled on first touch. A walk that asks about nothing reads
+    /// nothing; one that asks about thousands of ranges converges on the whole table.
+    batches: Vec<Option<Vec<u8>>>,
+}
+
+impl BigPageTable {
+    /// Resolve the table, or `None` when this target has no such thing to read — a user-mode
+    /// Segment Heap, or a kernel whose symbols do not carry the tracker type or the two
+    /// globals. `None` is not an error: the caller falls back to whatever the page itself
+    /// says, which is what a build without the table leaves it with.
+    fn open(
+        memory: &impl PoolMemory,
+        layout: &PoolLayout,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<Option<Self>, SnapshotError> {
+        let (Ok(entry), Ok(va_offset), Ok(tag_offset), Ok(size_offset)) = (
+            layout.type_layout("_POOL_TRACKER_BIG_PAGES"),
+            layout.field("_POOL_TRACKER_BIG_PAGES", "Va"),
+            layout.field("_POOL_TRACKER_BIG_PAGES", "Key"),
+            layout.field("_POOL_TRACKER_BIG_PAGES", "NumberOfBytes"),
+        ) else {
             return Ok(None);
-        }
-    };
-    let Some(&size_address) = layout.globals.get("PoolBigPageTableSize") else {
-        return Ok(None);
-    };
-    let count = match scalar(memory, size_address, 4).or_else(|_| scalar(memory, size_address, 8)) {
-        Ok(value) => value as usize,
-        Err(error) => {
-            diagnostics.push(format!("cannot read big-page table size: {error}"));
+        };
+        let (Some(&table_pointer_address), Some(&size_address)) = (
+            layout.globals.get("PoolBigPageTable"),
+            layout.globals.get("PoolBigPageTableSize"),
+        ) else {
             return Ok(None);
-        }
-    };
-    if table == 0 || count == 0 || count > 0x10_0000 || !count.is_power_of_two() {
-        diagnostics.push(format!("rejecting implausible big-page table size {count}"));
-        return Ok(None);
-    }
-    let mut probes = big_page_probe(address, count).ok_or_else(|| SnapshotError::InvalidData {
-        detail: format!("invalid big-page table size {count}"),
-    })?;
-    let mut remaining = count;
-    'probe: while let Some(first_index) = probes.next() {
+        };
+        // Two reads of its own, so they are polled for like any others: this runs at the head
+        // of discovery, where a budget already spent on resolving the heaps would otherwise
+        // buy two more reads before anything asked.
         check_budget(memory)?;
-        let batch_len = BIG_PAGE_PROBE_BATCH.min(remaining).min(count - first_index);
-        let byte_len =
-            entry_size
-                .checked_mul(batch_len)
-                .ok_or_else(|| SnapshotError::InvalidData {
-                    detail: "big-page probe batch size overflow".into(),
-                })?;
-        let entry_address = table
-            .checked_add(first_index as u64 * entry.size as u64)
-            .ok_or_else(|| SnapshotError::InvalidData {
-                detail: "big-page probe address overflow".into(),
-            })?;
-        let bytes = match guarded_read(memory, entry_address, byte_len) {
-            Ok(bytes) => bytes,
+        let base = match scalar(memory, table_pointer_address, 8) {
+            Ok(value) => value,
             Err(error) => {
-                diagnostics.push(format!(
-                    "cannot read big-page entries {first_index}..{} at {entry_address:#x}: {error}",
-                    first_index + batch_len
-                ));
-                for _ in 1..batch_len {
-                    let _ = probes.next();
-                }
-                remaining -= batch_len;
-                continue;
+                diagnostics.push(format!("cannot read big-page table pointer: {error}"));
+                return Ok(None);
             }
         };
-        for batch_index in 0..batch_len {
-            let offset = batch_index * entry_size;
-            let index = first_index + batch_index;
-            let Some(candidate) = read_u64(&bytes, offset + va_offset) else {
-                diagnostics.push(format!("truncated big-page entry {index}"));
-                continue;
+        let count =
+            match scalar(memory, size_address, 4).or_else(|_| scalar(memory, size_address, 8)) {
+                Ok(value) => value as usize,
+                Err(error) => {
+                    diagnostics.push(format!("cannot read big-page table size: {error}"));
+                    return Ok(None);
+                }
             };
-            if candidate == 0 {
-                break 'probe;
-            }
-            if candidate & !1 == address {
-                let Some(tag) = read_u32(&bytes, offset + tag_offset) else {
-                    diagnostics.push(format!("truncated big-page tag at entry {index}"));
-                    continue;
-                };
-                let Some(size) = read_u64(&bytes, offset + size_offset) else {
-                    diagnostics.push(format!("truncated big-page size at entry {index}"));
-                    continue;
-                };
-                return Ok(Some((tag, size)));
-            }
+        if base == 0 || count == 0 || count > 0x10_0000 || !count.is_power_of_two() {
+            diagnostics.push(format!("rejecting implausible big-page table size {count}"));
+            return Ok(None);
         }
-        for _ in 1..batch_len {
-            let _ = probes.next();
-        }
-        remaining -= batch_len;
+        Ok(Some(Self {
+            base,
+            count,
+            entry_size: entry.size as usize,
+            va_offset,
+            tag_offset,
+            size_offset,
+            batches: vec![None; count.div_ceil(BIG_PAGE_BATCH)],
+        }))
     }
-    diagnostics.push(format!(
-        "no validated big-page entry for large allocation {address:#x}"
-    ));
-    Ok(None)
+
+    /// The entry for `address`, or `None` when the table does not name it.
+    fn lookup(
+        &mut self,
+        memory: &impl PoolMemory,
+        address: u64,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<Option<BigPageEntry>, SnapshotError> {
+        let mut index =
+            big_page_hash(address, self.count).ok_or_else(|| SnapshotError::InvalidData {
+                detail: format!("invalid big-page table size {}", self.count),
+            })?;
+        for _ in 0..self.count {
+            let entry_size = self.entry_size;
+            let offset = (index % BIG_PAGE_BATCH) * entry_size;
+            let (va_offset, tag_offset, size_offset) =
+                (self.va_offset, self.tag_offset, self.size_offset);
+            let Some(bytes) = self.batch(memory, index / BIG_PAGE_BATCH, diagnostics)? else {
+                return Ok(None);
+            };
+            let Some(candidate) = read_u64(bytes, offset + va_offset) else {
+                // The batch is short of this entry: either the read failed, or the table
+                // runs past what the target will give us. Either way the chain ends here.
+                return Ok(None);
+            };
+            // Never used, so the allocator would have put our entry here rather than past it.
+            if candidate <= 1 {
+                return Ok(None);
+            }
+            if candidate == address {
+                let (Some(tag), Some(size)) = (
+                    read_u32(bytes, offset + tag_offset),
+                    read_u64(bytes, offset + size_offset),
+                ) else {
+                    diagnostics.push(format!("truncated big-page entry {index}"));
+                    return Ok(None);
+                };
+                return Ok(Some(BigPageEntry { tag, size }));
+            }
+            index = (index + 1) % self.count;
+        }
+        Ok(None)
+    }
+
+    /// One batch of entries, read on first touch and kept.
+    fn batch(
+        &mut self,
+        memory: &impl PoolMemory,
+        batch: usize,
+        diagnostics: &mut Vec<String>,
+    ) -> Result<Option<&[u8]>, SnapshotError> {
+        if self.batches.get(batch).is_none_or(Option::is_some) {
+            return Ok(self.batches.get(batch).and_then(Option::as_deref));
+        }
+        check_budget(memory)?;
+        let first = batch * BIG_PAGE_BATCH;
+        let len = BIG_PAGE_BATCH.min(self.count - first);
+        let (Some(byte_len), Some(entry_address)) = (
+            self.entry_size.checked_mul(len),
+            self.base.checked_add(first as u64 * self.entry_size as u64),
+        ) else {
+            return Err(SnapshotError::InvalidData {
+                detail: "big-page batch address overflow".into(),
+            });
+        };
+        match guarded_read(memory, entry_address, byte_len) {
+            Ok(bytes) => self.batches[batch] = Some(bytes),
+            Err(error) => {
+                diagnostics.push(format!(
+                    "cannot read big-page entries {first}..{} at {entry_address:#x}: {error}",
+                    first + len
+                ));
+                // An empty batch is still a batch: it is cached so that the next thousand
+                // allocations hashing into it do not each pay for the same failed read.
+                self.batches[batch] = Some(Vec::new());
+            }
+        }
+        Ok(self.batches[batch].as_deref())
+    }
 }
 
 /// How many verbatim examples of one kind of diagnostic to keep.
@@ -2822,30 +2965,6 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             }
             slot += 1;
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lookup_big_page(
-        &self,
-        table: &[u8],
-        entry_size: usize,
-        address: u64,
-    ) -> Option<(u32, u64)> {
-        if entry_size < 20 || !table.len().is_multiple_of(entry_size) {
-            return None;
-        }
-        let count = table.len() / entry_size;
-        for index in big_page_probe(address, count)? {
-            let offset = index * entry_size;
-            let candidate = read_u64(table, offset)?;
-            if candidate == 0 {
-                break;
-            }
-            if candidate & !1 == address {
-                return Some((read_u32(table, offset + 8)?, read_u64(table, offset + 12)?));
-            }
-        }
-        None
     }
 }
 
@@ -5170,23 +5289,6 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("only committed through"))
         );
-
-        let mut table = vec![0u8; 8 * 24];
-        let address = K + 0xb0_0000;
-        let first = super::super::decode::big_page_hash(address, 8).unwrap();
-        for distance in 0..2 {
-            let collision = ((first + distance) % 8) * 24;
-            table[collision..collision + 8]
-                .copy_from_slice(&(address + (distance as u64 + 1) * 0x10_0000).to_le_bytes());
-        }
-        let third = ((first + 2) % 8) * 24;
-        table[third..third + 8].copy_from_slice(&address.to_le_bytes());
-        table[third + 8..third + 12].copy_from_slice(b"NEXT");
-        table[third + 12..third + 20].copy_from_slice(&0x7000u64.to_le_bytes());
-        assert_eq!(
-            walker.lookup_big_page(&table, 24, address),
-            Some((u32::from_le_bytes(*b"NEXT"), 0x7000))
-        );
     }
 
     // ---- the walk budget --------------------------------------------------------------
@@ -5348,6 +5450,10 @@ mod tests {
     /// header, and they are discarded before the walk ever sees them. The free range is
     /// deliberately *not* in the free-page tree, so its state has to come from its own flags.
     fn segment_of_plain_page_ranges(heap_key: u64) -> SyntheticMemory {
+        SyntheticMemory::new(plain_page_range_writes(heap_key), Vec::new())
+    }
+
+    fn plain_page_range_writes(heap_key: u64) -> Writes {
         let mut bytes = Writes::default();
         let context = HEAP + 0x100;
 
@@ -5373,7 +5479,89 @@ mod tests {
             put(&mut bytes, descriptor + 0x18, &[flags]);
             put(&mut bytes, descriptor + 0x1f, &[1]);
         }
-        SyntheticMemory::new(bytes, Vec::new())
+        bytes
+    }
+
+    /// A kernel page range that `nt!PoolBigPageTable` names is a big-pool allocation, and it
+    /// has no `_POOL_HEADER` for the walk to read.
+    ///
+    /// `ExpAllocateBigPool` takes whole pages from this same segment allocator and puts the
+    /// caller's tag and length in that table instead of in a header, which is why the range
+    /// descriptor cannot tell one from a plain page-range allocation: both are `RangeFlags`
+    /// `0x03`. Decoding the page as though a header were there reads the caller's own first
+    /// sixteen bytes as one — measured on a live 26100 kernel (`FOLLOWUPS` item 99), where a
+    /// `CM25` registry hive bin came back as a 4080-byte block at `+0x10` tagged `..N.`, from
+    /// the bytes of `hbin`'s own header.
+    ///
+    /// The fixture writes a *valid-looking* pool header at the page start on purpose: without
+    /// it the wrong answer would be an empty tag, which a fixture of zeroes cannot tell from
+    /// the right one.
+    #[test]
+    fn test_a_page_range_the_big_page_table_names_carries_no_pool_header() {
+        let heap_key = 0x55aa_1234_9876_0000;
+        let allocated = SEGMENT + 0x1000;
+        let mut writes = plain_page_range_writes(heap_key);
+        fill(&mut writes, allocated, 0x1000);
+        pool_header(&mut writes, allocated, b"HBIN");
+        put_u64(&mut writes, BIG_TABLE_POINTER, BIG_TABLE);
+        put_u64(&mut writes, BIG_TABLE_COUNT, 8);
+        fill(&mut writes, BIG_TABLE, 8 * 0x20);
+        let index = super::super::decode::big_page_hash(allocated, 8).unwrap();
+        let entry = BIG_TABLE + index as u64 * 0x20;
+        put_u64(&mut writes, entry, allocated);
+        put(&mut writes, entry + 8, b"BIGP");
+        put_u64(&mut writes, entry + 0x10, 0xfc0);
+        let memory = SyntheticMemory::new(writes, Vec::new());
+        let layout = synthetic_layout();
+        let mut discovery = Discovery {
+            big_pages: BigPageTable::open(&memory, &layout, &mut Vec::new()).unwrap(),
+            ..Discovery::default()
+        };
+        assert!(discovery.big_pages.is_some(), "the fixture has a table");
+
+        discover_segment_context(
+            &memory,
+            &layout,
+            HEAP + 0x100,
+            0,
+            PoolKind::NonPagedNx,
+            HeapIdentity {
+                pool_state: STATE,
+                heap: HEAP,
+                special: false,
+            },
+            heap_key,
+            0xa5c3_1357,
+            1024,
+            &SharedChunks::default(),
+            &SharedChunks::default(),
+            &mut discovery,
+        )
+        .expect("the fixture is readable throughout");
+
+        let walker = SnapshotWalker {
+            memory: &memory,
+            layout: &layout,
+            traversal_limit: 1024,
+        };
+        let mut snapshot = PoolSnapshot {
+            complete: true,
+            ..PoolSnapshot::default()
+        };
+        walker
+            .walk_discovered_regions(discovery.regions, None, false, &mut snapshot)
+            .expect("the fixture is readable throughout");
+
+        let span = snapshot
+            .spans
+            .iter()
+            .find(|span| span.header_address == allocated)
+            .unwrap_or_else(|| panic!("no span at the allocated range: {:?}", snapshot.spans));
+        assert_eq!(super::super::decode::display_tag(span.raw_tag), "BIGP");
+        // The block starts at the page, not 0x10 into it, and is the length the table
+        // records rather than the page less a header that was never there.
+        assert_eq!(span.usable_address, allocated);
+        assert_eq!(span.size, 0xfc0);
     }
 
     /// A page range that is not a subsegment must be walked as page ranges, not rejected.
@@ -6204,9 +6392,10 @@ mod tests {
         let mut layout = synthetic_layout();
         layout.types.remove("_POOL_TRACKER_BIG_PAGES");
 
-        assert_eq!(
-            lookup_big_page_target(&memory, &layout, LARGE_VA, &mut Vec::new()).unwrap(),
-            None
+        assert!(
+            BigPageTable::open(&memory, &layout, &mut Vec::new())
+                .unwrap()
+                .is_none()
         );
         assert_eq!(memory.read_calls.get(), 0);
     }
@@ -6215,28 +6404,132 @@ mod tests {
     fn test_big_page_lookup_batches_collision_chain() {
         let memory = big_page_memory(LARGE_VA, 512, 300);
         let layout = synthetic_layout();
-        let reads_before = memory.read_calls.get();
         let mut diagnostics = Vec::new();
+        let mut table = BigPageTable::open(&memory, &layout, &mut diagnostics)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
-            lookup_big_page_target(&memory, &layout, LARGE_VA, &mut diagnostics).unwrap(),
-            Some((u32::from_le_bytes(*b"BTCH"), 0x9000))
+            table.lookup(&memory, LARGE_VA, &mut diagnostics).unwrap(),
+            Some(BigPageEntry {
+                tag: u32::from_le_bytes(*b"BTCH"),
+                size: 0x9000,
+            })
         );
-        assert!(memory.read_calls.get() - reads_before <= 5);
+        assert!(memory.read_calls.get() <= 5);
         assert!(diagnostics.is_empty());
+
+        // The chain crossed both batches, so asking again is pure arithmetic. This is what
+        // makes the lookup affordable per *page range* rather than per large allocation.
+        let reads = memory.read_calls.get();
+        assert!(
+            table
+                .lookup(&memory, LARGE_VA, &mut diagnostics)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(memory.read_calls.get(), reads);
     }
 
     #[test]
     fn test_big_page_lookup_honors_interrupt_between_batches() {
         let mut memory = big_page_memory(LARGE_VA, 512, 300);
         let layout = synthetic_layout();
+        let mut table = BigPageTable::open(&memory, &layout, &mut Vec::new())
+            .unwrap()
+            .unwrap();
         memory.interrupt_after_checks = Some(1);
 
         assert!(matches!(
-            lookup_big_page_target(&memory, &layout, LARGE_VA, &mut Vec::new()),
+            table.lookup(&memory, LARGE_VA, &mut Vec::new()),
             Err(SnapshotError::Interrupted)
         ));
         assert_eq!(memory.interrupt_checks.get(), 2);
+    }
+
+    /// `nt!ExpRemoveTagForBigPages` frees an entry with `lock inc [Va]`, so a freed
+    /// allocation is still in the table under `address | 1` with its old tag and size, and
+    /// `nt`'s own comparison is `cmp rcx,rdi` — exact. Matching on `Va & !1`, as this did,
+    /// answers for a page that has been given back with the tag it used to carry.
+    #[test]
+    fn test_big_page_lookup_walks_past_a_freed_entry_to_the_live_one() {
+        let count = 8;
+        let layout = synthetic_layout();
+        let mut bytes = vec![0u8; count * 0x20];
+        let first = super::super::decode::big_page_hash(LARGE_VA, count).unwrap();
+        let put = |bytes: &mut Vec<u8>, index: usize, va: u64, tag: &[u8; 4], size: u64| {
+            let offset = (index % count) * 0x20;
+            bytes[offset..offset + 8].copy_from_slice(&va.to_le_bytes());
+            bytes[offset + 8..offset + 12].copy_from_slice(tag);
+            bytes[offset + 0x10..offset + 0x18].copy_from_slice(&size.to_le_bytes());
+        };
+        // The same address, freed, sitting where the hash lands. Then the live entry.
+        put(&mut bytes, first, LARGE_VA | 1, b"DEAD", 0x3000);
+        put(&mut bytes, first + 1, LARGE_VA, b"LIVE", 0x1800);
+        let memory = BigPageMemory {
+            table: bytes,
+            count,
+            read_calls: Cell::new(0),
+            interrupt_checks: Cell::new(0),
+            interrupt_after_checks: None,
+        };
+        let mut table = BigPageTable::open(&memory, &layout, &mut Vec::new())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            table.lookup(&memory, LARGE_VA, &mut Vec::new()).unwrap(),
+            Some(BigPageEntry {
+                tag: u32::from_le_bytes(*b"LIVE"),
+                size: 0x1800,
+            })
+        );
+    }
+
+    /// A slot the allocator has never used reads `1` — `POOL_BIG_TABLE_ENTRY_FREE` with no
+    /// address behind it — and ends the chain, because `ExpAddTagForBigPages` claims the
+    /// first bit-0-set slot from the hash and so could not have walked past this one. The
+    /// test that matters is the *miss*: a lookup that scans the whole table instead costs a
+    /// read of every batch in it.
+    #[test]
+    fn test_big_page_lookup_stops_at_a_never_used_slot() {
+        let count = 512;
+        let layout = synthetic_layout();
+        let mut bytes = vec![0u8; count * 0x20];
+        let absent = LARGE_VA + 0x20_0000;
+        let first = super::super::decode::big_page_hash(absent, count).unwrap();
+        // Every slot occupied, so that a walk which does not stop where it should has nothing
+        // else to stop it and runs into the next batch. Each occupant is distinct from
+        // `absent`, which the chain must not accidentally contain.
+        for index in 0..count {
+            let offset = index * 0x20;
+            let occupant = LARGE_VA + 0x100_0000 + index as u64 * 0x1000;
+            bytes[offset..offset + 8].copy_from_slice(&occupant.to_le_bytes());
+        }
+        let never_used = ((first + 3) % count) * 0x20;
+        bytes[never_used..never_used + 8].copy_from_slice(&1u64.to_le_bytes());
+        assert!(
+            first % BIG_PAGE_BATCH + 3 < BIG_PAGE_BATCH,
+            "the fixture's chain has to stay inside one batch for the read count to mean              anything"
+        );
+        let memory = BigPageMemory {
+            table: bytes,
+            count,
+            read_calls: Cell::new(0),
+            interrupt_checks: Cell::new(0),
+            interrupt_after_checks: None,
+        };
+        let mut table = BigPageTable::open(&memory, &layout, &mut Vec::new())
+            .unwrap()
+            .unwrap();
+        let reads = memory.read_calls.get();
+
+        assert_eq!(
+            table.lookup(&memory, absent, &mut Vec::new()).unwrap(),
+            None
+        );
+        // One batch, not both: the chain ended before the walk left it.
+        assert_eq!(memory.read_calls.get() - reads, 1);
     }
 
     #[test]
