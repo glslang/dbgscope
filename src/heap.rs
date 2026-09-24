@@ -112,8 +112,9 @@ pub enum HeapState {
     Allocated,
     ReusableFree,
     CachedFree,
-    /// Memory the walk could not read that the process does have; see
-    /// [`PoolState::Unreadable`].
+    /// A span the walk could not read and nothing established was empty — which includes both
+    /// memory the process does have and memory nothing could be asked about. The conservative
+    /// bucket rather than a claim; see [`PoolState::Unreadable`].
     Unreadable,
     /// Address space in a heap region with no pages behind it; see
     /// [`PoolState::Uncommitted`]. Not a gap in the walk's coverage — a reserved subsegment
@@ -182,8 +183,9 @@ pub struct HeapWalkReport {
     pub total_chunks: usize,
     pub allocated_chunks: usize,
     pub diagnostic_count: usize,
-    /// Spans the walk could not read and the process **does** have; each one clears
-    /// [`WalkCoverage::complete`].
+    /// Spans the walk could not read and nothing established were empty; each one clears
+    /// [`WalkCoverage::complete`]. See [`HeapState::Unreadable`] for why that is not the same as
+    /// memory the process has.
     pub unreadable_gaps: usize,
     /// Spans with no pages behind them — reserved subsegment tails and the like, which the
     /// memory manager confirmed rather than the walk assumed.

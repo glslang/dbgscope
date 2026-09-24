@@ -42,7 +42,9 @@ All notable changes to this project are documented here. The format follows
   Only a positive `MEM_RESERVE`/`MEM_FREE` excuses a gap — a failed query, a run that cannot
   advance, an unnamed state and a source that cannot be asked are each conservative, so the
   excuse is never granted by an absence of evidence. The kernel pool walk is not asked at all
-  and is unchanged.
+  and is unchanged. Which also fixes what `Unreadable` *means*: it is now everything that could
+  not be established as empty, including every case nothing could be asked about, so it is the
+  conservative bucket rather than a claim that the target has the memory.
 
   A free chunk whose middle the allocator decommitted is the same question reached another way:
   it runs past the committed extent it starts in, and `walk_vs` emitted no span for it and
