@@ -24,6 +24,22 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **And a big-pool allocation served out of a VS subsegment kept no tag either.** The fix above
+  asked the page range descriptor which allocations have no `_POOL_HEADER`, and that is only where
+  *most* of them are: `nt` also puts them inside VS subsegments, where the descriptor says `0x0f`
+  and the chunk chain runs straight through them. The size answers it instead, and structurally
+  rather than by measurement — `_POOL_HEADER.BlockSize` is **eight bits** of sixteen-byte units
+  (`dt nt!_POOL_HEADER`, x64 26100.33438), so 4080 bytes of chunk is the most it can describe and
+  an allocation needing a page has nowhere to record its own length. That is why every one of the
+  7,639 live entries on a 26100 guest recorded `NumberOfBytes` of `0x1000` or more, and none
+  fewer. A chunk past that limit is now matched against the entries discovery found inside its
+  region, **by containment and length** rather than by arithmetic on the chunk header: the table's
+  `Va` is where the allocation starts and `NumberOfBytes` is how long it is, and taking both as
+  given assumes nothing about what sits between the chunk header and the data — which on that
+  guest is 0x10 that is measured and not yet explained. Measured there: `!pool` calls
+  `0xffffac09da29f000` an `MiRr` allocation of `0xe1c0` bytes and the walk called it 57,792
+  untagged bytes — the same length, with only the name lost. windbg-mcp `FOLLOWUPS.md` item 99.
+
 - **Every big-pool allocation was reported with a tag read out of the caller's own data.**
   `ExAllocatePoolWithTag` sends anything that will not fit inside a page to `ExpAllocateBigPool`,
   which takes whole pages from the segment allocator and records the tag and length in
