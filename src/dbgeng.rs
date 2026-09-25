@@ -4034,6 +4034,38 @@ impl Default for DebugEngine {
 // `the_engine_does_not_cross_threads_and_the_handle_does` is what stops an `unsafe impl` coming
 // back without one.
 
+/// What DbgEng says it is debugging: `GetDebuggeeType`'s class and qualifier, as the pair the
+/// engine returns.
+///
+/// **The raw pair rather than an enum of the qualifiers**, because a caller wanting to know what
+/// kind of target this is asks one of the predicates below, and a caller comparing two readings —
+/// which is the other use, and the one no other engine query serves — wants the *whole* pair.
+/// An enum would have to enumerate every `DEBUG_KERNEL_*` and `DEBUG_USER_WINDOWS_*` DbgEng has,
+/// and two qualifiers it did not know about would fold into one variant and compare equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DebuggeeType {
+    /// `DEBUG_CLASS_*`: uninitialized, kernel, or user-mode Windows.
+    pub class: u32,
+    /// Which target within that class: `DEBUG_KERNEL_*` or `DEBUG_USER_WINDOWS_*` — a live
+    /// connection, or which kind of dump.
+    pub qualifier: u32,
+}
+
+impl DebuggeeType {
+    /// Whether this is a kernel target at all — a live connection or a kernel dump.
+    pub fn is_kernel(self) -> bool {
+        self.class == DEBUG_CLASS_KERNEL
+    }
+
+    /// Whether this is a *live* kernel connection (net/1394/serial/local/EXDI/IDNA) as opposed to
+    /// a kernel dump or a user-mode target. A live kernel requires an INFINITE `WaitForEvent`
+    /// timeout; a finite one returns `E_NOTIMPL`.
+    pub fn is_live_kernel(self) -> bool {
+        // Dump qualifiers are >= DEBUG_KERNEL_SMALL_DUMP; live connections are below it.
+        self.is_kernel() && self.qualifier < DEBUG_KERNEL_SMALL_DUMP
+    }
+}
+
 /// What became of the **target** when its session ended.
 ///
 /// Separate from whether the teardown succeeded, which is the `Result` this rides in: a session can
@@ -4876,7 +4908,16 @@ impl DebugEngine {
         })
     }
 
-    pub fn is_kernel_target(&self) -> Result<bool, DbgEngError> {
+    /// What DbgEng says it is debugging right now — see [`DebuggeeType`].
+    ///
+    /// **Read from the engine on every call, which is the point of exposing it.** It is not a
+    /// property recorded by whichever opener ran: a raw `.opendump` typed at the engine replaces
+    /// the target without this crate seeing anything, and this is one of the few things that
+    /// answers differently afterwards. That makes it usable as half of a *fingerprint* a caller
+    /// compares across commands, which is a different question from
+    /// [`Self::target_identity`] — that one is a generation this crate hands out and bumps at its
+    /// own openers and teardowns, so it does **not** move when DbgEng is driven behind its back.
+    pub fn debuggee_type(&self) -> Result<DebuggeeType, DbgEngError> {
         let mut class = 0;
         let mut qualifier = 0;
         unsafe { self.control.GetDebuggeeType(&mut class, &mut qualifier) }.map_err(|source| {
@@ -4885,7 +4926,57 @@ impl DebugEngine {
                 source,
             }
         })?;
-        Ok(class == DEBUG_CLASS_KERNEL)
+        Ok(DebuggeeType { class, qualifier })
+    }
+
+    /// Whether the current target is a kernel one, live connection or kernel dump alike.
+    pub fn is_kernel_target(&self) -> Result<bool, DbgEngError> {
+        Ok(self.debuggee_type()?.is_kernel())
+    }
+
+    /// The dump or trace files this session is open on, in the engine's own order.
+    ///
+    /// Empty on a live target, where there is no file behind the debuggee — and **an engine that
+    /// will not answer at all is an error rather than an empty list**, so "none" always means
+    /// none. A caller comparing two readings to notice a target being swapped underneath it
+    /// cannot afford the two collapsed: a failure read as "no dump files" matches every live
+    /// target and would say the target had not changed.
+    ///
+    /// A name the engine returns as empty keeps its slot, because the *count* is as much of the
+    /// answer as the names are.
+    pub fn dump_files(&self) -> Result<Vec<String>, DbgEngError> {
+        let named = |operation: &str, source: windows::core::Error| DbgEngError::Context {
+            operation: operation.into(),
+            source,
+        };
+        let count = unsafe { self.client.GetNumberDumpFiles() }
+            .map_err(|source| named("counting the session's dump files", source))?;
+        let mut files = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            // The usual two calls: the first sizes the name, the second fills it. `kind` is the
+            // dump *file* type, which nothing here reads — the API takes a plain pointer for it
+            // rather than an optional one, so there is no way to decline it.
+            let mut kind = 0u32;
+            let mut needed = 0u32;
+            unsafe {
+                self.client
+                    .GetDumpFileWide(index, None, Some(&mut needed), None, &mut kind)
+            }
+            .map_err(|source| named("sizing a dump file's name", source))?;
+            // Counted in characters and including the terminator, so one is an empty name.
+            if needed <= 1 {
+                files.push(String::new());
+                continue;
+            }
+            let mut buffer = vec![0u16; needed as usize];
+            unsafe {
+                self.client
+                    .GetDumpFileWide(index, Some(&mut buffer), None, None, &mut kind)
+            }
+            .map_err(|source| named("reading a dump file's name", source))?;
+            files.push(wide_to_string(&buffer));
+        }
+        Ok(files)
     }
 
     /// Asks the engine to break in as soon as a freshly attached target initializes
@@ -4918,14 +5009,10 @@ impl DebugEngine {
     /// Whether the current target is a *live* kernel connection (net/1394/serial/local/
     /// EXDI/IDNA) as opposed to a kernel dump or a user-mode target. A live kernel
     /// requires an INFINITE `WaitForEvent` timeout; a finite one returns `E_NOTIMPL`.
+    /// An engine that will not say answers `false`, as it always has: this decides whether to
+    /// take the live-kernel teardown, and taking it on a guess is the worse of the two mistakes.
     fn is_live_kernel(&self) -> bool {
-        let mut class = 0u32;
-        let mut qualifier = 0u32;
-        if unsafe { self.control.GetDebuggeeType(&mut class, &mut qualifier) }.is_err() {
-            return false;
-        }
-        // Dump qualifiers are >= DEBUG_KERNEL_SMALL_DUMP; live connections are below it.
-        class == DEBUG_CLASS_KERNEL && qualifier < DEBUG_KERNEL_SMALL_DUMP
+        self.debuggee_type().is_ok_and(DebuggeeType::is_live_kernel)
     }
 
     /// Attaches to the local kernel and breaks in.
@@ -9138,12 +9225,63 @@ impl Drop for ScopedBreakpoint<'_> {
 #[cfg(test)]
 mod tests {
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DEBUG_STATUS_BREAK, DEBUG_STATUS_IGNORE_EVENT, DEBUG_STATUS_NO_CHANGE,
-        DEBUG_STATUS_OUT_OF_SYNC, DEBUG_STATUS_RESTART_REQUESTED, DEBUG_STATUS_TIMEOUT,
-        DEBUG_STATUS_WAIT_INPUT, DEBUG_VALUE_0, DEBUG_VALUE_INVALID, DEBUG_VALUE_TYPES,
+        DEBUG_CLASS_UNINITIALIZED, DEBUG_CLASS_USER_WINDOWS, DEBUG_KERNEL_CONNECTION,
+        DEBUG_KERNEL_DUMP, DEBUG_KERNEL_FULL_DUMP, DEBUG_KERNEL_LOCAL, DEBUG_STATUS_BREAK,
+        DEBUG_STATUS_IGNORE_EVENT, DEBUG_STATUS_NO_CHANGE, DEBUG_STATUS_OUT_OF_SYNC,
+        DEBUG_STATUS_RESTART_REQUESTED, DEBUG_STATUS_TIMEOUT, DEBUG_STATUS_WAIT_INPUT,
+        DEBUG_USER_WINDOWS_PROCESS, DEBUG_USER_WINDOWS_SMALL_DUMP, DEBUG_VALUE_0,
+        DEBUG_VALUE_INVALID, DEBUG_VALUE_TYPES,
     };
 
     use super::*;
+
+    /// The two predicates over `GetDebuggeeType`'s pair, against the qualifiers DbgEng defines.
+    ///
+    /// The boundary is the whole of it: `DEBUG_KERNEL_SMALL_DUMP` is the *lowest dump* qualifier,
+    /// so the live connections are the ones strictly below it. Reading it as "less than or equal"
+    /// would call a small kernel dump a live connection, and a live connection is the one target
+    /// whose `WaitForEvent` must be INFINITE — a finite one there answers `E_NOTIMPL`, so the
+    /// mistake surfaces as a teardown that will not run rather than as a wrong label.
+    #[test]
+    fn test_a_kernel_dump_is_a_kernel_target_and_not_a_live_one() {
+        let kind = |class, qualifier| DebuggeeType { class, qualifier };
+
+        let live = kind(DEBUG_CLASS_KERNEL, DEBUG_KERNEL_CONNECTION);
+        assert!(live.is_kernel() && live.is_live_kernel());
+        let local = kind(DEBUG_CLASS_KERNEL, DEBUG_KERNEL_LOCAL);
+        assert!(local.is_kernel() && local.is_live_kernel());
+
+        for qualifier in [
+            DEBUG_KERNEL_SMALL_DUMP,
+            DEBUG_KERNEL_DUMP,
+            DEBUG_KERNEL_FULL_DUMP,
+        ] {
+            let dump = kind(DEBUG_CLASS_KERNEL, qualifier);
+            assert!(dump.is_kernel(), "{qualifier} is a kernel target");
+            assert!(!dump.is_live_kernel(), "{qualifier} is a dump, not a link");
+        }
+
+        // A user-mode target is neither, whatever its qualifier — including the process
+        // qualifier, which is numerically below `DEBUG_KERNEL_SMALL_DUMP` and would pass the
+        // comparison on its own.
+        for qualifier in [DEBUG_USER_WINDOWS_PROCESS, DEBUG_USER_WINDOWS_SMALL_DUMP] {
+            let user = kind(DEBUG_CLASS_USER_WINDOWS, qualifier);
+            assert!(!user.is_kernel() && !user.is_live_kernel());
+        }
+
+        // An engine holding nothing says so, and says it as a class rather than as a failure.
+        let nothing = kind(DEBUG_CLASS_UNINITIALIZED, 0);
+        assert!(!nothing.is_kernel() && !nothing.is_live_kernel());
+
+        // The pair compares whole, which is what a caller watching for a target being swapped
+        // underneath it reads: a live kernel and a kernel dump are both kernel targets and are
+        // not the same target.
+        assert_ne!(live, kind(DEBUG_CLASS_KERNEL, DEBUG_KERNEL_FULL_DUMP));
+        assert_ne!(
+            kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_PROCESS),
+            kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_SMALL_DUMP)
+        );
+    }
 
     #[test]
     fn test_quit_must_release_the_target_before_reporting_resume() {
