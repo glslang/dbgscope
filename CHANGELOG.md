@@ -6,6 +6,32 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **CI's ARM64 entry names an image rather than the moving `windows-11-arm` label**, and the
+  architecture is a matrix value rather than that label matched a second time. Both entries here
+  drive a real engine — 46 of this crate's non-ignored tests reach `DebugCreate`, and several
+  launch or attach to a live process — so a run is a reading of that runner image's inbox
+  `dbgeng.dll`. A label is not that: GitHub migrated `windows-11-arm` onto the Visual Studio 2026
+  ARM64 image on 2026-09-23, and this workflow's own runs report `Image: windows-11-arm64` on
+  2026-09-22T19:45Z against `windows-11-vs2026-arm64`, `Version: 20260920.164.1` on run
+  36040398859 — a different OS build and therefore a different engine, under an unchanged
+  workflow and with nothing printed to say so. The entry is `windows-11-vs2026-arm` now, and a
+  step records which image answered.
+
+  **The hazard was in the step that reads the label, not in the label.** `vs-architecture` was
+  `${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}`, so renaming the runner without
+  touching it would have selected the **x64** toolchain on an ARM64 machine — wrong, and green.
+  `arch` is now stated per entry through an `include` that adds a key to an existing combination
+  rather than creating new ones, and the job name is `build (<arch>, <toolchain>)`, which no
+  image migration can move. Nothing was stranded by the rename: the repository ruleset protects
+  deletion, non-fast-forward and linear history and requires **no status check contexts**, which
+  was read rather than assumed.
+
+  Sibling to `windbg-mcp`'s `FOLLOWUPS.md` item 32, which was the same migration met by a repo
+  that had run the two labels side by side through it. This one had not, so the migration landed
+  here unobserved — which is the argument for the recording step.
+
 ### Added
 
 - **`DebugEngine::virtual_region`** — `IDebugDataSpaces2::QueryVirtual` as a typed answer
