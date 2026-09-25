@@ -8656,7 +8656,14 @@ impl DebugEngine {
     /// The engine id is what `SetCurrentProcessId` takes and the pid is what a caller knows a
     /// process by, and they are not the same number — `GetProcessIdsByIndex` is the one call that
     /// answers both, which is why this returns pairs rather than either alone.
-    fn session_processes(&self) -> Result<Vec<(u32, u32)>, DbgEngError> {
+    ///
+    /// **Public because it is the only stable answer to "which processes is this session
+    /// debugging".** [`Self::current_process_system_id`] answers a different question that reads
+    /// like the same one: it is the *selection*, which DbgEng moves on its own at a child-process
+    /// event and which `|Ns` moves by hand, neither of which changes what the session holds. A
+    /// caller comparing two readings to notice a target being swapped wants this one; one
+    /// reporting where the debugger is pointing wants that one.
+    pub fn session_processes(&self) -> Result<Vec<(u32, u32)>, DbgEngError> {
         // An engine with no debuggee holds no processes, and answering that rather than asking is
         // not a shortcut: `GetNumberProcesses` fails `E_UNEXPECTED` ("Catastrophic failure") in
         // that state — measured — which would turn "the program had already finished" into a

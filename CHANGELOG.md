@@ -69,6 +69,14 @@ All notable changes to this project are documented here. The format follows
   `WaitForEvent` that loads it is not comparable with a later one. And a **kernel** target has no
   process id to read at all (`E_NOTIMPL`).
 
+- **`DebugEngine::session_processes` is public**, having been the crate's own answer to which
+  user-mode processes a session holds since the teardown needed it. It is the stable half of a
+  pair whose other half reads like the same question and is not:
+  `current_process_system_id` is the *selection*, which DbgEng moves by itself at a child-process
+  event and which `|Ns` moves by hand — neither of which changes what the session is debugging.
+  Exposed for a caller fingerprinting its target, where using the selection retires a perfectly
+  good session the first time the debugger points somewhere else.
+
 - **`DebugEngine::virtual_region`** — `IDebugDataSpaces2::QueryVirtual` as a typed answer
   (`VirtualRegion`, `VirtualState`), which is what the memory manager says about a run of pages
   rather than what the debugger can read there. `VirtualState::Unknown(u32)` keeps a state this
