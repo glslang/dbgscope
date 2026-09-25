@@ -34,6 +34,27 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`DebugEngine::debuggee_type` and `DebugEngine::dump_files`** — the two engine queries that
+  answer *what is this engine holding right now*, rather than what the opener asked for.
+  `debuggee_type` is `GetDebuggeeType`'s `(class, qualifier)` pair as a `DebuggeeType`, with
+  `is_kernel` and `is_live_kernel` over it; `dump_files` is `GetNumberDumpFiles` plus
+  `GetDumpFileWide`, the files the session is open on, in the engine's order.
+
+  **Both were already here and neither was reachable.** `is_kernel_target` read the pair and threw
+  the qualifier away, and `is_live_kernel` read it again privately — so a caller could learn that a
+  target was a kernel one and had no way to learn whether it was a live link or a dump. It now goes
+  through `debuggee_type` like everything else, which is one read of `GetDebuggeeType` in the crate
+  instead of three.
+
+  **What they are for is a question no other query here answers: has the target been swapped?**
+  `target_identity` reads as though it would, and does not — it is a generation *this crate* hands
+  out at its own openers and teardowns, so a `.opendump` typed straight at the engine, or reached
+  through a `.if` or an alias, leaves it exactly where it was. These two are read off the engine on
+  every call, so a caller can take a reading when it opens a target and compare it after each
+  command. `dump_files` returns an error rather than an empty list where the engine will not
+  answer, for that reason: a failure folded into "no dump files" matches every live target, and
+  would report a swapped target as an unchanged one.
+
 - **`DebugEngine::virtual_region`** — `IDebugDataSpaces2::QueryVirtual` as a typed answer
   (`VirtualRegion`, `VirtualState`), which is what the memory manager says about a run of pages
   rather than what the debugger can read there. `VirtualState::Unknown(u32)` keeps a state this
