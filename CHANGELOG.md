@@ -55,6 +55,20 @@ All notable changes to this project are documented here. The format follows
   answer, for that reason: a failure folded into "no dump files" matches every live target, and
   would report a swapped target as an unchanged one.
 
+  **`dump_files` refuses an engine with no debuggee**, and that guard was measured rather than
+  anticipated: `GetNumberDumpFiles` on one is a `STATUS_ACCESS_VIOLATION` *inside* DbgEng — a
+  structured exception `catch_unwind` cannot trap, so it takes the calling process down instead
+  of failing the call. It killed `windbg-mcp`'s engine worker on the first run of the tier that
+  exercises it, as a launched program running to completion. `debuggee_type` in the same state
+  answers `DEBUG_CLASS_UNINITIALIZED` perfectly happily, which is how two queries sitting beside
+  each other come to be asked in one place. `examples/held_target_probe.rs` is the record: it
+  prints both, plus `has_target` and the process id, for a fresh engine, a launched process, that
+  process once it has exited, and a dump either side of its load wait — which is where the other
+  two things worth knowing came from too. **A dump's class and qualifier are known before the
+  load wait and its file name is not**, so a reading taken between `open_dump` and the
+  `WaitForEvent` that loads it is not comparable with a later one. And a **kernel** target has no
+  process id to read at all (`E_NOTIMPL`).
+
 - **`DebugEngine::virtual_region`** — `IDebugDataSpaces2::QueryVirtual` as a typed answer
   (`VirtualRegion`, `VirtualState`), which is what the memory manager says about a run of pages
   rather than what the debugger can read there. `VirtualState::Unknown(u32)` keeps a state this

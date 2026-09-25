@@ -4944,7 +4944,21 @@ impl DebugEngine {
     ///
     /// A name the engine returns as empty keeps its slot, because the *count* is as much of the
     /// answer as the names are.
+    ///
+    /// **It refuses an engine with no debuggee rather than asking**, and that guard is not
+    /// tidiness: `GetNumberDumpFiles` on one is a `STATUS_ACCESS_VIOLATION` *inside* DbgEng — a
+    /// structured exception, which `catch_unwind` cannot trap, so it takes the calling process
+    /// down instead of failing the call. Measured on dbgeng 10.0.26100.1 (ARM64, 2026-09-25),
+    /// twice: on a **fresh** engine that never had a target, and on one whose launched debuggee
+    /// had just run to completion, each an exit code of `0xC0000005` on the line after
+    /// [`Self::debuggee_type`] answered `DEBUG_CLASS_UNINITIALIZED` perfectly happily. So the two
+    /// queries beside each other do *not* behave alike, which is exactly the shape that gets a
+    /// caller to ask both in one place and lose the process.
+    ///
+    /// Same guard and same reason as [`Self::refuse_without_a_debuggee`], reached here for a
+    /// *query* rather than for caller-supplied text.
     pub fn dump_files(&self) -> Result<Vec<String>, DbgEngError> {
+        self.refuse_without_a_debuggee()?;
         let named = |operation: &str, source: windows::core::Error| DbgEngError::Context {
             operation: operation.into(),
             source,
