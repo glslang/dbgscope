@@ -29,17 +29,50 @@ permissions:
 
 jobs:
   build:
+    # **The name says the architecture; the label pins the image.** Both entries run a real
+    # engine - 46 of this crate's non-ignored tests reach `DebugCreate`, and several launch or
+    # attach to a live process - so what a run measures is that image's inbox `dbgeng.dll`. A
+    # runner label is not that: `windows-11-arm` names whatever ARM64 image GitHub currently
+    # ships, and on 2026-09-23 it was migrated onto the Visual Studio 2026 one. This workflow's
+    # own runs report `Image: windows-11-arm64` on 2026-09-22T19:45Z and
+    # `windows-11-vs2026-arm64`, `Version: 20260920.164.1` on run 36040398859 - a different OS
+    # build, and therefore a different engine, under an unchanged workflow and with nothing in
+    # the log to say so.
+    #
+    # So the label is named rather than followed, and the job name is kept free of it: a name
+    # carrying the image would have to change at every migration, which is the churn that makes
+    # one easy to miss. When the next image lands, add it as a second `os` entry with its own
+    # `arch`, keep both while they report different images, and drop the older when they do not.
+    name: build (${{ matrix.arch }}, ${{ matrix.toolchain }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [windows-latest, windows-11-arm]
+        os: [windows-latest, windows-11-vs2026-arm]
         toolchain:
           - stable
+        # **`arch` is a value, not the label parsed a second time.** `vs-architecture` used to
+        # read `matrix.os == 'windows-11-arm' && 'arm64' || 'x64'`, so pinning the label above
+        # would have silently selected the **x64** toolchain on an ARM64 runner - a wrong answer
+        # that builds green. An `include` that adds a key to an existing combination creates no
+        # new ones, so this is the two entries above with the architecture stated rather than
+        # inferred.
+        include:
+          - os: windows-latest
+            arch: x64
+          - os: windows-11-vs2026-arm
+            arch: arm64
     steps:
       - uses: actions/checkout@v7
+      # Which image answered, in this job's own log rather than only in the runner preamble that
+      # a reader has to know to go looking for. The migration above changed the engine under
+      # every ARM64 run here and left no trace in anything this workflow prints.
+      - name: Record which image answered
+        run: |
+          Write-Host "runner label: ${{ matrix.os }} (${{ matrix.arch }})"
+          Write-Host "image: $env:ImageOS $env:ImageVersion"
       - uses: microsoft/setup-msbuild@v3
         with:
-          vs-architecture: ${{ matrix.os == 'windows-11-arm' && 'arm64' || 'x64' }}
+          vs-architecture: ${{ matrix.arch }}
       - name: Install Rust
         run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
