@@ -300,8 +300,12 @@ All notable changes to this project are documented here. The format follows
   `SetInterrupt` as a command begins; `Reload` does not. A host interrupt that landed between
   operations (`BreakRequest::NothingRunning`) made the next `reload_symbols("")` on a live kernel
   return success in 4ms with the engine holding **no modules** and the break still pending, and on
-  a launched process fail with `0xD000013A`. Both reload methods now drain it first.
-  `test_a_pending_break_does_not_empty_the_next_reload` fails with the drains backed out.
+  a launched process fail with `0xD000013A`. Both reload methods now drain it first -- unless an
+  operation other than the reload's own is running, since a reload called from a breakpoint
+  callback runs inside the wait's operation and a pending break there may be a host's request to
+  stop it. `test_a_pending_break_does_not_empty_the_next_reload` fails with the drains backed out,
+  and `test_a_reload_inside_an_operation_leaves_its_break_pending` with either call site draining
+  unconditionally.
 
 - **An import name beside a hole that starts mid-page is read.** `read_c_string` never spanned a
   page, because a minidump's holes are page-granular -- but an **image-file** target (a `.sys`
