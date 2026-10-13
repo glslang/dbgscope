@@ -1574,6 +1574,19 @@ pub struct MemoryRead {
     pub cut_short: Option<Interruption>,
 }
 
+/// What a bounded [`DebugEngine::reload_symbols_bounded`] did.
+///
+/// A struct rather than a bare `Option`, for the reason [`CommandRun`] is one: `Ok(None)` would
+/// have to be read as "finished", and the case that matters is the other one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolReload {
+    /// `None` when the reload finished. `Some` means it was broken in part-way, and **the engine's
+    /// module list is now partial** — a reload rebuilds the list rather than adding to it, so one
+    /// cut short can leave fewer modules than were held before it started. See
+    /// [`DebugEngine::reload_symbols_bounded`] for the measurement.
+    pub cut_short: Option<Interruption>,
+}
+
 /// `QueryVirtual`'s output buffer, **16-byte aligned**, which the type it holds is not.
 ///
 /// `MEMORY_BASIC_INFORMATION64` is 48 bytes of 8-byte fields, so Rust aligns it to 8 — and the
@@ -6649,13 +6662,107 @@ impl DebugEngine {
 
     /// Reloads symbols. `args` mirrors `.reload` arguments — e.g. "/f HEVD.sys" to
     /// force-load one module's symbols, or "" to reload all deferred modules.
+    ///
+    /// **Unbounded.** A host's [`InterruptHandle::interrupt`] does reach a reload in progress
+    /// (measured; see [`Self::reload_symbols_bounded`]), but nothing here reports that it did, and
+    /// the reload's failure then reads as an ordinary one. A caller that needs a bound, or that
+    /// must tell an interrupted reload from a failed one, wants the bounded form.
+    ///
+    /// **A break left pending is drained first**, because a reload does not discard one the way
+    /// `Execute` does and what it does instead is the worst answer available: it returns success
+    /// with the module list emptied (see [`Self::reload_symbols_bounded`]).
     pub fn reload_symbols(&self, args: &str) -> Result<(), DbgEngError> {
         let args = CString::new(args).map_err(|_| DbgEngError::InvalidCommand)?;
+        let _ = self.interrupted();
         unsafe {
             self.symbols
                 .Reload(PCSTR::from_raw(args.as_ptr() as *const u8))
                 .map_err(DbgEngError::OperationFailed)
         }
+    }
+
+    /// Like [`Self::reload_symbols`], but **bounded**: a watchdog `SetInterrupt`s the engine after
+    /// `timeout_ms`, and a break by either origin — the watchdog's or a host's, through an
+    /// [`InterruptHandle`] — is reported in [`SymbolReload::cut_short`] rather than as the error
+    /// it provokes. `timeout_ms == 0` disables the watchdog and keeps the reporting, as it does for
+    /// [`Self::execute_command_bounded`].
+    ///
+    /// **The bound was measured before it was written**, because a watchdog that cannot break a
+    /// call in is worse than none: it claims a bound that does not exist. `Reload` is a direct
+    /// engine call rather than a command, and Microsoft documents no interrupt polling in it. The
+    /// measurement is `examples/reload_interrupt_probe.rs`, against a live ARM64 26100 kernel over
+    /// 115200-baud serial — the one link this crate's benches have where a reload is slow. There
+    /// the first `Reload("")` after an attach read 181 modules in 3.9s. Bounded at 0.5s, 1s and 2s
+    /// it returned at 517ms, 1,074ms and 2,005ms reporting `Deadline`, and a host's request raised
+    /// at 1s and 2s ended it within 2ms reporting `OnRequest` — every time on the first raise. The
+    /// engine's own answer to the break is `0xD000013A` (`STATUS_CONTROL_C_EXIT`), which is what
+    /// `cut_short` stands in for. Nothing was left pending afterwards, the session went on
+    /// answering, and a 60s bound on the same cold reload took the same 3.9s and reported nothing.
+    ///
+    /// **What an interrupted reload leaves behind is the thing to know before calling this.** The
+    /// reload discards the engine's module list and rebuilds it, so one cut short leaves the
+    /// engine holding *part* of the list — and part of a list it had in full before it began: 20,
+    /// 43 and 91 of 181 modules for the three deadlines above, against 181 held going in. So a
+    /// reload cut short is not a no-op that ran out of time; it is a *smaller* inventory than not
+    /// reloading at all would have left, and only another reload puts it back. A host listing
+    /// modules after one must say so.
+    ///
+    /// **A break left pending from before the call is drained, and that is a fix rather than
+    /// tidiness.** `Execute` discards a pending request as a command begins (see
+    /// `test_stale_interrupt_effect_on_the_next_command`); `Reload` does not, and what it does
+    /// instead was measured on the same target: a host interrupt raised with nothing running
+    /// (`BreakRequest::NothingRunning`), then a reload, returned **success** in 4ms with the
+    /// engine holding **no modules at all** and the break still pending — twice, once from 1
+    /// module and once from 181. On a launched process the same break fails the reload with
+    /// `0xD000013A` instead. The kernel's is the worse of the two — a complete-looking answer about
+    /// an empty target — and [`InterruptHandle::interrupt`] leaves exactly that pending break
+    /// whenever it lands between operations. The drain is inside the operation, so a request
+    /// arriving once it is open is filed against this reload rather than thrown away; the price is
+    /// that one landing between the open and the drain is consumed and still reported, so a reload
+    /// that then finishes says it was cut short — the safe direction, since it reads as a partial
+    /// inventory and a caller reloads again.
+    ///
+    /// **Only a cold reload costs anything, which is also what makes this hard to see.** The same
+    /// reload repeated at once took 57ms, answered from the engine's cache of target memory;
+    /// after a `.cache flushall` it was back to 3.85s. So the bound matters on the first reload
+    /// after an attach — which is precisely when a host reaches for one, to find modules loaded
+    /// before the debugger connected — and almost never after.
+    pub fn reload_symbols_bounded(
+        &self,
+        args: &str,
+        timeout_ms: u32,
+    ) -> Result<SymbolReload, DbgEngError> {
+        let args = CString::new(args).map_err(|_| DbgEngError::InvalidCommand)?;
+        // The same shape as `execute_command_bounded` and the breakpoint's symbolic resolve: open
+        // an operation, arm, run, then account for a break by either origin.
+        let operation = self.begin_operation();
+        // After the open, so only a break that belongs to no operation is lost; see the doc.
+        let _ = self.interrupted();
+        let watchdog = (timeout_ms > 0).then(|| {
+            let handle = self.interrupt_handle();
+            Watchdog::arm(Duration::from_millis(u64::from(timeout_ms)), move || {
+                let _ = handle.break_in_only();
+            })
+        });
+        let result = unsafe {
+            self.symbols
+                .Reload(PCSTR::from_raw(args.as_ptr() as *const u8))
+        };
+        let by_watchdog = watchdog.is_some_and(Watchdog::disarm);
+        // Nothing here waited, so this is the operation's `cut_short_by` rather than a
+        // [`WaitOutcome`].
+        let cut_short = operation.cut_short_by(by_watchdog, timeout_ms);
+        if cut_short.is_some() {
+            // Consume a break that may still be pending, as the other bounded paths do: the
+            // watchdog can raise one as the reload returns, and a flag left set belongs to no
+            // operation.
+            let _ = self.interrupted();
+        } else {
+            // The interrupted reload's own failure is the break, not a fault, so it is surfaced
+            // only when nothing interrupted it.
+            result.map_err(DbgEngError::OperationFailed)?;
+        }
+        Ok(SymbolReload { cut_short })
     }
 
     /// Returns the current register set as formatted text (`r`).
@@ -14087,6 +14194,62 @@ mod tests {
             drained,
             "draining should leave the next command fully usable"
         );
+
+        let _ = e.end_session();
+    }
+
+    /// **A break left pending does not empty the next reload**, and a reload that finishes inside
+    /// its bound says nothing was cut short.
+    ///
+    /// The first half is the defect [`DebugEngine::reload_symbols_bounded`] drains for: a host
+    /// interrupt raised with nothing running stays pending, and a `Reload` that starts under it
+    /// returns success with the module list emptied on a live kernel. On a launched process the
+    /// same break fails the reload with `0xD000013A` instead (measured with both drains backed
+    /// out, which is what this test does to it) — a different wrong answer to one mistake, and the
+    /// one CI's runners can reach. The deadline half needs a link slow enough for a reload to sit
+    /// in, which no user-mode target is; that is `examples/reload_interrupt_probe.rs`, against a
+    /// live kernel over serial.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_pending_break_does_not_empty_the_next_reload() {
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+        e.reload_symbols("").expect("unbounded reload failed");
+        let held = e.modules().expect("modules failed").len();
+        assert!(held > 0, "the launched target reports no modules to reload");
+
+        for (what, bounded) in [("bounded", true), ("unbounded", false)] {
+            let raised = e
+                .interrupt_handle()
+                .interrupt()
+                .expect("SetInterrupt failed");
+            assert_eq!(
+                raised,
+                BreakRequest::NothingRunning,
+                "the break was meant to land between operations"
+            );
+            if bounded {
+                let reload = e
+                    .reload_symbols_bounded("", 60_000)
+                    .expect("bounded reload failed");
+                assert_eq!(
+                    reload.cut_short, None,
+                    "a break raised before the reload began was charged to it"
+                );
+            } else {
+                e.reload_symbols("").expect("unbounded reload failed");
+            }
+            assert_eq!(
+                e.modules().expect("modules failed").len(),
+                held,
+                "an {what} reload begun under a pending break did not rebuild the inventory"
+            );
+            assert!(
+                !e.interrupted().expect("GetInterrupt failed"),
+                "an {what} reload left the break pending for whatever runs next"
+            );
+        }
 
         let _ = e.end_session();
     }

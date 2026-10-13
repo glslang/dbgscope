@@ -79,6 +79,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`DebugEngine::reload_symbols_bounded(args, timeout_ms)`** and **`SymbolReload`**: a reload with
+  the crate's watchdog around it, reporting a break by either origin in `cut_short` rather than as
+  the `0xD000013A` it provokes. Measured before it was written, since a watchdog that cannot break
+  the call in claims a bound that does not exist: against a live ARM64 26100 kernel over
+  115200-baud serial, the first reload after an attach read 181 modules in 3.9s, and bounds of
+  0.5s, 1s and 2s returned at 517ms, 1,074ms and 2,005ms (`examples/reload_interrupt_probe.rs`).
+  **A reload cut short leaves a smaller inventory than it started with** -- 20, 43 and 91 of 181 --
+  because it rebuilds the list rather than adding to it; only another reload restores it. Asked for
+  by windbg-mcp `FOLLOWUPS.md` item 54.
 - **`DebugEngine::integer_register(name)`**: one integer register by name, zero-extended -- the read
   a breakpoint callback makes, where `register_values` describes and reads every register the
   engine knows (194 on an ARM64 user-mode target, 214 on its kernel). A register holding no integer
@@ -285,6 +294,13 @@ All notable changes to this project are documented here. The format follows
   error. windbg-mcp `FOLLOWUPS.md` item 96.
 
 ### Fixed
+
+- **A break left pending no longer empties the next reload.** `Execute` discards a pending
+  `SetInterrupt` as a command begins; `Reload` does not. A host interrupt that landed between
+  operations (`BreakRequest::NothingRunning`) made the next `reload_symbols("")` on a live kernel
+  return success in 4ms with the engine holding **no modules** and the break still pending, and on
+  a launched process fail with `0xD000013A`. Both reload methods now drain it first.
+  `test_a_pending_break_does_not_empty_the_next_reload` fails with the drains backed out.
 
 - **An import name beside a hole that starts mid-page is read.** `read_c_string` never spanned a
   page, because a minidump's holes are page-granular -- but an **image-file** target (a `.sys`
