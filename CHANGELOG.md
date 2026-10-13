@@ -82,9 +82,10 @@ All notable changes to this project are documented here. The format follows
 - **`DebugEngine::reload_symbols_bounded(args, timeout_ms)`** and **`SymbolReload`**: a reload with
   the crate's watchdog around it, reporting a break by either origin in `cut_short` rather than as
   the `0xD000013A` it provokes. Measured before it was written, since a watchdog that cannot break
-  the call in claims a bound that does not exist: against a live ARM64 26100 kernel over
-  115200-baud serial, the first reload after an attach read 181 modules in 3.9s, and bounds of
-  0.5s, 1s and 2s returned at 517ms, 1,074ms and 2,005ms (`examples/reload_interrupt_probe.rs`).
+  the call in claims a bound that does not exist: against a live ARM64 kernel (`ntoskrnl`
+  10.0.26100.9457, Windows 11 25H2) over 115200-baud serial, the first reload after an attach read
+  181 modules in 3.9s, and bounds of 0.5s, 1s and 2s returned at 517ms, 1,074ms and 2,005ms
+  (`examples/reload_interrupt_probe.rs`).
   **A reload cut short leaves a smaller inventory than it started with** -- 20, 43 and 91 of 181 --
   because it rebuilds the list rather than adding to it; only another reload restores it. Asked for
   by windbg-mcp `FOLLOWUPS.md` item 54.

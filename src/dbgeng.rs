@@ -6690,14 +6690,15 @@ impl DebugEngine {
     /// **The bound was measured before it was written**, because a watchdog that cannot break a
     /// call in is worse than none: it claims a bound that does not exist. `Reload` is a direct
     /// engine call rather than a command, and Microsoft documents no interrupt polling in it. The
-    /// measurement is `examples/reload_interrupt_probe.rs`, against a live ARM64 26100 kernel over
-    /// 115200-baud serial — the one link this crate's benches have where a reload is slow. There
-    /// the first `Reload("")` after an attach read 181 modules in 3.9s. Bounded at 0.5s, 1s and 2s
-    /// it returned at 517ms, 1,074ms and 2,005ms reporting `Deadline`, and a host's request raised
-    /// at 1s and 2s ended it within 2ms reporting `OnRequest` — every time on the first raise. The
-    /// engine's own answer to the break is `0xD000013A` (`STATUS_CONTROL_C_EXIT`), which is what
-    /// `cut_short` stands in for. Nothing was left pending afterwards, the session went on
-    /// answering, and a 60s bound on the same cold reload took the same 3.9s and reported nothing.
+    /// measurement is `examples/reload_interrupt_probe.rs`, against a live ARM64 kernel
+    /// (`ntoskrnl` 10.0.26100.9457, Windows 11 25H2) over 115200-baud serial — the one link this
+    /// crate's benches have where a reload is slow. There the first `Reload("")` after an attach
+    /// read 181 modules in 3.9s. Bounded at 0.5s, 1s and 2s it returned at 517ms, 1,074ms and
+    /// 2,005ms reporting `Deadline`, and a host's request raised at 1s and 2s ended it within 2ms
+    /// reporting `OnRequest` — every time on the first raise. The engine's own answer to the break
+    /// is `0xD000013A` (`STATUS_CONTROL_C_EXIT`), which is what `cut_short` stands in for. Nothing
+    /// was left pending afterwards, the session went on answering, and a 60s bound on the same
+    /// cold reload took the same 3.9s and reported nothing.
     ///
     /// **What an interrupted reload leaves behind is the thing to know before calling this.** The
     /// reload discards the engine's module list and rebuilds it, so one cut short leaves the
