@@ -6660,6 +6660,35 @@ impl DebugEngine {
             .expect("[-] Failed to log message");
     }
 
+    /// Consumes a break left pending — **unless an operation other than `ours` is running**, in
+    /// which case the break may be that operation's and is left where it is.
+    ///
+    /// The case that makes this more than `interrupted()`: a breakpoint callback runs *inside*
+    /// [`Self::execute_and_wait`]'s operation, and [`BreakpointHit::engine`] shares its
+    /// [`ClientState`], so a reload called from a callback is nested in an operation a host may
+    /// have just asked to stop. Draining there would consume the `SetInterrupt` behind that
+    /// request; a callback answering `Go` would then let the target run on with the enclosing wait
+    /// never broken, the host's request recorded and never delivered. Raised by Codex on
+    /// dbgscope#197.
+    ///
+    /// **Checked and drained under the scope's lock**, the one [`InterruptHandle::interrupt`]
+    /// records and delivers under, so no request can land between the check and the drain: with
+    /// nothing else running, whatever is pending was filed against no operation, and is exactly
+    /// the stale break the reload methods drain for.
+    ///
+    /// What this guarantees is that the *drain* is not what discards an enclosing operation's
+    /// break — not that the break survives the reload. The engine has its own answer to a reload
+    /// begun under one, and it is not the same on every target: a launched process's reload fails
+    /// with `0xD000013A` and consumes it (measured), while a live kernel's returns success with the
+    /// module list emptied and leaves it pending. Both predate this crate's drain.
+    fn drain_an_unowned_break(&self, ours: Option<OperationId>) {
+        let scope = self.state.breaks.lock().unwrap_or_else(|e| e.into_inner());
+        if scope.running.iter().any(|running| Some(*running) != ours) {
+            return;
+        }
+        let _ = self.interrupted();
+    }
+
     /// Reloads symbols. `args` mirrors `.reload` arguments — e.g. "/f HEVD.sys" to
     /// force-load one module's symbols, or "" to reload all deferred modules.
     ///
@@ -6670,10 +6699,11 @@ impl DebugEngine {
     ///
     /// **A break left pending is drained first**, because a reload does not discard one the way
     /// `Execute` does and what it does instead is the worst answer available: it returns success
-    /// with the module list emptied (see [`Self::reload_symbols_bounded`]).
+    /// with the module list emptied (see [`Self::reload_symbols_bounded`]). Only a break no
+    /// operation owns, though — see [`Self::drain_an_unowned_break`].
     pub fn reload_symbols(&self, args: &str) -> Result<(), DbgEngError> {
         let args = CString::new(args).map_err(|_| DbgEngError::InvalidCommand)?;
-        let _ = self.interrupted();
+        self.drain_an_unowned_break(None);
         unsafe {
             self.symbols
                 .Reload(PCSTR::from_raw(args.as_ptr() as *const u8))
@@ -6721,7 +6751,9 @@ impl DebugEngine {
     /// arriving once it is open is filed against this reload rather than thrown away; the price is
     /// that one landing between the open and the drain is consumed and still reported, so a reload
     /// that then finishes says it was cut short — the safe direction, since it reads as a partial
-    /// inventory and a caller reloads again.
+    /// inventory and a caller reloads again. And it drains nothing while an *enclosing* operation is
+    /// running ([`Self::drain_an_unowned_break`]): a pending break there may be a host's request to
+    /// stop that operation, which is the one thing a drain must not throw away.
     ///
     /// **Only a cold reload costs anything, which is also what makes this hard to see.** The same
     /// reload repeated at once took 57ms, answered from the engine's cache of target memory;
@@ -6737,8 +6769,9 @@ impl DebugEngine {
         // The same shape as `execute_command_bounded` and the breakpoint's symbolic resolve: open
         // an operation, arm, run, then account for a break by either origin.
         let operation = self.begin_operation();
-        // After the open, so only a break that belongs to no operation is lost; see the doc.
-        let _ = self.interrupted();
+        // After the open, so a request arriving from here on is filed against this reload; see the
+        // doc, and the helper for why an enclosing operation's break is left alone.
+        self.drain_an_unowned_break(Some(operation.id));
         let watchdog = (timeout_ms > 0).then(|| {
             let handle = self.interrupt_handle();
             Watchdog::arm(Duration::from_millis(u64::from(timeout_ms)), move || {
@@ -14213,8 +14246,12 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn test_a_pending_break_does_not_empty_the_next_reload() {
+        let _debuggee = one_debuggee();
         let e = DebugEngine::new();
-        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+        // `ping.exe` itself, not `cmd /c ping`: ending the session takes `cmd` and leaves its child
+        // running, which `test_a_breakpoint_callback_reads_its_hit_and_lets_it_go_past` records
+        // breaking the tests after it.
+        e.launch_process("ping.exe -n 30 127.0.0.1")
             .expect("launch failed");
         e.reload_symbols("").expect("unbounded reload failed");
         let held = e.modules().expect("modules failed").len();
@@ -14244,11 +14281,67 @@ mod tests {
             assert_eq!(
                 e.modules().expect("modules failed").len(),
                 held,
-                "an {what} reload begun under a pending break did not rebuild the inventory"
+                "the {what} reload begun under a pending break did not rebuild the inventory"
             );
             assert!(
                 !e.interrupted().expect("GetInterrupt failed"),
-                "an {what} reload left the break pending for whatever runs next"
+                "the {what} reload left the break pending for whatever runs next"
+            );
+        }
+
+        let _ = e.end_session();
+    }
+
+    /// **A reload nested in an operation does not throw that operation's break away**, for both
+    /// reload methods.
+    ///
+    /// The shape is a breakpoint callback's: it runs inside `execute_and_wait`'s operation, and a
+    /// reload it calls would otherwise drain the `SetInterrupt` a host had just filed against the
+    /// wait, so the wait would never break. Staged here without a callback — an operation opened
+    /// the way the wait opens one, a request filed against it, and the reload inside it — because
+    /// what is asserted is the engine's flag, which is the same however the nesting came about.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_reload_inside_an_operation_leaves_its_break_pending() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        e.launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        e.reload_symbols("").expect("unbounded reload failed");
+
+        for (what, bounded) in [("bounded", true), ("unbounded", false)] {
+            let outer = e.begin_operation();
+            let raised = e
+                .interrupt_handle()
+                .interrupt()
+                .expect("SetInterrupt failed");
+            assert_eq!(
+                raised,
+                BreakRequest::Raised {
+                    operation: outer.id
+                },
+                "the request was meant for the enclosing operation"
+            );
+            let reload = if bounded {
+                e.reload_symbols_bounded("", 60_000).map(|_| ())
+            } else {
+                e.reload_symbols("")
+            };
+            println!("{what} reload under the enclosing operation's break: {reload:?}");
+            // Either is the request arriving somewhere: the engine stopping the reload with it
+            // (measured on a launched process, where that also consumes it), or the break still
+            // pending for the enclosing wait (a live kernel's reload leaves it). What must not
+            // happen is the drain taking it first, so the reload runs clean and nothing is left.
+            let pending = e.interrupted().expect("GetInterrupt failed");
+            assert!(
+                reload.is_err() || pending,
+                "the {what} reload nested in an operation threw away the break a host had filed \
+                 against that operation: the reload finished and nothing was left pending, so \
+                 the enclosing wait would never have broken"
+            );
+            assert!(
+                outer.took_break_request(),
+                "and the request is still the enclosing operation's to take"
             );
         }
 
