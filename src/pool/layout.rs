@@ -324,6 +324,11 @@ const OPTIONAL_FIELDS: &[(&str, &str, &[&str])] = &[
     // scaled by 64 bytes; the slot map holds AffinityMask + 1 entries.
     ("_HEAP_VS_CONTEXT", "SlotMapRef", &["SlotMapRef"]),
     ("_HEAP_VS_CONTEXT", "AffinityMask", &["AffinityMask"]),
+    // `_RTL_HP_VS_CONFIG`, whose `Flags.PageAlignLargeAllocs` bit decides where a VS user block
+    // begins when it would otherwise begin in the last sixteen bytes of a page — see
+    // `snapshot::PoolRegion::vs_skips_page_end`. Optional so a PDB without it still walks: read
+    // as unset then, with a diagnostic saying so.
+    ("_HEAP_VS_CONTEXT", "Config", &["Config"]),
     // How an affinity slot names the context it belongs to. Two canonical names rather than two
     // aliases of one, because they are not two spellings of the same fact: `VsContext` holds the
     // context's address and `VsContextOffset` holds `slot - context`. Aliased, the newer build
@@ -1653,11 +1658,18 @@ mod tests {
     /// an inline layout built on it used to pick up a stray `_HEAP_VS_AFFINITY_SLOT.VsContext`
     /// through the *required* table and no longer does. That moves the synthetic digest while no
     /// real build's moves, which is an artefact of the double rather than a regression.
+    ///
+    /// **Re-recorded 2026-10-14**, when `_HEAP_VS_CONTEXT.Config` joined the optional fields
+    /// (windbg-mcp `FOLLOWUPS.md` item 101). Every build carries that field, so every digest
+    /// moved — the resolver found one more fact about each, which is the resolver's change and
+    /// not the target's — and the two below were taken from the code with the field added. The
+    /// pin is therefore against any *later* change moving an older build's schema, and the move
+    /// itself is recorded in the changelog, where a caller comparing runs across it will look.
     #[test]
     fn test_an_older_builds_schema_is_unchanged_by_the_self_relative_shape() {
         for (build, recorded) in [
-            (&INLINE_BUILD, "fnv1a64:235676a22d0ccd01"),
-            (&ADDRESS_SLOT_BUILD, "fnv1a64:0084246676dae038"),
+            (&INLINE_BUILD, "fnv1a64:ef5b5fcd191a6c34"),
+            (&ADDRESS_SLOT_BUILD, "fnv1a64:f94b1d5fd7db5427"),
         ] {
             let layout = PoolLayout::resolve(&build_symbols(build), key()).unwrap();
 

@@ -308,6 +308,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A VS user block that would begin in the last sixteen bytes of a page is read where the
+  allocator put it: at the next page start.** Under
+  `_HEAP_VS_CONTEXT.Config.Flags.PageAlignLargeAllocs`, `nt!RtlpHpVsContextAllocate` hands out
+  `chunk + 0x20` rather than `chunk + 0x10` when the former is page-aligned, and
+  `RtlpHpVsContextFree` takes a page-aligned user block's chunk from `block - 0x20` -- the
+  kernel's own way of keeping a `_POOL_HEADER` out of a page's last unit, since `ExFreeHeapPool`
+  tells a chunk from a page allocation by `P & 0xfff` (x64 26100.33438, read at
+  `RtlpHpVsContextAllocate+0xf6..+0x12a`, `RtlpHpVsContextAllocateFinalize+0x3d` and
+  `RtlpHpVsContextFree+0xf2`). The walk placed every such header one unit early, decoding two
+  stale free-tree pointers as a `_POOL_HEADER`: the tag came out as the top half of a kernel
+  address, the span a unit early and a unit long, and the real header at the page start went
+  unclaimed. Measured on a live 26100.33438 kernel 2026-10-14: 1,275 paged chunks under the "tag"
+  `0x84e7ffff`, every one with its candidate header at page offset 0xff0;
+  `0xffffe78459203fe0` is a 0x80-byte chunk holding `ffffe78459207e18 ffffe78459213bc8` at
+  `+0x10` and the `MmDT` header `!pool` names at `0xffffe78459204000`. The flag is read from each
+  heap's context at discovery -- `_HEAP_VS_CONTEXT.Config` is a new optional field, so **every
+  layout fingerprint moves** -- carried on the region, and applied only where set: a target
+  without it is walked as before, and a PDB without the field says so in a diagnostic.
+  `adjust_page_end_header`, which moved a candidate *back* to the end of the previous page and
+  could never fire on a sixteen-byte-aligned one, is gone. windbg-mcp `FOLLOWUPS.md` item 101.
+  `test_a_vs_user_block_that_would_end_a_page_begins_the_next_one` pins the placement,
+  `test_without_the_flag_a_page_end_user_block_is_read_at_its_chunk_header` the gate,
+  `test_a_vs_user_block_on_a_page_boundary_is_left_where_it_is` the boundary and
+  `test_discovery_reads_whether_a_vs_user_block_skips_a_page_end_from_the_context` the read.
+  Beside it, `tree_nodes` now polls the budget before its first read: the one extra read per
+  heap moved the sampled deadlines onto a five-read stretch between polls that
+  `test_the_walk_stops_reading_promptly_once_its_budget_is_gone` had never landed on.
+
 - **A break left pending no longer empties the next reload.** `Execute` discards a pending
   `SetInterrupt` as a command begins; `Reload` does not. A host interrupt that landed between
   operations (`BreakRequest::NothingRunning`) made the next `reload_symbols("")` on a live kernel

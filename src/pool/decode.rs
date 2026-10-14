@@ -4,6 +4,10 @@ use super::{PoolBackend, PoolState};
 
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
 pub(crate) const VS_SIGNATURE: u16 = 0x2bed;
+/// The granularity of a VS chunk: `_HEAP_VS_CHUNK_HEADER.Sizes` counts in units of this many
+/// bytes, and `nt!RtlpHpVsContextAllocate` moves a user block by one of them
+/// (`snapshot::PoolRegion::vs_skips_page_end`).
+pub(crate) const VS_UNIT: u64 = 16;
 pub(crate) const PAGE_SEGMENT_SIGNATURE: u64 = 0xa2e6_4ead_a2e6_4ead;
 pub(crate) const DESCRIPTOR_TREE_SIGNATURE: u32 = 0xccdd_ccdd;
 
@@ -243,8 +247,8 @@ pub(crate) fn decode_vs_chunk(
     subsegment_end: u64,
 ) -> Result<VsChunk, VsRejection> {
     let sizes = decode_vs_sizes(encoded, header_address, heap_key);
-    let size = usize::from(sizes.size).saturating_mul(16);
-    let previous_size = usize::from(sizes.previous_size).saturating_mul(16);
+    let size = usize::from(sizes.size).saturating_mul(VS_UNIT as usize);
+    let previous_size = usize::from(sizes.previous_size).saturating_mul(VS_UNIT as usize);
     let reject = |reason| {
         Err(VsRejection {
             reason,
@@ -474,21 +478,6 @@ pub(crate) fn lfh_bitmap_state(bitmap: &[u8], slot: usize) -> Option<PoolState> 
     } else {
         PoolState::Allocated
     })
-}
-
-/// A header that would straddle the page boundary is stored at the end of the
-/// preceding page.  Return the physical header location, checking all arithmetic.
-pub(crate) fn adjust_page_end_header(candidate: u64, header_size: u64) -> Option<u64> {
-    if header_size == 0 || header_size > PAGE_SIZE {
-        return None;
-    }
-    let page_offset = candidate & (PAGE_SIZE - 1);
-    let last_header_start = PAGE_SIZE - header_size;
-    if page_offset > last_header_start {
-        candidate.checked_sub(page_offset - last_header_start)
-    } else {
-        Some(candidate)
-    }
 }
 
 pub(crate) fn decode_pool_header(
@@ -1342,9 +1331,6 @@ mod tests {
         // A page number that does fit in 32 bits is unaffected, which is why every user-mode
         // fixture kept passing.
         assert_eq!(big_page_hash(0x9000, 0x100), Some(0x57));
-        assert_eq!(adjust_page_end_header(0x1ff0, 0x10), Some(0x1ff0));
-        assert_eq!(adjust_page_end_header(0x1ff8, 0x10), Some(0x1ff0));
-        assert_eq!(adjust_page_end_header(0x2000, 0x10), Some(0x2000));
         let tree = 0xffff_8000_0001_0000;
         let root = 0xffff_8000_0002_0000;
         assert_eq!(decode_rb_root(root, tree, false), Some(root));
