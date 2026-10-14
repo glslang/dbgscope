@@ -3240,7 +3240,23 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
             if region.vs_skips_page_end
                 && physical_header.saturating_add(VS_UNIT) & (PAGE_SIZE - 1) == 0
             {
-                physical_header += VS_UNIT;
+                // Only where the chunk has the unit to skip. `decode_vs_chunk` admitted this
+                // chunk against its two headers alone, and a chunk exactly that size — the
+                // smallest free remainder a split leaves — would otherwise have its user block
+                // placed at its own end, which is the next chunk's header. The allocator asks
+                // for one more unit than a request needs under the flag
+                // (`RtlpHpVsContextAllocate+0x1a..+0x3c`: `and eax,1` / `inc eax` /
+                // `add eax,r10d`), so a chunk here with no room is one nothing was allocated
+                // from, and it is read in place; an *allocated* one contradicts that and is
+                // reported.
+                if chunk_size >= header_bytes.saturating_add(VS_UNIT as usize) {
+                    physical_header += VS_UNIT;
+                } else if chunk.allocated {
+                    snapshot.diagnostics.push(format!(
+                        "VS chunk at {header_address:#x} is {chunk_size:#x} bytes, too short to \
+                         hold a user block moved off the page end; read in place"
+                    ));
+                }
             }
             let pool_offset = physical_header.saturating_sub(base) as usize;
             let tag = decode_pool_header(bytes, pool_offset, region.pool_header)
@@ -4369,6 +4385,38 @@ mod tests {
         assert_eq!(on_boundary.header_address, VS_BASE + 0x1000);
         assert_eq!(on_boundary.size, 0x20);
         assert_eq!(on_boundary.raw_tag, u32::from_le_bytes(*b"VS!!"));
+    }
+
+    /// A chunk at offset 0xfe0 with no unit to skip — two headers' worth, the smallest remainder
+    /// a split leaves — keeps its user block in place rather than having it placed at its own
+    /// end, which is the next chunk's header; and since the fixture marks every chunk allocated,
+    /// which the allocator would never do to one this short under the flag, the walk says so.
+    /// Raised by Codex on dbgscope#199.
+    #[test]
+    fn test_a_vs_chunk_too_short_to_move_its_user_block_is_read_in_place() {
+        let bytes = vs_extent(&[(0xfe0, 0), (0x20, 0xfe0), (0x40, 0x20)]);
+        let mut region = vs_region(bytes.len());
+        region.vs_skips_page_end = true;
+
+        let snapshot = walk_vs_region(region, &bytes);
+
+        let short = span_of_class(&snapshot, 0x20);
+        assert_eq!(short.header_address, VS_BASE + 0xff0);
+        assert_eq!(short.usable_address, VS_BASE + 0x1000);
+        assert_eq!(short.size, 0);
+        let after = span_of_class(&snapshot, 0x40);
+        assert_eq!(after.header_address, VS_BASE + 0x1010);
+        assert_eq!(after.raw_tag, u32::from_le_bytes(*b"VS!!"));
+        assert_eq!(snapshot.spans.len(), 3);
+        assert!(
+            snapshot
+                .diagnostics
+                .examples()
+                .iter()
+                .any(|line| line.contains("too short to hold a user block moved off the page end")),
+            "{:?}",
+            snapshot.diagnostics
+        );
     }
 
     /// A VS chunk too large for `_POOL_HEADER.BlockSize` carries no header, and its tag is in
