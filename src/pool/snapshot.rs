@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::decode::{
-    MAX_POOL_HEADER_CHUNK, PAGE_SIZE, PoolHeaderLayout, SpecialPoolHeader, adjust_page_end_header,
-    big_page_hash, decode_descriptor_at, decode_large_requested_size, decode_lfh_subsegment,
-    decode_pool_header, decode_rb_root_for, decode_slist_header_next, decode_special_pool_header,
-    decode_vs_chunk, descriptor_backend, lfh_bitmap_state, read_u16, read_u32, read_u64,
+    MAX_POOL_HEADER_CHUNK, PAGE_SIZE, PoolHeaderLayout, SpecialPoolHeader, VS_UNIT, big_page_hash,
+    decode_descriptor_at, decode_large_requested_size, decode_lfh_subsegment, decode_pool_header,
+    decode_rb_root_for, decode_slist_header_next, decode_special_pool_header, decode_vs_chunk,
+    descriptor_backend, lfh_bitmap_state, read_u16, read_u32, read_u64,
     valid_descriptor_tree_signature, valid_page_segment_signature, valid_vs_signature,
 };
 use super::{
@@ -112,6 +112,32 @@ pub(crate) struct PoolRegion {
     pub pool_header: PoolHeaderLayout,
     pub vs_header_size: usize,
     pub vs_sizes_offset: usize,
+    /// Whether this heap's VS allocator keeps a user block out of the last [`VS_UNIT`] bytes of
+    /// a page: `_HEAP_VS_CONTEXT.Config.Flags.PageAlignLargeAllocs`, read once at discovery.
+    ///
+    /// A VS chunk's user block ordinarily begins right after its `_HEAP_VS_CHUNK_HEADER`. With
+    /// this set, `nt!RtlpHpVsContextAllocate` tests whether `chunk + 0x20` is page-aligned and
+    /// hands out `chunk + 0x20` when it is — one unit later than usual, with the usable size one
+    /// unit shorter. Read on x64 26100.33438 at `+0xf6..+0x12a`: `lea rdi,[rsi+10h]`, then
+    /// `test byte ptr [rbp+4],1` / `lea rax,[rsi+20h]` / `test rax,0FFFh` / `lea rdi,[rsi+20h]` /
+    /// `add ebx,0FFFFFFF0h`, `rbp` being the context and `+4` its `Config`.
+    /// `RtlpHpVsContextAllocateFinalize+0x3d` does the same for a multi-allocation, and
+    /// `RtlpHpVsContextFree+0xf2` is the mirror: under the flag, a page-aligned user block's
+    /// chunk is taken from `block - 0x20`. The kernel needs it because `ExFreeHeapPool+0xd6`
+    /// tells a chunk from a page allocation by `P & 0xfff`, and a `_POOL_HEADER` in the last
+    /// sixteen bytes of a page would hand its caller a page-aligned `P`.
+    ///
+    /// What that looked like from here before the walk consulted it (windbg-mcp `FOLLOWUPS.md`
+    /// item 101): every chunk whose header sat at page offset 0xfe0 had its pool header decoded
+    /// at 0xff0, which holds whatever the chunk held when it was free — two tree pointers — so
+    /// the tag was the top half of a kernel address, the span began sixteen bytes early and ran
+    /// sixteen bytes long, and the real header at the page start went unclaimed. Measured
+    /// 2026-10-14 on `ctf-vm`: 1,275 paged chunks under the "tag" `0x84e7ffff`, every one with
+    /// its candidate at 0xff0; the chunk at `0xffffe78459203fe0` is `0x80` bytes, holds
+    /// `ffffe78459207e18 ffffe78459213bc8` at `+0x10`, and has at `0xffffe78459204000` the
+    /// `MmDT` header `!pool` names there (`size: 60`). Both pool heaps on that kernel carry the
+    /// flag; no target without it has been measured, which is what gating on it is for.
+    pub vs_skips_page_end: bool,
     pub known_tag: Option<u32>,
     /// Allocator-derived states for segment/page-range cells.
     pub states: Vec<PoolState>,
@@ -410,6 +436,12 @@ fn tree_nodes(
     label: &str,
     diagnostics: &mut Vec<String>,
 ) -> Result<Vec<u64>, SnapshotError> {
+    // Polled before the root and flag reads, not only inside the loop below: every caller
+    // reaches here a few unpolled reads past its own poll, which is a stretch of up to five
+    // between checks, and the sampled budgets in
+    // `test_the_walk_stops_reading_promptly_once_its_budget_is_gone` landed on it once the
+    // per-heap config read shifted them by one (2026-10-14).
+    check_budget(memory)?;
     let Ok(root_offset) = layout.field("_RTL_RB_TREE", "Root") else {
         diagnostics.push(format!("cannot resolve {label} root field"));
         return Ok(Vec::new());
@@ -520,8 +552,12 @@ fn insert_cached_chunk_candidates(
     let overhead = pool_header_size.saturating_add(vs_header_size);
     if let Some(header) = entry.checked_sub(overhead) {
         cached.insert(header);
+        // The lookaside's half of [`PoolRegion::vs_skips_page_end`]: data sixteen bytes into a
+        // page has its pool header at the page start and, under the flag, its chunk header one
+        // unit before where the subtraction above puts it. Both are kept, because this is a
+        // set of candidates and only a chunk decoded at one of them can match.
         if header & (PAGE_SIZE - 1) == PAGE_SIZE - pool_header_size {
-            cached.insert(header.saturating_sub(16));
+            cached.insert(header.saturating_sub(VS_UNIT));
         }
     }
 }
@@ -847,6 +883,49 @@ fn vs_roots(
     Ok(roots)
 }
 
+/// `_RTL_HP_VS_CONFIG.Flags.PageAlignLargeAllocs`: `Pos 0, 1 Bit` of the byte at
+/// `_HEAP_VS_CONTEXT.Config` on the x64 26100.33438 PDB, and the first flag the type declares.
+/// The byte's offset is resolved; the bit's position inside it is this.
+const VS_CONFIG_PAGE_ALIGN: u64 = 1;
+
+/// Whether `heap_address`'s VS allocator moves a user block off the end of a page — see
+/// [`PoolRegion::vs_skips_page_end`] for the rule and where it was read.
+///
+/// Asked once per heap, here, because what it decides is applied to every chunk. A layout that
+/// did not resolve `Config`, or a context that will not read, answers **unset** and says so: that
+/// is the reading the walk made before it consulted the flag at all, and on a target that does
+/// carry it the diagnostic is what points at the ~1,300 misplaced headers per boot it costs.
+/// An `Err` is the budget or an interrupt, polled before the read like every other read here.
+fn vs_skips_page_end(
+    memory: &impl PoolMemory,
+    layout: &PoolLayout,
+    heap_address: u64,
+    diagnostics: &mut Vec<String>,
+) -> Result<bool, SnapshotError> {
+    let Ok(context_offset) = layout.field("_SEGMENT_HEAP", "VsContext") else {
+        return Ok(false);
+    };
+    let Ok(config_offset) = layout.field("_HEAP_VS_CONTEXT", "Config") else {
+        diagnostics.push(format!(
+            "VS context of heap {heap_address:#x} has no resolved Config: a user block ending \
+             a page is read at its chunk header"
+        ));
+        return Ok(false);
+    };
+    check_budget(memory)?;
+    let address = heap_address + context_offset as u64 + config_offset as u64;
+    Ok(match scalar(memory, address, 1) {
+        Ok(flags) => flags & VS_CONFIG_PAGE_ALIGN != 0,
+        Err(error) => {
+            diagnostics.push(format!(
+                "cannot read VS context config at {address:#x}: {error}; a user block ending a \
+                 page is read at its chunk header"
+            ));
+            false
+        }
+    })
+}
+
 fn discover_vs_evidence(
     memory: &impl PoolMemory,
     layout: &PoolLayout,
@@ -1006,6 +1085,8 @@ fn discover_heap_regions(
         traversal_limit,
         &mut discovery.diagnostics,
     )?;
+    let vs_skips_page_end =
+        vs_skips_page_end(memory, layout, heap_address, &mut discovery.diagnostics)?;
 
     // Touch both LFH roots through guarded reads. Descriptor metadata remains the
     // authoritative source of active subsegments, while these probes make corrupt
@@ -1042,6 +1123,7 @@ fn discover_heap_regions(
             traversal_limit,
             &reusable_chunks,
             &cached_chunks,
+            vs_skips_page_end,
             discovery,
         ) {
             // As in `discover_pool_regions`: a halt is about the walk, not about this
@@ -1085,6 +1167,7 @@ fn discover_segment_context(
     traversal_limit: usize,
     reusable_chunks: &SharedChunks,
     cached_chunks: &SharedChunks,
+    vs_skips_page_end: bool,
     discovery: &mut Discovery,
 ) -> Result<(), SnapshotError> {
     let segment = layout.type_layout("_HEAP_PAGE_SEGMENT")?;
@@ -1468,6 +1551,7 @@ fn discover_segment_context(
                 pool_header,
                 vs_header_size: layout.type_layout("_HEAP_VS_CHUNK_HEADER")?.size as usize,
                 vs_sizes_offset: layout.field("_HEAP_VS_CHUNK_HEADER", "Sizes")?,
+                vs_skips_page_end,
                 known_tag,
                 states: vec![state],
                 reusable_chunks: Arc::clone(reusable_chunks),
@@ -1591,6 +1675,7 @@ fn discover_large_allocations(
             pool_header,
             vs_header_size: 0,
             vs_sizes_offset: 0,
+            vs_skips_page_end: false,
             known_tag: Some(tag),
             states: vec![PoolState::Allocated],
             reusable_chunks: Arc::default(),
@@ -3145,23 +3230,18 @@ impl<'a, M: PoolMemory> SnapshotWalker<'a, M> {
                 snapshot.complete = false;
                 break;
             }
-            let candidate = header_address + region.vs_header_size as u64;
-            let physical_header = if region.pool_header.size == 0 {
-                candidate
-            } else {
-                let Some(header) =
-                    adjust_page_end_header(candidate, region.pool_header.size as u64)
-                else {
-                    // Where this chunk's *pool* header sits could not be worked out, so no span
-                    // is emitted for it. Its size decoded and passed the bound check, though, so
-                    // the chunk chain is not what was lost here and the next extent can still be
-                    // placed.
-                    resume = header_address.saturating_add(chunk_size as u64);
-                    snapshot.complete = false;
-                    break;
-                };
-                header
-            };
+            // Where the chunk's user block begins: the pool header on a kernel target, the
+            // caller's own bytes on a user-mode one. Right after the chunk header, except where
+            // that is the last unit of a page and the allocator hands out the next page start
+            // instead — see [`PoolRegion::vs_skips_page_end`]. The chain is not involved: the
+            // chunk's extent is what its header says, and only where the user block sits in it
+            // moves.
+            let mut physical_header = header_address + region.vs_header_size as u64;
+            if region.vs_skips_page_end
+                && physical_header.saturating_add(VS_UNIT) & (PAGE_SIZE - 1) == 0
+            {
+                physical_header += VS_UNIT;
+            }
             let pool_offset = physical_header.saturating_sub(base) as usize;
             let tag = decode_pool_header(bytes, pool_offset, region.pool_header)
                 .map_or(0, |header| header.tag);
@@ -3376,6 +3456,7 @@ mod tests {
             },
             vs_header_size: 0,
             vs_sizes_offset: 0,
+            vs_skips_page_end: false,
             known_tag: None,
             states: Vec::new(),
             reusable_chunks: Arc::default(),
@@ -4128,6 +4209,7 @@ mod tests {
             pool_header: X64_POOL_HEADER,
             vs_header_size: 0,
             vs_sizes_offset: 0,
+            vs_skips_page_end: false,
             known_tag: None,
             states: Vec::new(),
             reusable_chunks: Arc::default(),
@@ -4159,6 +4241,7 @@ mod tests {
             pool_header: X64_POOL_HEADER,
             vs_header_size: 0x10,
             vs_sizes_offset: 0,
+            vs_skips_page_end: false,
             known_tag: None,
             states: Vec::new(),
             reusable_chunks: Arc::default(),
@@ -4187,7 +4270,10 @@ mod tests {
     }
 
     fn walk_vs_extent(bytes: &[u8]) -> PoolSnapshot {
-        let region = vs_region(bytes.len());
+        walk_vs_region(vs_region(bytes.len()), bytes)
+    }
+
+    fn walk_vs_region(region: PoolRegion, bytes: &[u8]) -> PoolSnapshot {
         let memory = FlatMemory::new(VS_BASE, bytes.len());
         let layout = vs_layout(VsFixture::Inline);
         let walker = SnapshotWalker {
@@ -4201,6 +4287,88 @@ mod tests {
         };
         walker.walk_vs(&region, VS_BASE, bytes, Some(VS_BASE), &mut snapshot);
         snapshot
+    }
+
+    /// The measured shape of a VS chunk whose header sits at page offset 0xfe0 under
+    /// `PageAlignLargeAllocs` ([`PoolRegion::vs_skips_page_end`]): its user block is the next
+    /// page start, and the unit before that holds whatever the chunk held while it was free —
+    /// on `ctf-vm`, two tree pointers whose top half reads as a tag.
+    ///
+    /// Three chunks from [`VS_BASE`], the middle one at `0x2fe0` with its pool header at
+    /// `0x3000` and the stale pointers at `0x2ff0`, as `dq 0xffffe78459203fe0` read them on
+    /// 2026-10-14 (`c1914c0d038da756 ffffe78400000056 | ffffe78459207e18 ffffe78459213bc8 |
+    /// 54446d4d03060000`).
+    fn vs_extent_with_a_user_block_moved_off_the_page_end() -> Vec<u8> {
+        let mut bytes = vs_extent(&[(0xfe0, 0), (0x80, 0xfe0), (0x40, 0x80)]);
+        bytes[0xff0..0xff8].copy_from_slice(&0xffff_e784_5920_7e18u64.to_le_bytes());
+        bytes[0xff8..0x1000].copy_from_slice(&0xffff_e784_5921_3bc8u64.to_le_bytes());
+        bytes[0x1000..0x1004].copy_from_slice(&0x0306_0000u32.to_le_bytes());
+        bytes[0x1004..0x1008].copy_from_slice(b"MmDT");
+        bytes
+    }
+
+    fn span_of_class(snapshot: &PoolSnapshot, size_class: u32) -> &PoolSpan {
+        snapshot
+            .spans
+            .iter()
+            .find(|span| span.size_class == size_class)
+            .unwrap_or_else(|| panic!("no span of class {size_class:#x}: {:?}", snapshot.spans))
+    }
+
+    /// Under the flag, a user block that would begin in a page's last unit begins the next page:
+    /// the header is where `!pool` says (`size: 60`, so 0x50 usable), the tag is the real one,
+    /// and the chain is untouched — the chunk after is found where the sizes put it.
+    #[test]
+    fn test_a_vs_user_block_that_would_end_a_page_begins_the_next_one() {
+        let bytes = vs_extent_with_a_user_block_moved_off_the_page_end();
+        let mut region = vs_region(bytes.len());
+        region.vs_skips_page_end = true;
+
+        let snapshot = walk_vs_region(region, &bytes);
+
+        let moved = span_of_class(&snapshot, 0x80);
+        assert_eq!(moved.header_address, VS_BASE + 0x1000);
+        assert_eq!(moved.usable_address, VS_BASE + 0x1010);
+        assert_eq!(moved.size, 0x50);
+        assert_eq!(moved.raw_tag, u32::from_le_bytes(*b"MmDT"));
+        let after = span_of_class(&snapshot, 0x40);
+        assert_eq!(after.header_address, VS_BASE + 0x1060 + 0x10);
+        assert_eq!(after.raw_tag, u32::from_le_bytes(*b"VS!!"));
+        assert_eq!(snapshot.spans.len(), 3);
+        assert!(snapshot.complete, "{:?}", snapshot.diagnostics);
+    }
+
+    /// The control, and what the flag gates: without it the same bytes read as they did before
+    /// the walk consulted it — the stale pointer as the header, its top half as the tag, a span
+    /// a unit early and a unit long. That is what a target **without** the flag would hold, so
+    /// it is what the walk has to go on reading there.
+    #[test]
+    fn test_without_the_flag_a_page_end_user_block_is_read_at_its_chunk_header() {
+        let bytes = vs_extent_with_a_user_block_moved_off_the_page_end();
+
+        let snapshot = walk_vs_extent(&bytes);
+
+        let unmoved = span_of_class(&snapshot, 0x80);
+        assert_eq!(unmoved.header_address, VS_BASE + 0xff0);
+        assert_eq!(unmoved.size, 0x60);
+        assert_eq!(unmoved.raw_tag, 0xffff_e784);
+    }
+
+    /// The allocator's test is `chunk + 0x20` page-aligned, not `chunk + 0x10`: a user block
+    /// that begins exactly on a page boundary is not in the last unit of the page before, and
+    /// stays where it is.
+    #[test]
+    fn test_a_vs_user_block_on_a_page_boundary_is_left_where_it_is() {
+        let bytes = vs_extent(&[(0xff0, 0), (0x40, 0xff0)]);
+        let mut region = vs_region(bytes.len());
+        region.vs_skips_page_end = true;
+
+        let snapshot = walk_vs_region(region, &bytes);
+
+        let on_boundary = span_of_class(&snapshot, 0x40);
+        assert_eq!(on_boundary.header_address, VS_BASE + 0x1000);
+        assert_eq!(on_boundary.size, 0x20);
+        assert_eq!(on_boundary.raw_tag, u32::from_le_bytes(*b"VS!!"));
     }
 
     /// A VS chunk too large for `_POOL_HEADER.BlockSize` carries no header, and its tag is in
@@ -5448,6 +5616,16 @@ mod tests {
     struct Writes(Vec<(u64, Vec<u8>)>);
 
     impl SyntheticMemory {
+        /// Overwrites one byte inside a range an earlier write already covers.
+        fn poke(&mut self, address: u64, byte: u8) {
+            let (start, data) = self
+                .runs
+                .iter_mut()
+                .find(|(start, data)| address >= *start && address < *start + data.len() as u64)
+                .expect("the address is inside a written run");
+            data[(address - *start) as usize] = byte;
+        }
+
         fn new(writes: Writes, holes: Vec<(u64, u64)>) -> Self {
             // Extents first: merge every written interval that overlaps or abuts a neighbour,
             // which yields exactly the runs the byte map used to produce by iterating in key
@@ -5680,6 +5858,7 @@ mod tests {
                     ("FreeChunkTree", 0),
                     ("DelayFreeContext", 0x10),
                     ("SubsegmentList", 0x30),
+                    ("Config", 0x38),
                 ],
             ),
         );
@@ -6410,6 +6589,7 @@ mod tests {
             1024,
             &SharedChunks::default(),
             &SharedChunks::default(),
+            false,
             &mut discovery,
         )
         .expect("the fixture is readable throughout");
@@ -6469,6 +6649,7 @@ mod tests {
             1024,
             &SharedChunks::default(),
             &SharedChunks::default(),
+            false,
             &mut discovery,
         )
         .expect("the fixture is readable throughout");
@@ -6568,6 +6749,7 @@ mod tests {
             1024,
             &SharedChunks::default(),
             &SharedChunks::default(),
+            false,
             &mut discovery,
         )
         .expect("the fixture is readable throughout");
@@ -6704,6 +6886,7 @@ mod tests {
             1024,
             &SharedChunks::default(),
             &SharedChunks::default(),
+            false,
             &mut discovery,
         );
 
@@ -7231,6 +7414,90 @@ mod tests {
         assert_eq!(SPECIAL_POOL_KINDS.len(), 4);
         assert_eq!(SPECIAL_POOL_KINDS[3], PoolKind::SpecialPrototypePaged);
         assert!(SPECIAL_POOL_KINDS[3].is_paged());
+    }
+
+    /// Whether a VS user block skips a page end is read off the target's own context, once per
+    /// heap, and lands on every region of that heap — bit 0 of `Config` and nothing else, since
+    /// bit 1 (`EnableDelayFree`) shares the byte. A layout with no `Config` reads unset and says
+    /// so, which is the one way a target carrying the flag can be walked without it.
+    #[test]
+    fn test_discovery_reads_whether_a_vs_user_block_skips_a_page_end_from_the_context() {
+        let identity = HeapIdentity {
+            pool_state: STATE,
+            heap: HEAP,
+            special: false,
+        };
+        let discover = |memory: &SyntheticMemory, layout: &PoolLayout| {
+            let mut discovery = Discovery::default();
+            discover_heap_regions(
+                memory,
+                layout,
+                HEAP,
+                0,
+                PoolKind::NonPagedNx,
+                identity,
+                None,
+                0x55aa_1234_9876_0000,
+                0xa5c3_1357,
+                1024,
+                &mut discovery,
+            )
+            .expect("the fixture is readable throughout");
+            discovery
+        };
+        let config = HEAP + 0x300 + 0x38;
+        for (flags, expected) in [(0u8, false), (1, true), (2, false), (3, true)] {
+            let mut memory = synthetic_memory();
+            memory.poke(config, flags);
+
+            let discovery = discover(&memory, &synthetic_layout());
+
+            let vs: Vec<_> = discovery
+                .regions
+                .iter()
+                .filter(|region| region.backend == PoolBackend::Vs)
+                .collect();
+            assert!(!vs.is_empty(), "the fixture has a VS subsegment");
+            assert!(
+                vs.iter().all(|region| region.vs_skips_page_end == expected),
+                "config {flags:#x} should read {expected}"
+            );
+            assert!(
+                !discovery
+                    .diagnostics
+                    .iter()
+                    .any(|line| line.contains("Config")),
+                "{:?}",
+                discovery.diagnostics
+            );
+        }
+
+        let mut memory = synthetic_memory();
+        memory.poke(config, 1);
+        let mut layout = synthetic_layout();
+        layout
+            .types
+            .get_mut("_HEAP_VS_CONTEXT")
+            .unwrap()
+            .fields
+            .remove("Config");
+
+        let discovery = discover(&memory, &layout);
+
+        assert!(
+            discovery
+                .regions
+                .iter()
+                .all(|region| !region.vs_skips_page_end)
+        );
+        assert!(
+            discovery
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("has no resolved Config")),
+            "{:?}",
+            discovery.diagnostics
+        );
     }
 
     #[test]
