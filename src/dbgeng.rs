@@ -154,6 +154,32 @@ pub enum DbgEngError {
     #[error("Debug command failed: {0}")]
     CommandFailed(windows::core::Error),
 
+    /// [`Self::CommandFailed`] with what the engine printed while the command ran.
+    ///
+    /// The five calls that capture output — [`DebugEngine::execute_command`],
+    /// [`DebugEngine::execute_command_bounded`], [`DebugEngine::execute_and_wait`],
+    /// [`DebugEngine::settle`] and [`DebugEngine::run_to_address`] — answer with this one rather
+    /// than that one when `Execute` refuses the text or the wait after it fails, because the code
+    /// alone says very little. `0x80040205` is DbgEng's answer to a mistyped command, to an argument naming
+    /// nothing, to `g` on a dump and to `||1s` naming a system not yet loaded, while the engine's
+    /// own line says which: `Couldn't resolve error at 'ntdll!Nope'`, `^ No runnable debuggees
+    /// error in 'g'`, `^ Illegal debuggee error in '||1s'`. That line is printed into this call's
+    /// capture, beside whatever earlier segments of the command printed, so it was in hand and
+    /// thrown away with the buffer. Measured by `examples/failed_command_output.rs`.
+    ///
+    /// **Not every failure comes back this way.** Some the engine prints and then returns success
+    /// for — `dt` of a type that does not exist, an extension command that does not exist — so they
+    /// arrive as an ordinary `Ok` with the complaint in the text. This is for the ones that return
+    /// an error. The message is [`Self::CommandFailed`]'s word for word, so a caller rendering
+    /// errors as text sees no change until it asks for [`Self::output`].
+    #[error("Debug command failed: {source}")]
+    CommandFailedWithOutput {
+        source: windows::core::Error,
+        /// Everything the engine printed during the call, the command's echo included. Empty when
+        /// it printed nothing, which is itself an answer.
+        output: String,
+    },
+
     #[error("Symbol path operation failed: {0}")]
     SymbolPathFailed(windows::core::Error),
 
@@ -278,6 +304,34 @@ pub enum DbgEngError {
     /// frames. The engine unwinds whatever those addresses reach now and answers.
     #[error("this register context was read from a target the engine no longer holds")]
     ContextFromAnotherTarget,
+}
+
+impl DbgEngError {
+    /// What the engine printed during the call that failed, where the failure carries it.
+    ///
+    /// `None` is "this failure had no capture", not "the engine printed nothing" — an empty
+    /// capture is `Some("")`. Only [`Self::CommandFailedWithOutput`] answers `Some`.
+    pub fn output(&self) -> Option<&str> {
+        match self {
+            Self::CommandFailedWithOutput { output, .. } => Some(output),
+            _ => None,
+        }
+    }
+}
+
+/// `error`, carrying what the engine printed during the call that produced it.
+///
+/// Only [`DbgEngError::CommandFailed`] is rewritten, because it is the one these paths produce for
+/// a failed `Execute` or a failed wait; anything else is already a different statement and is
+/// handed back as it came.
+fn printed(error: DbgEngError, output: &[u8]) -> DbgEngError {
+    match error {
+        DbgEngError::CommandFailed(source) => DbgEngError::CommandFailedWithOutput {
+            source,
+            output: String::from_utf8_lossy(output).to_string(),
+        },
+        other => other,
+    }
 }
 
 /// Fallback length of `_EPROCESS::ImageFileName` when the field's own size cannot be read.
@@ -5919,7 +5973,7 @@ impl DebugEngine {
             let _ = self.client.SetOutputCallbacks(None);
         }
 
-        result.map_err(DbgEngError::CommandFailed)?;
+        result.map_err(|source| printed(DbgEngError::CommandFailed(source), &output_buffer))?;
 
         Ok(String::from_utf8_lossy(&output_buffer).to_string())
     }
@@ -6026,7 +6080,7 @@ impl DebugEngine {
         // A watchdog-forced interrupt makes `Execute` fail (or return partial output); that is
         // expected, so only propagate a genuine (non-interrupted) error.
         if !interrupted {
-            result.map_err(DbgEngError::CommandFailed)?;
+            result.map_err(|source| printed(DbgEngError::CommandFailed(source), &output_buffer))?;
         }
 
         Ok(CommandRun {
@@ -6321,8 +6375,8 @@ impl DebugEngine {
             // As there: consume anything the engine did not, so the next operation starts clean.
             let _ = self.interrupted();
         } else if !target_gone {
-            exec.map_err(DbgEngError::CommandFailed)?;
-            waited?;
+            exec.map_err(|source| printed(DbgEngError::CommandFailed(source), &output_buffer))?;
+            waited.map_err(|error| printed(error, &output_buffer))?;
         }
 
         Ok(CommandRun {
@@ -6467,7 +6521,7 @@ impl DebugEngine {
         if interrupted {
             let _ = self.interrupted();
         } else if !target_gone {
-            waited?;
+            waited.map_err(|error| printed(error, &output_buffer))?;
         }
 
         Ok(Some(CommandRun {
@@ -6592,8 +6646,8 @@ impl DebugEngine {
                 output,
             });
         }
-        exec.map_err(DbgEngError::CommandFailed)?;
-        waited?;
+        exec.map_err(|source| printed(DbgEngError::CommandFailed(source), output.as_bytes()))?;
+        waited.map_err(|error| printed(error, output.as_bytes()))?;
 
         if expired {
             // The watchdog has already broken the target in, so the caller is not left with a
@@ -14473,6 +14527,55 @@ mod tests {
         );
 
         let _ = e.end_session();
+    }
+
+    /// A command the engine refuses comes back with what it printed, on each of the three paths a
+    /// caller's text takes — and the line saying *why* is in it.
+    ///
+    /// `0x80040205` on its own is the same answer for a mistyped command, an argument naming
+    /// nothing and `||1s` on a system not yet loaded; the engine's line is the only thing that
+    /// tells them apart (`examples/failed_command_output.rs`). Pinned on an argument naming nothing
+    /// because that line quotes the caller's own text back, so the assertion does not depend on
+    /// how a given engine version words its parse errors. The `.echo` ahead of it is the other
+    /// half: output from a segment that ran before the one that failed survives as well.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_refused_command_keeps_what_the_engine_printed() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        e.launch_process("cmd.exe /c ping -n 30 127.0.0.1")
+            .expect("launch failed");
+
+        let command = ".echo before the failure; ? nowhere!Nope";
+        let paths = [
+            ("execute_command", e.execute_command(command).map(|_| ())),
+            (
+                "execute_command_bounded",
+                e.execute_command_bounded(command, 10_000).map(|_| ()),
+            ),
+            (
+                "execute_and_wait",
+                e.execute_and_wait(command, 10_000).map(|_| ()),
+            ),
+        ];
+        for (path, outcome) in paths {
+            let error = match outcome {
+                Ok(()) => panic!("{path}: `{command}` succeeded, so nothing here is under test"),
+                Err(error) => error,
+            };
+            let printed = error
+                .output()
+                .unwrap_or_else(|| panic!("{path}: the failure carried no capture: {error:?}"));
+            assert!(
+                printed.contains("before the failure"),
+                "{path}: what the first segment printed was lost: {printed:?}"
+            );
+            assert!(
+                printed.contains("Couldn't resolve error at 'nowhere!Nope'"),
+                "{path}: the engine's reason was not in the capture: {printed:?}"
+            );
+        }
+        e.end_session().expect("end_session failed");
     }
 
     /// Serializes the tests that build a [`DebugEngine`].

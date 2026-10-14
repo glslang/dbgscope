@@ -79,6 +79,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A command that fails keeps what the engine printed**: `DbgEngError::CommandFailedWithOutput`,
+  read through `DbgEngError::output()`. `execute_command`, `execute_command_bounded`,
+  `execute_and_wait`, `settle` and `run_to_address` answer with it where they answered
+  `CommandFailed`, and the message is unchanged. The code alone said little -- `0x80040205` is the
+  answer to a mistyped command, to an argument naming nothing, to `g` on a dump and to `||1s` on a
+  system not yet loaded -- while the engine's own line, which says which, was printed into the
+  capture and dropped with it. Measured on dbgeng 10.0.29617.1000 and 10.0.26100.1742 (ARM64), the
+  same on both (`examples/failed_command_output.rs`): `Couldn't resolve error at 'ntdll!Nope'`,
+  `^ No runnable debuggees error in 'g'`, `^ Illegal debuggee error in '||1s'`, with the output of
+  any segment that ran before the failing one kept beside it. Not every failure takes this road:
+  `dt` of a missing type and an extension command that does not exist print their complaint and
+  return success. Asked for by windbg-mcp `FOLLOWUPS.md` item 126.
 - **`DebugEngine::reload_symbols_bounded(args, timeout_ms)`** and **`SymbolReload`**: a reload with
   the crate's watchdog around it, reporting a break by either origin in `cut_short` rather than as
   the `0xD000013A` it provokes. Measured before it was written, since a watchdog that cannot break
