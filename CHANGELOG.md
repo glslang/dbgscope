@@ -6,6 +6,34 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-17
+
+This release lets a breakpoint callback read its hit and decide whether the target stops, decodes
+ARM64 instructions in full and walks ARM64 kernel pools and user heaps, adds a PE reader and
+bounded reads and symbol reloads, and corrects how the pool and heap walkers read current Windows
+builds.
+
+### Migration from 0.2
+
+- `BreakpointCallback` is `Box<dyn Fn(&BreakpointHit<'_>) -> BreakpointAction>`: it reads the hit
+  through `BreakpointHit` and answers `Default`, `Go` or `Break`. Register it with
+  `set_breakpoint_callback` and remove it with `clear_breakpoint_callback`;
+  `create_debug_event_context_callbacks`, `set_breakpoint_event_callbacks` and the public
+  `DebugEventContextCallbacks` are removed.
+- `end_session` returns `TargetLeft` rather than `()`. `KernelHalted` means the session ended and
+  the guest is probably still stopped at a break; attach again and detach to release it.
+- A command that fails returns `DbgEngError::CommandFailedWithOutput` where it returned
+  `CommandFailed`. Match both, or read the engine's own line through `DbgEngError::output()`.
+- Public enums gain variants and public structs gain fields: `DbgEngError` (five variants),
+  `Operand::Undecoded`, `PoolState::Uncommitted` and `HeapState::Uncommitted`,
+  `HeapQueryError::Wow64Process` and `InvalidTeb`, `VsSemanticFamily::AffinitySlotsSelfRelative`,
+  `Instruction::privilege` and `reads`, `HeapWalkReport::uncommitted_gaps` and
+  `object::Globals::upcase`. Update exhaustive matches and struct literals.
+- `HeapRoot::index` is a position in `ntdll`'s heap list rather than in the PEB's `ProcessHeaps`,
+  and every pool and heap layout fingerprint moves. Re-resolve anything cached by fingerprint.
+- A caller that read `Flow::Unknown` as "operands were not decoded" asks
+  `InstructionSet::operands_are_read` instead; `flow_is_read` is the separate question for `flow`.
+
 ### Changed
 
 - **A breakpoint callback is handed a typed `BreakpointHit`** -- the breakpoint's `id()`, its
@@ -76,6 +104,28 @@ All notable changes to this project are documented here. The format follows
   Sibling to `windbg-mcp`'s `FOLLOWUPS.md` item 32, which was the same migration met by a repo
   that had run the two labels side by side through it. This one had not, so the migration landed
   here unobserved — which is the argument for the recording step.
+
+- **`end_session` says what became of the target.** It returns `TargetLeft` -- `KernelRunning`,
+  `KernelHalted` or `Unspoken` -- where it returned `()`, because the session ending and the target
+  running are different answers and only the first was kept. A live kernel's resume was
+  `let _ =`, so a guest never told to run was reported as released: on 2026-09-15 a reattach found
+  one at the same `System Uptime` it had been left at. A failed resume is `KernelHalted` rather
+  than an `Err`, since the session did end and the useful thing to do is go and look at the guest;
+  `Err` stays for a detach that did not happen (`DbgEngError::IncompleteKernelDetach`). The release
+  itself now goes through the engine's own `qd` rather than `SetExecutionStatus(GO)` followed by an
+  active detach, which left a 29671 hypervisor unresponsive while reporting success.
+  **Breaking** for a caller that names the return type.
+
+- **Object names fold the way the target's object manager folds them.** `Namespace::object_at`
+  matched each path component with `eq_ignore_ascii_case`, so a name differing from the one asked
+  for only outside ASCII -- one object to the kernel -- came back `ObjectError::NotFound`. The walk
+  now folds through the target's own `UnicodeUpcaseTable844`, reached from `nt!PspHostSiloGlobals`,
+  and falls back to this host's `RtlUpcaseUnicodeChar` where the target will not say where its
+  table is. `Upcase::source` reports which answered: `Target`, `Host`, or `Mixed` when a read into
+  the target's table missed and a unit was folded here instead, which is what a partial dump
+  produces. An ASCII name reads no table at all. `Namespace::upcase` exposes the walk's fold, and
+  `same_object_name` is the host's fold for a caller holding two names and no target.
+  windbg-mcp `FOLLOWUPS.md` items 70 and 77.
 
 ### Added
 
@@ -239,6 +289,52 @@ All notable changes to this project are documented here. The format follows
   `Complete`: every gap it filed, put back to the memory manager, with an allocated chunk and a
   free one as controls. An address as a second argument answers that one question, which is how
   the dump direction is checked.
+
+- **`pe`: a loaded image's PE structures, read through a memory reader** (#150). `read_image`
+  takes a base and a reader and returns an `Image` -- its bitness, machine, sections and the
+  directories later reads start from; `read_imports` names its imports and `imports_by_slot` keys
+  them by the address-table slot a call site reads through, which is what names a call in a driver
+  with no symbols. Moved from `windbg-mcp` once four of its tools had exercised it, the parser
+  unchanged. It asks for a range at a time rather than a contiguous slice, because a loaded image
+  in a dump has holes -- the reason `goblin`, `object` and `pelite` were not the answer. Declared
+  spans are checked against the image and refused rather than clipped, and a machine and a magic
+  that disagree refuse the image.
+
+- **`DebugEngine::read_memory_bounded(address, size, budget_ms)`** and **`MemoryRead`** (#95): a
+  read with a deadline, taken a page at a time with the deadline checked before each chunk.
+  `ReadVirtual` is not documented to poll for `SetInterrupt`, so the watchdog the other bounded
+  operations use would be a bound that only looks taken. The residual is one chunk; a short chunk
+  is reported as the `ShortRead` one call of the whole range would have given; and a host's
+  `interrupt` reaches a read between chunks. `read_memory` stays unbounded. Every allocation on
+  both read paths is fallible, a failed one answering `DbgEngError::OutOfMemory` with how far the
+  read had got rather than aborting the host. Release build, 1 MiB of `ntdll` from a local
+  process: 486-581µs as one `ReadVirtual` against 735-768µs as 256.
+
+- **`Instruction::reads`**: the registers an instruction reads, beside `writes`. `operands` names
+  only the explicit reads, so `mul ecx` reading `eax`, `cmpxchg` reading `rax`, the string
+  instructions reading `rsi`/`rdi`/`rcx` and `cmp dword ptr [rcx+8],5` reading `rcx` were invisible
+  to a consumer asking whether an instruction looks at the value it is tracking. Empty means not
+  decoded rather than "reads nothing". windbg-mcp `FOLLOWUPS.md` item 75.
+
+- **ARM64 control flow and function extents are decoded** (windbg-mcp#297). `Instruction::flow`
+  and `function_extent` answered "not this architecture" on ARM64. A64 is fixed-width, so every
+  transfer of control is one of six encoding classes and a word outside them falls through; `b.al`
+  and `b.nv` are unconditional. The unwind record is read as ARM64's two words, where x64's
+  three-RVA reading produced a plausible region containing the address asked about.
+  `InstructionSet::flow_is_read` is new, separate from `operands_are_read`.
+
+- **`DebugEngine::attach_kernel_announcement_begin(connection_string)`**, an experimental attach
+  for a known-running KDNET lab target: one break, requested on the engine's English
+  `Connected to target` output, with no `INITIAL_BREAK` and no extra `g`. That text is not a
+  Microsoft readiness contract, so missing or changed output, an interrupt and a timeout fail with
+  `DbgEngError::ExperimentalKernelAttach` rather than falling back to a break, and an unconnected
+  transport may still block without bound -- run it in a worker process that can be killed.
+
+- **`DebugEngine::kernel_connection_options`**: a live kernel session's connection options, in
+  DbgEng's own canonical `KdSrv:` form. Two live kernels are otherwise indistinguishable by
+  everything this crate exposes -- same class and qualifier, no dump files, no process set -- so
+  this is what a caller fingerprinting its target compares. **It can carry a secret**: a KDNET form
+  includes the target's `key=`, so keep a hash of it rather than the string.
 
 ### Changed
 
@@ -441,6 +537,15 @@ All notable changes to this project are documented here. The format follows
   because `ExpAddTagForBigPages` claims the first bit-0-set slot from the hash and so cannot have
   walked past one. The table is also read a batch at a time and **kept**, which is what makes
   asking this question of every page range affordable rather than of large allocations only.
+
+- **`!poolmap` says what the walk missed.** It drew the map and listed every diagnostic but
+  rendered none of the walk's `complete`, unplaced bytes, stalls or refused chunks, so an operator
+  got a picture with no statement of how much of the pool was not in it -- on a live 29671 kernel,
+  `coverage: partial` with 15,626,240 unplaced bytes under a map that said nothing. A
+  `--- pool walk ---` summary now follows the map, on the empty-map path too, where "no allocation
+  matches" and "the walk never reached the pool" otherwise read the same. It is the walk's report
+  rather than the filtered index's, so `--paged` does not shrink the count of chunks walked.
+  windbg-mcp `FOLLOWUPS.md` item 100.
 
 - **The heap walker read an LFH subsegment's busy blocks from the wrong bits, on every current
   build.** `_HEAP_LFH_SUBSEGMENT.BlockBitmap` was read as two adjacent bits per block, busy the
@@ -1486,6 +1591,7 @@ the API, is that every answer carries what the answering cost — see
 - **Pre-1.0.** The `dbgeng` surface is large and expected to change; breaking changes may land
   in any `0.x` release.
 
-[Unreleased]: https://github.com/glslang/dbgscope/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/glslang/dbgscope/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/glslang/dbgscope/releases/tag/v0.3.0
 [0.2.0]: https://github.com/glslang/dbgscope/releases/tag/v0.2.0
 [0.1.0]: https://github.com/glslang/dbgscope/releases/tag/v0.1.0
