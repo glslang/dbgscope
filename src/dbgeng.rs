@@ -709,6 +709,9 @@ struct ArrivalId(u64);
 /// here, so the second launch waits for the next one. The reason that fix was weighed and rejected
 /// before is that it needed "new engine-wide state, cleared everywhere a session is replaced and
 /// pruned for pid reuse" — which is the very cost this shape does not have.
+///
+/// What a claim settles is that two opens are not given the *same* process. Which launch is given
+/// which is a different question and is still open — see [`Arrival`] and dbgscope#141.
 #[derive(Debug, Default)]
 struct Arrivals {
     /// Ids handed out so far. Never reused.
@@ -899,13 +902,17 @@ impl Arrivals {
         // (dbgscope#141). Dropping the guard does not un-queue the `CreateProcessWide` behind it,
         // so that process still arrives — and it is new to the *next* launch's snapshot, because
         // it did not exist when that snapshot was taken, so without this the next launch claims it
-        // and its `wait()` returns for a target it never asked for. Measured before it was fixed:
-        // a launch of `ping.exe` behind an abandoned `cmd.exe` was delivered the `cmd.exe`.
+        // and its `wait()` returns on that stop, before its own process has stopped at all.
+        // Measured before it was fixed: a launch of `ping.exe` behind an abandoned `cmd.exe` was
+        // delivered the `cmd.exe`.
         //
         // The entry is kept rather than an exclusion left behind, because there is nothing to
-        // exclude yet — which process the create will produce is exactly what nobody knows. Being
-        // first in registration order is what makes it right: `deliver` offers in that order, and
-        // the engine realises queued creates in it.
+        // exclude yet — which process the create will produce is exactly what nobody knows. **What
+        // makes keeping it right is accounting, not order**: one entry absorbs one arrival, so the
+        // next launch's `wait()` returns only once a second process has stopped. Being first does
+        // not decide *which* one it absorbs — one `WaitForEvent` realises both queued creates and
+        // which of them the event names is a coin flip — so the next launch is still handed the
+        // `cmd.exe` about half the time. That is identification, the half dbgscope#141 keeps open.
         //
         // **Only a launch, and only one that has been given nothing.** An abandoned *attach* is
         // already covered by the engine's `attached_processes`, which is what `Pending::wants`
@@ -965,9 +972,12 @@ impl Arrivals {
 
     /// Routes a stop to the open that wants it, if any.
     ///
-    /// **First registered wins**, which is the whole of what makes two pending launches
-    /// distinguishable: the arrival is offered in registration order and claimed by one open, so
-    /// the second launch is still waiting when the next one comes.
+    /// **First registered wins**, which is the whole of what keeps two pending launches from being
+    /// given the same process: the arrival is offered in registration order and claimed by one
+    /// open, so the second launch is still waiting when the next one comes. It does not give each
+    /// launch its *own*: one `WaitForEvent` realises every queued create and which of them the
+    /// event names is a coin flip, so the first launch registered takes whichever stops first
+    /// (dbgscope#141).
     ///
     /// A process already claimed is offered to nobody, which [`Pending::wants`] enforces for every
     /// caller rather than this one alone: a target stops more than once in a session -- every later
@@ -9569,17 +9579,25 @@ impl Drop for Registered<'_> {
 /// when the next one comes; and because an entry cannot outlive the guard that made it, there is no
 /// stale claim to prune or clear. The record whose lifecycle made the fix expensive was the thing
 /// the fix would have joined. A guard that finishes and is dropped hands its claim to the opens
-/// still waiting ([`Arrivals::forget`]), so the two live guards and the delivered-then-dropped case
-/// are both exact.
+/// still waiting ([`Arrivals::forget`]), so no process is given to two opens, whether both guards
+/// are live or one was delivered and dropped.
 ///
-/// **What is left is a launch abandoned before it is delivered anything**, and it is dbgscope#141
-/// rather than this change: dropping such a guard takes a `Waiting` entry out of the register and
-/// leaves no exclusion, so the process the deferred `CreateProcessWide` still produces is new to
-/// the *next* launch's snapshot and is claimed by it. Keeping the entry is not simply the fix —
-/// nothing would ever retire one whose launch failed to start (`deferred_arrival` arm C: an image
-/// that does not exist fails inside the wait), and it would then take the next launch's process
-/// and time that guard out instead. A wrong `Ok` for a wrong timeout is a trade rather than a fix,
-/// and it wants deciding on its own.
+/// **What is left is identification, and it is dbgscope#141.** A claim makes arrivals *distinct*,
+/// not *attributed*: [`Arrivals::deliver`] offers in registration order, but one `WaitForEvent`
+/// realises every queued create (measured: session 0 → 2 on a single pump) and which of them the
+/// event names is a coin flip, so the first launch registered takes whichever process stops first.
+/// Telling them apart needs something to match on rather than an order, and `CreateProcessWide`
+/// hands back no pid to match. It is documented rather than built; the issue records why, and what
+/// would change that.
+///
+/// **A launch abandoned before it is delivered anything keeps its entry** ([`Arrivals::forget`]).
+/// Its `CreateProcessWide` is still queued, and the process it produces is new to the next launch's
+/// snapshot — so without the entry the next launch claimed it and its `wait()` returned before its
+/// own process had stopped. Nothing has to retire an entry for a launch that cannot start, because
+/// no such entry is constructible: a missing image fails at [`DebugEngine::launch_process_begin`],
+/// before any guard exists (`0x80070002` in 1.5 ms, `examples/abandoned_launch.rs` arm B). An open
+/// that pumps its whole bound and sees nothing is discarded rather than kept
+/// ([`Arrivals::discard`]).
 #[derive(Debug)]
 enum Arrival {
     /// A process this engine launched: one the session did not hold when the launch was issued and
@@ -13674,8 +13692,9 @@ mod tests {
         let _ = theirs.wait();
     }
 
-    /// **Two launches pending at once are told apart**, which [`Arrival`] used to document as an
-    /// accepted ambiguity.
+    /// **Two launches pending at once are given different processes**, where [`Arrival`] used to
+    /// document both waits ending on the first arrival as an accepted ambiguity. Not each its own
+    /// process: that is dbgscope#141, and this does not assert it.
     ///
     /// A launch is identified by elimination -- `CreateProcessWide` hands back no pid -- so with
     /// two of them pending the first arrival is new to both snapshots and satisfied both waits.
@@ -13737,11 +13756,10 @@ mod tests {
         e.end_session().expect("end_session failed");
     }
 
-    /// **A launch abandoned before anything pumps does not hand its process to the next launch**
-    /// (dbgscope#141).
+    /// **A launch abandoned before anything pumps absorbs an arrival of its own** (dbgscope#141).
     ///
-    /// Dropping a guard takes a `Waiting` entry out of the register and leaves no exclusion behind
-    /// — there is nothing to leave, since nothing was ever delivered to it. The queued
+    /// Dropping a guard used to take its `Waiting` entry out of the register and leave no exclusion
+    /// behind — there was nothing to leave, since nothing was ever delivered to it. The queued
     /// `CreateProcessWide` still produces a process, and it is new to the *next* launch's snapshot
     /// because it did not exist when that snapshot was taken.
     ///

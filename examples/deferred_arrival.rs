@@ -22,9 +22,12 @@
 //!   names it: `510.29b4: Break instruction exception - code 80000003 (first chance)`, on the
 //!   *attached* pid. `AttachProcess` injects a thread to raise it, and under load that thread is
 //!   scheduled late enough to land a whole wait after its own.
-//! - **A pump must not swallow a real failure** (arm C). A launch whose image does not exist fails
-//!   *inside* the wait — `Err(0x80070002)` in 13ms, no debuggee behind it, a further wait
-//!   answering `E_UNEXPECTED` in 37µs — so the loop propagates rather than pumping on.
+//! - **A launch that cannot start never reaches a pump** (arm C). A launch whose image does not
+//!   exist answers `Err(0x80070002)` in 13ms with no debuggee behind it, and a further wait answers
+//!   `E_UNEXPECTED` in 37µs. This arm was read as failing *inside* the wait, which it cannot show:
+//!   it calls the combined `launch_process`. `abandoned_launch` arm B splits the two and the error
+//!   is `launch_process_begin`'s, before any guard exists — so there is no failure here for a pump
+//!   to swallow, and the further wait failing rather than expiring is arm I's fact.
 //! - **A guard may ask before it waits** (arms E, F and H). Neither opener lists its process
 //!   before the wait that completes it, so the ask cannot fire on an ordinary open; a guard whose
 //!   target arrived meanwhile took 29.36s and `E_UNEXPECTED` before the fix against single-digit
@@ -403,9 +406,10 @@ fn what_a_wait_can_conclude() {
     wait_once("a stopped target, nothing left to report", &e);
 }
 
-/// Arm C: the failure a pump must not turn into a hang — a launch whose image does not exist.
-/// The spawn is deferred, so this fails *inside* the wait, and a fix that pumps until a process
-/// appears has to see that failure rather than wait out its whole deadline.
+/// Arm C: a launch whose image does not exist. Written as the failure a pump must not turn into a
+/// hang, on the reading that the deferred spawn fails *inside* the wait — it does not: the error is
+/// `launch_process_begin`'s, before any guard exists (`abandoned_launch` arm B), which this arm
+/// cannot see because `launch_process` fuses the two. What it still shows is that nothing hangs.
 fn a_launch_that_cannot_start() {
     println!("\n=== C. launch_process on an image that does not exist ===");
     let e = DebugEngine::new();
