@@ -1,6 +1,7 @@
 //! Scratch measurement for dbgscope#141 (not part of the public API): a launch guard dropped
-//! **before** anything pumps leaves its `Waiting` entry removed and no exclusion behind it, while
-//! `CreateProcessWide` is still queued. Whose process does the *next* launch get?
+//! **before** anything pumps, while its `CreateProcessWide` is still queued. Whose process does the
+//! *next* launch get? (When this was written the dropped guard's `Waiting` entry was removed with
+//! no exclusion left behind; #143 keeps it.)
 //!
 //! The issue was written from reasoning. Both of its load-bearing claims needed measuring, and the
 //! first draft of this file measured the wrong thing:
@@ -11,10 +12,11 @@
 //!   example did, and why it reported "waited for its own process" for a case it had not tested.
 //!
 //! - **B.** Does a launch whose image does not exist fail at `launch_process_begin`, or later
-//!   inside the wait? This decides whether the fix is hard. `deferred_arrival`'s arm C says "fails
+//!   inside the wait? This decides whether the fix is hard. `deferred_arrival`'s arm C said "fails
 //!   *inside* the wait", but that arm calls the combined `launch_process`, which cannot tell the
-//!   two apart — the error comes back from one call either way. windbg-mcp's `worker.rs` says the
-//!   opposite and claims a live check.
+//!   two apart — the error comes back from one call either way. windbg-mcp's `worker.rs` said the
+//!   opposite and claimed a live check, and was right: **it fails at begin**, `0x80070002` in
+//!   1.5ms with no guard returned.
 //!
 //! - **C.** The contract itself, observed rather than inferred: when the second guard's `wait()`
 //!   returns, is that guard's **own program** in the session? Distinguishable images (`cmd.exe`
@@ -30,7 +32,8 @@ use dbgscope::dbgeng::DebugEngine;
 use std::time::Instant;
 
 /// The session's process listing, through the public surface only — the same `|` reading
-/// `deferred_arrival` uses, since `session_processes` is private to the crate.
+/// `deferred_arrival` uses. Not `session_processes`, though that is public now: arm C tells the two
+/// programs apart by image name, and that answers only `(engine id, pid)` pairs.
 fn listing(e: &DebugEngine) -> String {
     e.execute_command("|").unwrap_or_default()
 }
