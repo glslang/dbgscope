@@ -3004,6 +3004,30 @@ pub struct Instruction {
     pub reads: Vec<RegisterOperand>,
 }
 
+/// A bounded [`DebugEngine::disassemble_bounded`]'s instructions, **and** whether that is all of
+/// them — the same shape as [`MemoryRead`], and for the same reason.
+///
+/// [`DebugEngine::disassemble`] answers a bare `Vec<Instruction>` because a short answer there is a
+/// fact about the target: disassembly runs forward into whatever follows a function, and a walk
+/// that stops has reached something that is not code. A *bounded* walk stops for a second reason —
+/// it ran out of time, or a host asked it to — and that is not the same fact: a listing cut short
+/// by the clock is a prefix of a function that is still there, and reading its last decoded
+/// instruction as the function's end invents a fall-through the code does not have. So the stop is
+/// reported rather than left to be inferred from a length, exactly as [`CommandRun`] and
+/// [`MemoryRead`] report theirs.
+#[derive(Debug, Clone)]
+pub struct Disassembly {
+    /// The instructions decoded, in address order, up to where the walk stopped. Shorter than the
+    /// `count` asked for whenever [`Self::cut_short`] is `Some` — and possibly also when it is
+    /// `None`, a run into unmapped memory or data ending the walk with no interruption, which is
+    /// the same short answer [`DebugEngine::disassemble`] gives.
+    pub instructions: Vec<Instruction>,
+    /// `None` when the walk ran to `count` or to the end of what could be disassembled. `Some` is a
+    /// deadline or a host request, and means the function very likely continues past the last
+    /// instruction here.
+    pub cut_short: Option<Interruption>,
+}
+
 /// The engine's current **scope**: which instruction, which frame, and the register context
 /// those are read through — what `.frame`, `.cxr`, `.ecxr` and `.trap` set, and what `dt`, `dv`,
 /// `k` and every register read are answered against.
@@ -3578,6 +3602,68 @@ fn split_instruction(address: u64, line: &str, set: InstructionSet) -> Instructi
         writes: decoded.writes,
         reads: decoded.reads,
     }
+}
+
+/// The loop behind both [`DebugEngine::disassemble`] and [`DebugEngine::disassemble_bounded`],
+/// driven by closures so the bound can be asserted with no debuggee — the same arrangement as
+/// [`read_chunked`], and for the same reason.
+///
+/// `render_line` renders the instruction at an address and reports the engine's own next address
+/// beside it; `halt` is asked **before each line**, so a walk stops between two renderings rather
+/// than inside one. That "before each" is the whole of the bound and the whole of its limit: a
+/// single `IDebugControl::Disassemble` renders one line, which resolves the symbols in it, which on
+/// a cold module is a fetch from a symbol server — and nothing here runs between the start of that
+/// call and its return. See [`DebugEngine::disassemble_bounded`] for why that residual is one line
+/// and why it needs no answer about `SetInterrupt`.
+fn disassemble_lines(
+    address: u64,
+    count: usize,
+    set: InstructionSet,
+    mut halt: impl FnMut() -> Option<Interruption>,
+    mut render_line: impl FnMut(u64) -> (windows::core::Result<String>, u64),
+) -> Result<Disassembly, DbgEngError> {
+    let mut out = Vec::with_capacity(count.min(64));
+    let mut at = address;
+    for _ in 0..count {
+        // Asked before the render, never after: a walk stopped on the clock must not be credited
+        // the instruction it had not yet read, and one that finished must not be reported cut
+        // short — the same ordering `read_chunked` keeps, and for the same reason.
+        if let Some(cut_short) = halt() {
+            return Ok(Disassembly {
+                instructions: out,
+                cut_short: Some(cut_short),
+            });
+        }
+        let (line, next) = render_line(at);
+        let line = match line {
+            Ok(line) if !line.trim().is_empty() => line,
+            // The first one failing is the caller's own question going unanswered; a later one is
+            // the end of what can be read, and the instructions before it are still good.
+            Ok(_) | Err(_) if !out.is_empty() => break,
+            Ok(_) => {
+                return Err(DbgEngError::Context {
+                    operation: format!("disassembling {at:#x}"),
+                    source: S_FALSE.into(),
+                });
+            }
+            Err(source) => {
+                return Err(DbgEngError::Context {
+                    operation: format!("disassembling {at:#x}"),
+                    source,
+                });
+            }
+        };
+        out.push(split_instruction(at, &line, set));
+        // An engine that does not advance would spin here forever rendering one instruction.
+        if next <= at {
+            break;
+        }
+        at = next;
+    }
+    Ok(Disassembly {
+        instructions: out,
+        cut_short: None,
+    })
 }
 
 /// One instruction's **encoding**, decoded.
@@ -7833,39 +7919,97 @@ impl DebugEngine {
         // Asked once for the whole walk: the target's architecture cannot change inside one, and
         // asking per instruction would put a COM call between every pair of them.
         let set = self.instruction_set();
-        let mut out = Vec::with_capacity(count.min(64));
-        let mut at = address;
-        for _ in 0..count {
-            let mut next = 0u64;
-            let line = read_engine_string(|buffer, size| unsafe {
-                self.control.Disassemble(at, 0, buffer, size, &mut next)
-            });
-            let line = match line {
-                Ok(line) if !line.trim().is_empty() => line,
-                // The first one failing is the caller's own question going unanswered; a later one
-                // is the end of what can be read, and the instructions before it are still good.
-                Ok(_) | Err(_) if !out.is_empty() => break,
-                Ok(_) => {
-                    return Err(DbgEngError::Context {
-                        operation: format!("disassembling {at:#x}"),
-                        source: S_FALSE.into(),
+        // No halt: this is the unbounded listing path — the hot one for the disassembly tool, the
+        // parallel of `read_memory` staying unbounded beside `read_memory_bounded`. The bounded
+        // sibling is `disassemble_bounded`; both drive the same loop so they cannot drift in how
+        // they render a line or what they make of one that fails.
+        disassemble_lines(address, count, set, || None, |at| self.render_line(at))
+            .map(|disassembly| disassembly.instructions)
+    }
+
+    /// Renders the instruction at `at`, reporting the engine's own next address beside it. The one
+    /// place `IDebugControl::Disassemble` is called, shared by the unbounded and bounded walks.
+    ///
+    /// Flags are zero: the same rendering `u` produces by default, without the effective-address
+    /// annotation, which is a fact about the *current register context* rather than about the
+    /// instruction and would make two identical calls differ.
+    fn render_line(&self, at: u64) -> (windows::core::Result<String>, u64) {
+        let mut next = 0u64;
+        let line = read_engine_string(|buffer, size| unsafe {
+            self.control.Disassemble(at, 0, buffer, size, &mut next)
+        });
+        (line, next)
+    }
+
+    /// Like [`Self::disassemble`], but **bounded**: the walk checks `budget_ms` before rendering
+    /// each instruction, so a listing that outlasts its budget comes back with what it had rather
+    /// than with the session held while a cold symbol loads.
+    ///
+    /// Returns [`Disassembly`]: the instructions, **and** whether that is all of them.
+    /// `budget_ms == 0` asks for no deadline (the parallel of [`Self::read_memory_bounded`] and
+    /// [`Self::execute_command_bounded`]), which still buys the other half — a host's
+    /// [`InterruptHandle::interrupt`] is read between instructions, so a thousand-instruction walk
+    /// over a cold module is no longer a call nobody can stop.
+    ///
+    /// # Why this bounds the loop and not the call, like [`Self::read_memory_bounded`]
+    ///
+    /// Each instruction is one `IDebugControl::Disassemble`, which renders a line — and rendering
+    /// resolves the symbols in it, so a module with deferred symbols can send that one call to a
+    /// symbol server. `Disassemble` is a direct engine call, not an `Execute` or a `WaitForEvent`,
+    /// and Microsoft documents no interrupt polling in it; whether a watchdog's `SetInterrupt`
+    /// reaches one in progress is the question [`Self::read_memory_bounded`] left open for
+    /// `ReadVirtual`, for want of a live kernel behind a link slow enough for a call to sit in.
+    ///
+    /// So the bound here is one this crate can keep without that answer, and it is the same move:
+    /// the loop over lines is split exactly as [`read_chunked`]'s loop over pages is, and the
+    /// deadline is checked before each one. **What the bound does not reach is one line** — a
+    /// single `Disassemble` blocked loading a symbol runs to its own completion, nothing lying
+    /// between its start and its return. That residual is the honest shape of it, and it is the
+    /// whole of what dbgscope#149 is about: a thousand-instruction function no longer spends a
+    /// thousand symbol loads past the deadline, only the one it was inside when the clock ran out.
+    /// A caller that needs even that one bounded wants the `SetInterrupt` question settled first,
+    /// which needs the link above.
+    pub fn disassemble_bounded(
+        &self,
+        address: u64,
+        count: usize,
+        budget_ms: u32,
+    ) -> Result<Disassembly, DbgEngError> {
+        let set = self.instruction_set();
+        // A request that arrives from here on names this walk and only this one, exactly as it
+        // does for a bounded read: a break aimed at whatever ran before is invisible to it, so
+        // nothing can cut this walk short on somebody else's account.
+        let operation = self.begin_operation();
+        let deadline = (budget_ms > 0)
+            .then(|| Instant::now().checked_add(Duration::from_millis(u64::from(budget_ms))))
+            .flatten();
+        let disassembly = disassemble_lines(
+            address,
+            count,
+            set,
+            || {
+                // The deadline is asked first, so the one caller who is both out of time and being
+                // asked to stop is told the thing it can act on. A request left unread here stays
+                // filed against this operation, and `Operation::drop` discards it and drains the
+                // engine's pending break.
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Some(Interruption::Deadline {
+                        after_ms: budget_ms,
                     });
                 }
-                Err(source) => {
-                    return Err(DbgEngError::Context {
-                        operation: format!("disassembling {at:#x}"),
-                        source,
-                    });
-                }
-            };
-            out.push(split_instruction(at, &line, set));
-            // An engine that does not advance would spin here forever rendering one instruction.
-            if next <= at {
-                break;
-            }
-            at = next;
+                operation
+                    .took_break_request()
+                    .then_some(Interruption::OnRequest)
+            },
+            |at| self.render_line(at),
+        )?;
+        // A request this walk *took* is this walk's to account for, so the `SetInterrupt` behind it
+        // is drained here rather than left pending to break into whatever runs next — the same
+        // policy, at the same point in it, as the bounded read and command paths.
+        if disassembly.cut_short == Some(Interruption::OnRequest) {
+            let _ = self.interrupted();
         }
-        Ok(out)
+        Ok(disassembly)
     }
 
     /// Decodes a **range** of code from one memory read, instead of one engine call per
@@ -11861,6 +12005,229 @@ mod tests {
         );
         assert_eq!(undecoded.flow, Flow::Unknown);
         assert!(undecoded.writes.is_empty(), "{undecoded:?}");
+    }
+
+    /// **A bounded disassembly stops between two renderings and keeps what it had.**
+    ///
+    /// The stop is placed exactly rather than raced for, the same way the bounded-read tests place
+    /// theirs: `halt` is a closure, so a deadline can be made to fall after a chosen number of
+    /// lines instead of depending on a real clock against a real engine. The addresses are checked
+    /// against the prefix rather than only the count, because the count alone passes for a walk
+    /// that kept the wrong instructions.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn a_bounded_disassembly_stops_between_lines_and_keeps_what_it_had() {
+        const BASE: u64 = 0x1000;
+        let polls = RefCell::new(0usize);
+        let renders = RefCell::new(0usize);
+        let disassembly = disassemble_lines(
+            BASE,
+            10,
+            InstructionSet::Amd64,
+            || {
+                let mut polls = polls.borrow_mut();
+                *polls += 1;
+                // Two lines rendered, then out of time.
+                (*polls == 3).then_some(Interruption::Deadline { after_ms: 250 })
+            },
+            |at| {
+                *renders.borrow_mut() += 1;
+                (Ok(format!("{at:08x} 90 nop")), at + 1)
+            },
+        )
+        .expect("a walk cut short reports its stop rather than failing");
+
+        assert_eq!(
+            disassembly.cut_short,
+            Some(Interruption::Deadline { after_ms: 250 }),
+            "a walk that stopped on its deadline did not say so, so its caller reads a short \
+             listing as a function that ends there"
+        );
+        assert_eq!(
+            disassembly
+                .instructions
+                .iter()
+                .map(|instruction| instruction.address)
+                .collect::<Vec<_>>(),
+            vec![BASE, BASE + 1],
+            "the instructions kept are not the prefix of the walk asked for"
+        );
+        assert_eq!(
+            *renders.borrow(),
+            2,
+            "the stop did not land between two renderings"
+        );
+    }
+
+    /// **A walk that finished is never reported cut short**, which is the other half of the stop
+    /// being a fact and not a length: a listing that ran to its `count` and said it was
+    /// interrupted would send a caller to raise a timeout that was never the problem.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn a_disassembly_that_finished_is_never_reported_cut_short() {
+        const BASE: u64 = 0x2000;
+        let disassembly = disassemble_lines(
+            BASE,
+            3,
+            InstructionSet::Amd64,
+            || None,
+            |at| (Ok(format!("{at:08x} 90 nop")), at + 1),
+        )
+        .expect("a finished walk failed");
+        assert_eq!(disassembly.instructions.len(), 3);
+        assert_eq!(
+            disassembly.cut_short, None,
+            "a walk that ran to its count was reported cut short"
+        );
+    }
+
+    /// **A host's request is read between lines too**, which is what `budget_ms == 0` buys — a
+    /// walk with no deadline is still one a host can stop, the parallel of the bounded read's own
+    /// between-chunk request.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn a_bounded_disassembly_reads_a_host_request_between_lines() {
+        const BASE: u64 = 0x3000;
+        let polls = RefCell::new(0usize);
+        let disassembly = disassemble_lines(
+            BASE,
+            10,
+            InstructionSet::Amd64,
+            || {
+                let mut polls = polls.borrow_mut();
+                *polls += 1;
+                (*polls == 2).then_some(Interruption::OnRequest)
+            },
+            |at| (Ok(format!("{at:08x} 90 nop")), at + 1),
+        )
+        .expect("a walk a host interrupted failed instead of reporting it");
+        assert_eq!(disassembly.cut_short, Some(Interruption::OnRequest));
+        assert_eq!(disassembly.instructions.len(), 1);
+    }
+
+    /// **The first rendering failing is an error, and a later one ends the walk** — the contract
+    /// [`DebugEngine::disassemble`] has always had, asserted here because both it and
+    /// [`DebugEngine::disassemble_bounded`] now reach it through this one loop. The first line is
+    /// the caller's own question; a later failure is the end of what is code, and the lines before
+    /// it stand.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn the_first_rendering_failing_is_an_error_and_a_later_one_ends_the_walk() {
+        const BASE: u64 = 0x4000;
+        // Render an empty line (what the engine returns for an address it cannot disassemble) at
+        // the nth rendering; everything else is a valid instruction.
+        let walk = |fail_at: usize| {
+            let renders = RefCell::new(0usize);
+            disassemble_lines(
+                BASE,
+                10,
+                InstructionSet::Amd64,
+                || None,
+                move |at| {
+                    let mut renders = renders.borrow_mut();
+                    *renders += 1;
+                    if *renders == fail_at {
+                        (Ok(String::new()), at + 1)
+                    } else {
+                        (Ok(format!("{at:08x} 90 nop")), at + 1)
+                    }
+                },
+            )
+        };
+
+        assert!(
+            matches!(walk(1), Err(DbgEngError::Context { .. })),
+            "a walk that could not render its first instruction answered as though the address \
+             held nothing, rather than failing the caller's own question"
+        );
+        let later = walk(3).expect("a walk that stopped at a later line is not an error");
+        assert_eq!(
+            later.instructions.len(),
+            2,
+            "a rendering that failed after some lines did not end the walk with what it had"
+        );
+        assert_eq!(
+            later.cut_short, None,
+            "running into something that is not code is not an interruption"
+        );
+    }
+
+    /// **Out of time before the first line reads nothing**, and renders nothing — the deadline is
+    /// checked before each rendering, including the first, so a walk handed a budget already
+    /// behind it pays for no lines at all. Mutation target: moving the check after the render.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn a_bounded_disassembly_out_of_time_before_the_first_line_reads_nothing() {
+        let renders = RefCell::new(0usize);
+        let disassembly = disassemble_lines(
+            0x5000,
+            10,
+            InstructionSet::Amd64,
+            || Some(Interruption::Deadline { after_ms: 0 }),
+            |at| {
+                *renders.borrow_mut() += 1;
+                (Ok(format!("{at:08x} 90 nop")), at + 1)
+            },
+        )
+        .expect("a walk out of time before it started failed instead of reporting it");
+        assert!(disassembly.instructions.is_empty());
+        assert_eq!(
+            disassembly.cut_short,
+            Some(Interruption::Deadline { after_ms: 0 })
+        );
+        assert_eq!(
+            *renders.borrow(),
+            0,
+            "the deadline was checked after the first rendering, not before it"
+        );
+    }
+
+    /// **The walk stops when the engine does not advance**, so an engine that reports an
+    /// instruction's next address as its own cannot spin the loop rendering one line forever. The
+    /// guard carried over from [`DebugEngine::disassemble`]; mutation target: the `next <= at`
+    /// break.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "decodes through iced-x86; see MIRI AND THE DECODER above"
+    )]
+    fn a_disassembly_stops_when_the_engine_does_not_advance() {
+        const BASE: u64 = 0x6000;
+        let renders = RefCell::new(0usize);
+        let disassembly = disassemble_lines(
+            BASE,
+            10,
+            InstructionSet::Amd64,
+            || None,
+            |at| {
+                *renders.borrow_mut() += 1;
+                // The same address as its next: an engine that is not advancing.
+                (Ok(format!("{at:08x} 90 nop")), at)
+            },
+        )
+        .expect("a non-advancing walk failed");
+        assert_eq!(
+            disassembly.instructions.len(),
+            1,
+            "a walk whose engine reported no progress rendered more than one instruction"
+        );
+        assert_eq!(*renders.borrow(), 1);
+        assert_eq!(disassembly.cut_short, None);
     }
 
     /// An instruction says which registers it **reads**, which its operands do not.
