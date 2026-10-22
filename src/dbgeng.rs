@@ -699,9 +699,12 @@ struct ArrivalId(u64);
 /// wrote into it and every guard polled it, and because it outlived the opens that read it, it
 /// needed a lifecycle of its own — pruned at both openers for pid reuse, cleared where a session
 /// was replaced and again where one was ended, each of which arrived as a review finding
-/// (dbgscope#133 rounds 7 to 9). A register of *pending* opens needs none of that: an entry lives
-/// exactly as long as the guard that made it, so there is no stale record to prune, clear or
-/// match by accident.
+/// (dbgscope#133 rounds 7 to 9). A register of *pending* opens needs none of that while an entry
+/// lives as long as the guard that made it, so there is no stale record to prune, clear or match
+/// by accident. The one entry that outlives its guard is an abandoned launch's, kept until the
+/// session goes so that it absorbs the process its still-queued create produces
+/// ([`Arrivals::forget`], dbgscope#141) — and retiring that one is what the clears at a session's
+/// end and replacement are still for.
 ///
 /// It also gives each open an identity, which is what closes the ambiguity [`Arrival`] used to
 /// document as accepted: two launches pending at once could not be told apart, because the first
@@ -9080,10 +9083,11 @@ impl DebugEngine {
     /// hurt: the operating system reusing it for a process this engine went on to launch, which
     /// would then be detached from and survive a session that is supposed to take it.
     ///
-    /// The pending opens go for a narrower reason than the record they replace did. An entry
-    /// cannot outlive its guard, so nothing here is about staleness across time; what it is about
-    /// is a guard held *across* a session replacement, whose `(engine id, pid)` predicate would
-    /// otherwise be evaluated against a session it never asked about. Forgetting the entry leaves
+    /// The pending opens go for a narrower reason than the record they replace did. Two kinds of
+    /// entry reach here: a guard held *across* a session replacement, whose `(engine id, pid)`
+    /// predicate would otherwise be evaluated against a session it never asked about; and an
+    /// abandoned launch's, the one entry that outlives its guard ([`Arrivals::forget`]), which
+    /// would otherwise go on waiting into the next session. Forgetting the entry leaves
     /// [`Arrivals::presence`] answering [`Presence::Absent`] for it, which is the truth.
     ///
     /// **And it reissues the target identity, which is why that lives here rather than in the
@@ -9191,9 +9195,11 @@ impl DebugEngine {
         // sharper reason -- engine process ids are handed out from zero again for the next
         // session, so a pair that outlived this one was matched by a later process that inherited
         // both numbers, which for two `attach_process` calls to the same pid on one engine is the
-        // ordinary case rather than a coincidence. Nothing outlives its guard any more, so what is
-        // left here is tidiness rather than a hazard. (`detach_attached_processes` already takes
-        // the attach record; this is the other half of what a session owns.)
+        // ordinary case rather than a coincidence. Only an abandoned launch's entry outlives its
+        // guard now, and it is why this is more than tidiness: its create dies with the session,
+        // so left here it would wait on into the next one and take that session's first launch's
+        // stop. (`detach_attached_processes` already takes the attach record; this is the other
+        // half of what a session owns.)
         //
         // **The condition is `EndSession`'s own outcome and not the value this returns**, which
         // are two different facts wherever a detach fails: the `.and` above reports that failure to
@@ -9522,9 +9528,11 @@ enum WaitKind<'a> {
 /// to complete a guard that is still held: [`PendingTarget`] documents driving the engine yourself
 /// as a thing to do, and until the entry exists there is nobody for a stop to be delivered to.
 ///
-/// **Forgotten on drop, and that is the whole of the lifecycle** the record it replaces needed
-/// pruning, clearing and a review round each for. An entry cannot outlive the open that made it,
-/// so there is no stale arrival for a reused engine id or a reused pid to match.
+/// **Forgotten on drop, and that is nearly the whole of the lifecycle** the record it replaces
+/// needed pruning, clearing and a review round each for. An entry does not outlive the open that
+/// made it, so there is no stale arrival for a reused engine id or a reused pid to match. The
+/// exception is a launch dropped before it was delivered anything: [`Arrivals::forget`] keeps its
+/// entry for the process its queued create still produces, and the session's end retires it.
 struct Registered<'a> {
     engine: &'a DebugEngine,
     id: ArrivalId,
@@ -9576,11 +9584,11 @@ impl Drop for Registered<'_> {
 ///
 /// dbgscope#136 stage 3 removes most of it, and removes that cost with it. An arrival is delivered
 /// to a registered open ([`Arrivals`]) and **claimed** by it, so the second launch is still waiting
-/// when the next one comes; and because an entry cannot outlive the guard that made it, there is no
-/// stale claim to prune or clear. The record whose lifecycle made the fix expensive was the thing
-/// the fix would have joined. A guard that finishes and is dropped hands its claim to the opens
-/// still waiting ([`Arrivals::forget`]), so no process is given to two opens, whether both guards
-/// are live or one was delivered and dropped.
+/// when the next one comes; and because an entry does not outlive the guard that made it, bar an
+/// abandoned launch's (below), there is no stale claim to prune or clear. The record whose
+/// lifecycle made the fix expensive was the thing the fix would have joined. A guard that finishes
+/// and is dropped hands its claim to the opens still waiting ([`Arrivals::forget`]), so no process
+/// is given to two opens, whether both guards are live or one was delivered and dropped.
 ///
 /// **What is left is identification, and it is dbgscope#141.** A claim makes arrivals *distinct*,
 /// not *attributed*: [`Arrivals::deliver`] offers in registration order, but one `WaitForEvent`
@@ -9590,14 +9598,15 @@ impl Drop for Registered<'_> {
 /// hands back no pid to match. It is documented rather than built; the issue records why, and what
 /// would change that.
 ///
-/// **A launch abandoned before it is delivered anything keeps its entry** ([`Arrivals::forget`]).
-/// Its `CreateProcessWide` is still queued, and the process it produces is new to the next launch's
-/// snapshot — so without the entry the next launch claimed it and its `wait()` returned before its
-/// own process had stopped. Nothing has to retire an entry for a launch that cannot start, because
-/// no such entry is constructible: a missing image fails at [`DebugEngine::launch_process_begin`],
-/// before any guard exists (`0x80070002` in 1.5 ms, `examples/abandoned_launch.rs` arm B). An open
-/// that pumps its whole bound and sees nothing is discarded rather than kept
-/// ([`Arrivals::discard`]).
+/// **A launch abandoned before it is delivered anything keeps its entry until the session goes**
+/// ([`Arrivals::forget`]). Its `CreateProcessWide` is still queued, and the process it produces is
+/// new to the next launch's snapshot — so without the entry the next launch claimed it and its
+/// `wait()` returned before its own process had stopped. A missing image leaves no entry behind:
+/// it fails at [`DebugEngine::launch_process_begin`], before any guard exists (`0x80070002` in
+/// 1.5 ms, `examples/abandoned_launch.rs` arm B). What would strand one is a process that is
+/// created and never stops, which nothing has measured: its entry would stay waiting and take the
+/// next launch's stop. An open that pumps its whole bound and sees nothing is discarded rather
+/// than kept ([`Arrivals::discard`]).
 #[derive(Debug)]
 enum Arrival {
     /// A process this engine launched: one the session did not hold when the launch was issued and
@@ -10432,9 +10441,9 @@ mod tests {
             "the second launch was not given the arrival nobody had claimed"
         );
 
-        // An entry dies with its guard, and an id that names nothing is `Absent` -- which is what
-        // a guard held across a session replacement reads, and the whole of the lifecycle the
-        // record this replaces needed a prune and two clears for.
+        // A delivered entry dies with its guard, and an id that names nothing is `Absent` -- which
+        // is what a guard held across a session replacement reads, and the whole of the lifecycle
+        // the record this replaces needed a prune and two clears for.
         arrivals.forget(first);
         assert_eq!(
             arrivals.presence(first, &[(0, 100)], &none),
@@ -16349,9 +16358,10 @@ mod tests {
     /// it was review that put it there.
     ///
     /// **The construction that makes it unreachable** is that an arrival is delivered to a
-    /// registered open rather than broadcast into a set: an entry cannot outlive the guard that
-    /// made it, so the reattach's open starts with nothing delivered to it whatever numbers it
-    /// inherits. There is no record left to prune, and the prune's arrival half is gone with it.
+    /// registered open rather than broadcast into a set: an attach's entry cannot outlive the guard
+    /// that made it (only an abandoned *launch's* is kept), so the reattach's open starts with
+    /// nothing delivered to it whatever numbers it inherits. There is no record left to prune, and
+    /// the prune's arrival half is gone with it.
     ///
     /// Kept as an end-to-end statement of that rather than deleted, since it costs one attach: the
     /// second process is what makes this a *detach* rather than a teardown, so nothing else could
