@@ -38,10 +38,16 @@ use windows::Win32::System::Diagnostics::Debug::Extensions::{
     IDebugEventContextCallbacks, IDebugOutputCallbacks, IDebugRegisters, IDebugSymbols3,
     IDebugSystemObjects,
 };
+// The debugger data model, for what TTD publishes there and nowhere else: a replay's position.
+use windows::Win32::System::Diagnostics::Debug::Extensions::{
+    DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_IDNA, IDebugHost, IDebugHostEvaluator,
+    IHostDataModelAccess, IModelMethod, IModelObject,
+};
 use windows::Win32::System::Diagnostics::Debug::{EXCEPTION_RECORD64, IMAGEHLP_MODULEW64};
 use windows::Win32::System::Memory::{
     MEM_COMMIT, MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION64,
 };
+use windows::Win32::System::Variant::{VT_I4, VT_I8, VT_UI4, VT_UI8, VT_UNKNOWN, VariantClear};
 
 /// What a [`BreakpointCallback`] tells the engine to do about the hit it was handed: the
 /// `DEBUG_STATUS_*` an `IDebugEventContextCallbacks::Breakpoint` returns.
@@ -1354,6 +1360,12 @@ pub enum RunToOutcome {
 pub struct RunToResult {
     pub outcome: RunToOutcome,
     pub output: String,
+    /// Where a TTD replay was left when this run was cut short on one, as [`CommandRun::replay`]
+    /// says it: a [`RunToOutcome::Timeout`], or a [`RunToOutcome::StoppedElsewhere`] that a host's
+    /// break ended, whose `stopped_at` is then where the run was put back to. Never a
+    /// [`RunToOutcome::Hit`], which is a real stop at `address` however close to the deadline it
+    /// landed.
+    pub replay: Option<ReplayLanding>,
 }
 
 /// Why a command stopped before it finished.
@@ -1495,6 +1507,14 @@ pub struct CommandRun {
     /// `ntdll!LdrShutdownProcess`, and the target goes away on the *next* resume, which is where
     /// the pump reports it.)
     pub target_gone: bool,
+    /// Where a **TTD replay** was left, when this run was cut short on one — put back where the
+    /// run started, or, failing that, wherever TTD put it. See [`ReplayLanding`] for why a replay
+    /// needs saying apart: the position TTD leaves an interrupted replay at is not where the run
+    /// had got to, and is usually past every breakpoint it had not reached.
+    ///
+    /// `None` on every other target, on a replay that stopped by itself, and on a run that was
+    /// not cut short.
+    pub replay: Option<ReplayLanding>,
 }
 
 impl CommandRun {
@@ -1503,6 +1523,76 @@ impl CommandRun {
     pub fn into_output(self) -> String {
         self.output
     }
+}
+
+/// A position in a Time Travel Debugging trace: the `Sequence:Steps` pair that `!tt` takes and
+/// `dx @$curthread.TTD.Position` shows, as numbers rather than as that text.
+///
+/// Ordered as the recording is — by sequence, then by steps within one — so `a < b` means `a`
+/// comes first in the trace, which is the comparison TTD itself makes between positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TtdPosition {
+    pub sequence: u64,
+    pub steps: u64,
+}
+
+impl std::fmt::Display for TtdPosition {
+    /// `8E6:0`: both halves in uppercase hex with no prefix, which is how TTD prints a position
+    /// and how `!tt` reads one back.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:X}:{:X}", self.sequence, self.steps)
+    }
+}
+
+/// Where a TTD replay was left when a run on it was cut short — at its bound or by a host's break
+/// — which on a replay is a different question from where the run had got to.
+///
+/// **TTD does not leave an interrupted replay where it had reached.** It prints *"Replay was
+/// interrupted by the user. The current position is approximately how far we had gone."*, and
+/// then the position is one of its own choosing: measured, usually the trace's **end** for a
+/// forward run — past every breakpoint the run had not reached, with no hit reported for any of
+/// them — and now and then a breakpoint itself, again with no hit (windbg-mcp item 125, on ARM64
+/// and x64 alike, indexed traces and unindexed, bounds of 1 ms to 2 s). So a caller reading the
+/// stop as progress concludes that a breakpoint ahead is never hit, and the next `g` answers
+/// `End of trace reached` as an ordinary stop.
+///
+/// So the bounded paths put it back: the position is taken before the run, and a run cut short
+/// travels back to it. That makes a cut-short replay one that made **no** progress, which is the
+/// truth — TTD threw the progress away — and the retry is a longer bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayLanding {
+    /// Travelled back to `to`, where the run started, and confirmed there — position and current
+    /// thread both read back. No breakpoint was passed: going on from here reaches the first one
+    /// ahead.
+    Rewound { to: TtdPosition },
+    /// The travel back failed, or did not arrive where it was aimed, so the replay is wherever TTD
+    /// put it: `left_at`, where that could be read. **Any breakpoint between `from` and there may
+    /// have been skipped without a hit.** `from` is `None` when the starting position could not be
+    /// read either, so there was nothing to travel back to.
+    NotRewound {
+        from: Option<TtdPosition>,
+        left_at: Option<TtdPosition>,
+    },
+}
+
+/// The current thread's position as the data model holds it, taken before a run so that a
+/// cut-short one can be put back — see [`ReplayLanding`].
+///
+/// It keeps the model **object** as well as its value, because the travel back is that object's
+/// own `SeekTo`: measured, a position object read before a run seeks back to its position after
+/// the run, in about 1.5 ms, leaving the engine at a break with nothing to pump. Holding it across
+/// the wait is sound for the reason every engine call here is — one thread.
+enum ReplayMark {
+    /// Not a TTD target, so there is nothing to put back.
+    NotAReplay,
+    /// A replay whose position could not be read: a run cut short on it cannot be put back, and
+    /// says so rather than passing for a target that is not a replay.
+    Unread,
+    Read {
+        object: IModelObject,
+        position: TtdPosition,
+        thread: Option<u32>,
+    },
 }
 
 /// What one of [`DebugEngine::spend_pending_break_ins`]'s resumes settled about the break-ins a
@@ -3548,6 +3638,67 @@ pub fn decode_instruction(bytes: &[u8], address: u64, set: InstructionSet) -> In
     }
 }
 
+/// The data-model object under `key` on `object` — one step of a `dx` path, typed.
+fn model_key(object: &IModelObject, key: &str) -> windows::core::Result<IModelObject> {
+    let key = windows::core::HSTRING::from(key);
+    let mut value = None;
+    unsafe { object.GetKeyValue(PCWSTR(key.as_ptr()), Some(&mut value), None) }?;
+    value.ok_or_else(|| windows::core::Error::from_hresult(E_UNEXPECTED))
+}
+
+/// An intrinsic data-model value as a `u64`, refusing anything that is not an unsigned or
+/// non-negative integer.
+///
+/// TTD's `Sequence` and `Steps` are `VT_UI8` (measured); the narrower and signed integer types are
+/// accepted because a model value's variant type is the provider's choice, and a negative one is
+/// refused rather than wrapped into a position that does not exist.
+fn model_u64(object: &IModelObject) -> windows::core::Result<u64> {
+    let mut value = unsafe { object.GetIntrinsicValue() }?;
+    // Read inside the union and cleared before anything can return, so an object-valued variant
+    // this does not expect still has its reference released.
+    let (kind, read) = unsafe {
+        let inner = &value.Anonymous.Anonymous;
+        let read = match inner.vt {
+            VT_UI8 => Some(inner.Anonymous.ullVal),
+            VT_UI4 => Some(u64::from(inner.Anonymous.ulVal)),
+            VT_I8 => u64::try_from(inner.Anonymous.llVal).ok(),
+            VT_I4 => u64::try_from(inner.Anonymous.lVal).ok(),
+            _ => None,
+        };
+        (inner.vt, read)
+    };
+    let _ = unsafe { VariantClear(&mut value) };
+    read.ok_or_else(|| {
+        windows::core::Error::new(
+            E_INVALIDARG,
+            format!(
+                "a data-model value of variant type {} is not a position",
+                kind.0
+            ),
+        )
+    })
+}
+
+/// Calls the data-model method `name` on `object` with no arguments — `object.name()` in `dx`.
+fn call_model_method(object: &IModelObject, name: &str) -> windows::core::Result<()> {
+    let mut method = unsafe { model_key(object, name)?.GetIntrinsicValue() }?;
+    // A method is an intrinsic `VT_UNKNOWN` holding the `IModelMethod`. Cloned out — an `AddRef`
+    // — so the clear below releases the variant's own reference and not the one used here.
+    let unknown = unsafe {
+        let inner = &method.Anonymous.Anonymous;
+        match inner.vt {
+            VT_UNKNOWN => (*inner.Anonymous.punkVal).clone(),
+            _ => None,
+        }
+    };
+    let _ = unsafe { VariantClear(&mut method) };
+    let method: IModelMethod = unknown
+        .ok_or_else(|| windows::core::Error::from_hresult(E_NOINTERFACE))?
+        .cast()?;
+    let mut result = None;
+    unsafe { method.Call(object, &[], &mut result, None) }
+}
+
 /// Reads a string out of one of DbgEng's two-call string getters.
 ///
 /// They all take the same shape — a buffer, its length, and an out-parameter for the size the
@@ -4521,6 +4672,17 @@ impl DebuggeeType {
     pub fn is_live_kernel(self) -> bool {
         // Dump qualifiers are >= DEBUG_KERNEL_SMALL_DUMP; live connections are below it.
         self.is_kernel() && self.qualifier < DEBUG_KERNEL_SMALL_DUMP
+    }
+
+    /// Whether this is a **Time Travel Debugging replay**: a user-mode target with the
+    /// `DEBUG_USER_WINDOWS_IDNA` qualifier — iDNA being TTD's name before it shipped.
+    ///
+    /// Not a dump qualifier, though a trace is opened like a dump (`OpenDumpFileWide`) and reads
+    /// like one in every other respect: measured on an x64 host, 2026-11-06, a `.run` opened by
+    /// [`DebugEngine::open_trace`] answers class 2, qualifier 2, where a user minidump answers
+    /// 2 / 1024.
+    pub fn is_ttd_replay(self) -> bool {
+        self.class == DEBUG_CLASS_USER_WINDOWS && self.qualifier == DEBUG_USER_WINDOWS_IDNA
     }
 }
 
@@ -6193,6 +6355,11 @@ impl DebugEngine {
             // later pump will ever mention it. The guard at the top is what makes this mean
             // "this command did it" rather than "there was never anything here".
             target_gone: self.lost_its_target(),
+            // Nothing here pumps, so nothing here runs a replay: a resume this command set going
+            // is [`Self::settle`]'s to drive, and it puts a cut-short replay back there. A command
+            // that travels inside `Execute` itself (`!tt`) is not a run, and an interrupted one
+            // has not been measured.
+            replay: None,
         })
     }
 
@@ -6399,6 +6566,13 @@ impl DebugEngine {
     /// passing with the target still going, so the break is this crate's own and the position is
     /// wherever the target happened to be; `None` is the target stopping on its own.
     ///
+    /// **Except on a TTD replay, where a run cut short is put back where it started**, and
+    /// [`CommandRun::replay`] says so. TTD does not leave an interrupted replay where it had got
+    /// to but somewhere of its own choosing, usually past every breakpoint ahead — see
+    /// [`ReplayLanding`] — so "wherever it happened to be" would be a position the run never
+    /// reached. The position is read before the run on every dump-class target, which on a replay
+    /// is one data-model evaluation and on anything else is one `GetDebuggeeType`.
+    ///
     /// **The wait is [`Bound::Watchdog`] for every target type, and that is load
     /// bearing rather than uniform-for-neatness.** A live kernel needs the INFINITE wait because a
     /// finite one returns `E_NOTIMPL` there — but a finite `WaitForEvent` is not usable on the
@@ -6423,6 +6597,9 @@ impl DebugEngine {
 
         let cmd_c = CString::new(command).map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
+
+        // Before the run and before the capture, so the evaluation prints into neither.
+        let mark = self.replay_mark();
 
         let mut output_buffer = Vec::<u8>::with_capacity(4096);
         let output_callbacks = OutputCallbacks::new(&mut output_buffer);
@@ -6470,9 +6647,14 @@ impl DebugEngine {
         // answering `E_UNEXPECTED`, and reporting that is reporting a program's ordinary ending
         // as a catastrophe — while discarding the output the run had already captured.
         let target_gone = self.lost_its_target();
+        let mut replay = None;
         if interrupted {
             // As there: consume anything the engine did not, so the next operation starts clean.
             let _ = self.interrupted();
+            // After the consume, so the travel back cannot be what a stale break lands on.
+            if !target_gone {
+                replay = self.rewind_replay(mark);
+            }
         } else if !target_gone {
             exec.map_err(|source| printed(DbgEngError::CommandFailed(source), &output_buffer))?;
             waited.map_err(|error| printed(error, &output_buffer))?;
@@ -6482,6 +6664,7 @@ impl DebugEngine {
             output: String::from_utf8_lossy(&output_buffer).to_string(),
             cut_short,
             target_gone,
+            replay,
         })
     }
 
@@ -6584,6 +6767,11 @@ impl DebugEngine {
         }
         // A break asked for from here on names this operation; see `execute_command_bounded`.
         let operation = self.begin_operation();
+        // Where a replay is, read *after* the command set the run state and before anything moved
+        // it — which is the same place, because only the pump below moves a target. Measured: an
+        // `Execute("g")` on a replay leaves `DEBUG_STATUS_GO` and the position still reads, and
+        // reads where the replay stood.
+        let mark = self.replay_mark();
 
         // Captured, because the pump is where the interesting output is: the command that set the
         // run state printed only its own echo, and the breakpoint banner, module loads and stop
@@ -6617,8 +6805,13 @@ impl DebugEngine {
         // the module loads and anything an embedded script printed, precisely on the run that
         // has no successor to print them again.
         let target_gone = self.lost_its_target();
+        let mut replay = None;
         if interrupted {
             let _ = self.interrupted();
+            // As in `execute_and_wait`, and after the consume for its reason.
+            if !target_gone {
+                replay = self.rewind_replay(mark);
+            }
         } else if !target_gone {
             waited.map_err(|error| printed(error, &output_buffer))?;
         }
@@ -6627,6 +6820,7 @@ impl DebugEngine {
             output: String::from_utf8_lossy(&output_buffer).to_string(),
             cut_short,
             target_gone,
+            replay,
         }))
     }
 
@@ -6684,6 +6878,9 @@ impl DebugEngine {
 
         let cmd_c = CString::new("g").map_err(|_| DbgEngError::InvalidCommand)?;
         let cmd = PCSTR::from_raw(cmd_c.as_ptr() as *const u8);
+
+        // As in `execute_and_wait`: where a replay stands, so a run cut short can be put back.
+        let mark = self.replay_mark();
 
         let mut output_buffer = Vec::<u8>::with_capacity(4096);
         let output_callbacks = OutputCallbacks::new(&mut output_buffer);
@@ -6743,36 +6940,61 @@ impl DebugEngine {
             return Ok(RunToResult {
                 outcome: RunToOutcome::TargetGone,
                 output,
+                replay: None,
             });
         }
         exec.map_err(|source| printed(DbgEngError::CommandFailed(source), output.as_bytes()))?;
         waited.map_err(|error| printed(error, output.as_bytes()))?;
+
+        // A break of either origin that did not land on `address`. On a replay that is TTD's
+        // landing rather than the run's, and is put back before anything below reads a position —
+        // see `ReplayLanding`. One that did land there is a hit, as it always was.
+        //
+        // Read once, before the travel: a run put back to where it started is not a hit even when
+        // it started at `address`.
+        let landed = cut_short.is_some() && self.instruction_pointer().ok() == Some(address);
+        let replay = match cut_short {
+            Some(_) if !landed => {
+                // Consumed first, as `execute_and_wait` does, so the travel back cannot be what a
+                // stale break lands on.
+                let _ = self.interrupted();
+                self.rewind_replay(mark)
+            }
+            _ => None,
+        };
 
         if expired {
             // The watchdog has already broken the target in, so the caller is not left with a
             // running one. A hit landing in the same window as the deadline is still a hit, so
             // consult the instruction pointer before concluding otherwise — leniently, since a
             // failed read here means "no clean stop to report", which is the timeout.
-            if self.instruction_pointer().ok() == Some(address) {
+            if landed {
                 return Ok(RunToResult {
                     outcome: RunToOutcome::Hit,
                     output,
+                    replay,
                 });
             }
             return Ok(RunToResult {
                 outcome: RunToOutcome::Timeout,
                 output,
+                replay,
             });
         }
 
-        // The target stopped on its own.
+        // The target stopped on its own — or a host broke in, which a replay put back above, so
+        // the position read here is where it was put rather than where TTD left it.
         let rip = self.instruction_pointer()?;
-        let outcome = if rip == address {
+        let outcome = if rip == address && replay.is_none() {
             RunToOutcome::Hit
         } else {
             RunToOutcome::StoppedElsewhere { stopped_at: rip }
         };
-        Ok(RunToResult { outcome, output })
+        Ok(RunToResult {
+            outcome,
+            output,
+            replay,
+        })
     }
 
     /// Hands every breakpoint event this client receives to `callback`, and answers the engine with
@@ -7270,6 +7492,125 @@ impl DebugEngine {
             });
         }
         Ok(out)
+    }
+
+    /// The current thread's position in a **TTD trace**, or `None` when the target is not one.
+    ///
+    /// Read through the debugger data model (`@$curthread.TTD.Position`, its `Sequence` and
+    /// `Steps`), which is where TTD publishes it; the alternatives are `!tt` and `dx` text. Whether
+    /// the target is a trace at all is [`DebuggeeType::is_ttd_replay`], so on anything else this
+    /// costs one `GetDebuggeeType` and asks the model nothing.
+    ///
+    /// An `Err` is a replay whose position could not be read, and is never folded into `None`:
+    /// `None` means *not a trace* and nothing else. Where the target type itself cannot be read,
+    /// the model is asked whether there is a TTD session (`@$cursession.TTD`) instead, so an
+    /// unreadable type is not taken for an answer in either direction.
+    pub fn ttd_position(&self) -> Result<Option<TtdPosition>, DbgEngError> {
+        Ok(self.ttd_position_object()?.map(|(_, position)| position))
+    }
+
+    /// [`Self::ttd_position`] with the model object it was read from, which is what a travel back
+    /// needs — see [`ReplayMark`].
+    fn ttd_position_object(&self) -> Result<Option<(IModelObject, TtdPosition)>, DbgEngError> {
+        let replay = match self.debuggee_type() {
+            Ok(kind) => kind.is_ttd_replay(),
+            Err(_) => self.evaluate_model("@$cursession.TTD").is_ok(),
+        };
+        if !replay {
+            return Ok(None);
+        }
+        let read = || -> windows::core::Result<(IModelObject, TtdPosition)> {
+            let object = self.evaluate_model("@$curthread.TTD.Position")?;
+            let position = TtdPosition {
+                sequence: model_u64(&model_key(&object, "Sequence")?)?,
+                steps: model_u64(&model_key(&object, "Steps")?)?,
+            };
+            Ok((object, position))
+        };
+        read().map(Some).map_err(|source| DbgEngError::Context {
+            operation: "reading the TTD position".into(),
+            source,
+        })
+    }
+
+    /// Evaluates a fixed data-model expression in the current context — the `dx` evaluator, as
+    /// an object rather than as text.
+    ///
+    /// Private, and given only literals written in this file: it is not a way for a caller's text
+    /// to reach the engine, which is [`Self::execute_command`]'s door and guarded there.
+    fn evaluate_model(&self, expression: &str) -> windows::core::Result<IModelObject> {
+        let access: IHostDataModelAccess = self.client.cast()?;
+        let mut manager = None;
+        let mut host = None;
+        unsafe { access.GetDataModel(&mut manager, &mut host) }?;
+        let host: IDebugHost =
+            host.ok_or_else(|| windows::core::Error::from_hresult(E_UNEXPECTED))?;
+        let evaluator: IDebugHostEvaluator = host.cast()?;
+        let context = unsafe { host.GetCurrentContext() }?;
+        let expression = windows::core::HSTRING::from(expression);
+        let mut result = None;
+        unsafe {
+            evaluator.EvaluateExtendedExpression(
+                &context,
+                PCWSTR(expression.as_ptr()),
+                None::<&IModelObject>,
+                &mut result,
+                None,
+            )
+        }?;
+        result.ok_or_else(|| windows::core::Error::from_hresult(E_UNEXPECTED))
+    }
+
+    /// Where the replay is, taken before a run that may be cut short — see [`ReplayMark`].
+    fn replay_mark(&self) -> ReplayMark {
+        match self.ttd_position_object() {
+            Ok(None) => ReplayMark::NotAReplay,
+            Ok(Some((object, position))) => ReplayMark::Read {
+                object,
+                position,
+                thread: self.current_thread_system_id().ok(),
+            },
+            Err(_) => ReplayMark::Unread,
+        }
+    }
+
+    /// Puts a replay whose run was cut short back where the run started, and says where it ended
+    /// up — `None` when the target is not a replay. See [`ReplayLanding`].
+    ///
+    /// **Confirmed by reading back, not by `SeekTo` succeeding.** The position and the current
+    /// thread are both read again and compared with the mark, and anything short of both matching
+    /// is [`ReplayLanding::NotRewound`] carrying where it is instead. The thread is part of it
+    /// because a position is the current thread's: a travel that arrived at the right moment on
+    /// another thread would leave every register read answering about the wrong one.
+    ///
+    /// Measured: the travel leaves the engine at a break (`DEBUG_STATUS_BREAK`), so there is
+    /// nothing to pump after it, and takes about 1.5 ms on the traces it was measured on.
+    fn rewind_replay(&self, mark: ReplayMark) -> Option<ReplayLanding> {
+        let (object, position, thread) = match mark {
+            ReplayMark::NotAReplay => return None,
+            ReplayMark::Unread => {
+                return Some(ReplayLanding::NotRewound {
+                    from: None,
+                    left_at: self.ttd_position().ok().flatten(),
+                });
+            }
+            ReplayMark::Read {
+                object,
+                position,
+                thread,
+            } => (object, position, thread),
+        };
+        let sought = call_model_method(&object, "SeekTo");
+        let now = self.ttd_position().ok().flatten();
+        let on = self.current_thread_system_id().ok();
+        if sought.is_ok() && now == Some(position) && on == thread {
+            Some(ReplayLanding::Rewound { to: position })
+        } else {
+            Some(ReplayLanding::NotRewound {
+                from: Some(position),
+                left_at: now,
+            })
+        }
     }
 
     /// The current instruction pointer, read typed via `IDebugRegisters` (no text parse).
@@ -10033,6 +10374,30 @@ mod tests {
     /// would call a small kernel dump a live connection, and a live connection is the one target
     /// whose `WaitForEvent` must be INFINITE — a finite one there answers `E_NOTIMPL`, so the
     /// mistake surfaces as a teardown that will not run rather than as a wrong label.
+    /// A trace is the IDNA qualifier and nothing else — not a dump qualifier, which is what it is
+    /// opened as, and not the same number on the kernel class, where `DEBUG_KERNEL_*` gives 2 a
+    /// meaning of its own.
+    #[test]
+    fn test_a_replay_is_the_idna_qualifier_on_a_user_target() {
+        let kind = |class, qualifier| DebuggeeType { class, qualifier };
+        assert!(kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_IDNA).is_ttd_replay());
+        for qualifier in [DEBUG_USER_WINDOWS_PROCESS, DEBUG_USER_WINDOWS_SMALL_DUMP] {
+            assert!(!kind(DEBUG_CLASS_USER_WINDOWS, qualifier).is_ttd_replay());
+        }
+        assert!(!kind(DEBUG_CLASS_KERNEL, DEBUG_USER_WINDOWS_IDNA).is_ttd_replay());
+    }
+
+    /// Ordered as the recording is — sequence first, steps within it — and printed the way `!tt`
+    /// reads a position back, which is what a caller pasting one into it needs.
+    #[test]
+    fn test_a_ttd_position_orders_by_sequence_then_steps_and_prints_as_tt_reads_it() {
+        let at = |sequence, steps| TtdPosition { sequence, steps };
+        assert!(at(0x894, 0x1580) < at(0x8E6, 0));
+        assert!(at(0x894, 0x157F) < at(0x894, 0x1580));
+        assert_eq!(at(0x894, 0x1580).to_string(), "894:1580");
+        assert_eq!(at(0xE, 0).to_string(), "E:0");
+    }
+
     #[test]
     fn test_a_kernel_dump_is_a_kernel_target_and_not_a_live_one() {
         let kind = |class, qualifier| DebuggeeType { class, qualifier };
@@ -10063,6 +10428,7 @@ mod tests {
         // An engine holding nothing says so, and says it as a class rather than as a failure.
         let nothing = kind(DEBUG_CLASS_UNINITIALIZED, 0);
         assert!(!nothing.is_kernel() && !nothing.is_live_kernel());
+        assert!(!nothing.is_ttd_replay());
 
         // The pair compares whole, which is what a caller watching for a target being swapped
         // underneath it reads: a live kernel and a kernel dump are both kernel targets and are
@@ -10088,6 +10454,7 @@ mod tests {
             output: String::new(),
             cut_short,
             target_gone,
+            replay: None,
         }
     }
 
@@ -16167,6 +16534,47 @@ mod tests {
             scope.running.is_empty() && scope.asked.is_empty(),
             "a timed-out run left {scope:?} behind, so the next operation inherits it"
         );
+    }
+
+    /// **A live target is not a replay, and a run cut short on one is left where it stopped.**
+    ///
+    /// The other half of `ReplayLanding`, and the half CI can reach: no trace is recorded there
+    /// (that needs `TTD.exe` and elevation), so what is pinned here is that the travel back is
+    /// confined to replays — a live process answers no position, and its deadline-broken runs
+    /// carry no landing on any of the three bounded paths. The replay half is
+    /// `examples/ttd_position_probe.rs`, run against a recorded trace.
+    #[test]
+    #[cfg(not(miri))]
+    fn test_a_live_target_is_no_replay_and_is_not_put_back() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        e.launch_process("ping.exe -n 30 127.0.0.1")
+            .expect("launch failed");
+        assert!(!e.debuggee_type().expect("type").is_ttd_replay());
+        assert_eq!(e.ttd_position().expect("a position read"), None);
+
+        let here = e
+            .instruction_pointer()
+            .expect("could not read the instruction pointer");
+        let reached = e.run_to_address(here, 0).expect("run_to_address failed");
+        assert!(
+            matches!(reached.outcome, RunToOutcome::Timeout),
+            "{:?}",
+            reached.outcome
+        );
+        assert_eq!(reached.replay, None);
+
+        let run = e.execute_and_wait("g", 0).expect("g failed");
+        assert!(run.cut_short.is_some(), "the bound did not cut it short");
+        assert_eq!(run.replay, None);
+
+        e.execute_command("g").expect("could not set the run state");
+        let settled = e.settle(0).expect("settle failed").expect("it was running");
+        assert!(
+            settled.cut_short.is_some(),
+            "the bound did not cut it short"
+        );
+        assert_eq!(settled.replay, None);
     }
 
     /// **A host that asks for control back gets it**, rather than being held for the rest of the

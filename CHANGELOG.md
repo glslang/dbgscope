@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Migration from 0.3
+
+- `CommandRun` and `RunToResult` gain a public `replay` field; struct literals add
+  `replay: None`.
+
+### Added
+
+- **`DebugEngine::ttd_position` reads a TTD replay's position typed**, as a `TtdPosition`
+  (`sequence`, `steps`, ordered as the trace is, printing as `!tt` reads it), through the debugger
+  data model rather than `!tt` or `dx` text. It answers `None` on anything that is not a trace, and
+  `DebuggeeType::is_ttd_replay` is how it tells: a `.run` opened by `open_trace` reports qualifier
+  `DEBUG_USER_WINDOWS_IDNA`, not a dump qualifier.
+
+### Changed
+
+- **A run cut short on a TTD replay is put back where it started.** TTD does not leave an
+  interrupted replay where it had got to; it usually moves it to the trace's end, past every
+  breakpoint the run had not reached, with no hit reported (windbg-mcp item 125). `execute_and_wait`,
+  `settle` and `run_to_address` now read the position before the run and, when a deadline or a
+  host's break cuts it short, seek back through the position object's own `SeekTo` and read the
+  position and current thread again to confirm. `CommandRun::replay` and `RunToResult::replay`
+  carry the outcome as a `ReplayLanding`: `Rewound`, or `NotRewound` with both positions when the
+  travel back failed. On every other target they are `None`, at the cost of one `GetDebuggeeType`
+  per resume. `examples/ttd_position_probe.rs` holds the measurements.
+- The library's `windows` dependency adds `Win32_System_Com`, `Win32_System_Ole` and
+  `Win32_System_Variant`, which `IModelObject::GetIntrinsicValue` is gated on.
+
 ## [0.3.0] - 2026-10-17
 
 This release lets a breakpoint callback read its hit and decide whether the target stops, decodes
