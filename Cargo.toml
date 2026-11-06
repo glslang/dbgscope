@@ -72,6 +72,12 @@ features = [
     # object manager's own fold rather than a reproduction of it. Under `Wdk` rather than `Win32`
     # because that is where Microsoft's metadata puts the ntdll Rtl surface.
     "Wdk_System_SystemServices",
+    # The debugger data model's values arrive as `VARIANT`s (`IModelObject::GetIntrinsicValue`),
+    # and the `windows` crate gates that method on all three — which is how a TTD position is read
+    # and sought typed rather than through `!tt` and `dx` text (`DebugEngine::ttd_position`).
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
 ]
 
 # `examples/undecoded_families.rs` only, which decodes every 32-bit word twice -- once with this
