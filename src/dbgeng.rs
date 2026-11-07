@@ -301,6 +301,9 @@ pub enum DbgEngError {
     #[error("this scope was read from a target the engine no longer holds")]
     ScopeFromAnotherTarget,
 
+    #[error("this thread selection was read from a target the engine no longer holds")]
+    ThreadSelectionFromAnotherTarget,
+
     /// The sibling of [`Self::ScopeFromAnotherTarget`], for the same hazard on the other saved
     /// register state this crate hands out.
     ///
@@ -5310,6 +5313,99 @@ impl DebugEngine {
         })
     }
 
+    /// Selects one thread by its operating-system id and restores the prior process, thread and
+    /// scope when the returned guard is dropped.
+    ///
+    /// `thread_system_id` is the id the debuggee and operating system use, not DbgEng's per-process
+    /// thread index. The mapping is performed by `IDebugSystemObjects::GetThreadIdBySystemId`, and
+    /// the engine index is exposed separately on [`ThreadSelectionGuard`] so the two namespaces
+    /// cannot be confused by a caller.
+    ///
+    /// The guard saves the current process as well as the thread because DbgEng thread indices are
+    /// process-relative, and saves the scope because selecting a thread resets the register/frame
+    /// view. Restoration therefore happens in process, thread, scope order on success, error and
+    /// panic unwinding. A caller that needs to report a restoration failure can call
+    /// [`ThreadSelectionGuard::restore`] before returning; drop repeats the same idempotent restore
+    /// as a best effort.
+    pub fn thread_selection_guard(
+        &self,
+        thread_system_id: u32,
+    ) -> Result<ThreadSelectionGuard<'_>, DbgEngError> {
+        let objects = self.system_objects()?;
+        let process_system_id =
+            unsafe { objects.GetCurrentProcessSystemId() }.map_err(|source| {
+                DbgEngError::Context {
+                    operation: "reading the current process system id".into(),
+                    source,
+                }
+            })?;
+        let thread_system_id_before =
+            unsafe { objects.GetCurrentThreadSystemId() }.map_err(|source| {
+                DbgEngError::Context {
+                    operation: "reading the current thread system id".into(),
+                    source,
+                }
+            })?;
+        let scope = self.scope()?;
+        let selected_engine_id = unsafe { objects.GetThreadIdBySystemId(thread_system_id) }
+            .map_err(|source| DbgEngError::Context {
+                operation: format!("resolving system thread id {thread_system_id:#x}"),
+                source,
+            })?;
+        unsafe { objects.SetCurrentThreadId(selected_engine_id) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: format!("selecting system thread id {thread_system_id:#x}"),
+                source,
+            }
+        })?;
+        Ok(ThreadSelectionGuard {
+            engine: self,
+            saved: ThreadSelection {
+                process_system_id,
+                thread_system_id: thread_system_id_before,
+                scope,
+            },
+            selected_engine_id,
+            selected_system_id: thread_system_id,
+        })
+    }
+
+    fn restore_thread_selection(&self, saved: &ThreadSelection) -> Result<(), DbgEngError> {
+        if saved.scope.target != self.target_identity() {
+            return Err(DbgEngError::ThreadSelectionFromAnotherTarget);
+        }
+        let objects = self.system_objects()?;
+        let process_engine_id = unsafe { objects.GetProcessIdBySystemId(saved.process_system_id) }
+            .map_err(|source| DbgEngError::Context {
+                operation: format!(
+                    "resolving saved system process id {:#x}",
+                    saved.process_system_id
+                ),
+                source,
+            })?;
+        unsafe { objects.SetCurrentProcessId(process_engine_id) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "restoring the current process".into(),
+                source,
+            }
+        })?;
+        let thread_engine_id = unsafe { objects.GetThreadIdBySystemId(saved.thread_system_id) }
+            .map_err(|source| DbgEngError::Context {
+                operation: format!(
+                    "resolving saved system thread id {:#x}",
+                    saved.thread_system_id
+                ),
+                source,
+            })?;
+        unsafe { objects.SetCurrentThreadId(thread_engine_id) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "restoring the current thread".into(),
+                source,
+            }
+        })?;
+        self.set_scope(&saved.scope)
+    }
+
     /// The address of the system structure describing DbgEng's current thread
     /// (`GetCurrentThreadDataOffset`): the TEB on a user-mode target, and on a kernel target the
     /// thread running on the current processor.
@@ -10126,6 +10222,51 @@ impl Drop for ScopeGuard<'_> {
     }
 }
 
+struct ThreadSelection {
+    process_system_id: u32,
+    thread_system_id: u32,
+    scope: Scope,
+}
+
+/// A temporary DbgEng thread selection created by
+/// [`DebugEngine::thread_selection_guard`].
+///
+/// The guard borrows the engine, so selection and restoration stay on its owning thread. Drop is
+/// best-effort because it cannot report a failure; call [`Self::restore`] when success must be
+/// observed before returning a result.
+#[must_use = "the previous process, thread and scope are restored when this is dropped"]
+pub struct ThreadSelectionGuard<'a> {
+    engine: &'a DebugEngine,
+    saved: ThreadSelection,
+    selected_engine_id: u32,
+    selected_system_id: u32,
+}
+
+impl ThreadSelectionGuard<'_> {
+    /// DbgEng's process-relative id for the selected thread.
+    pub fn selected_engine_id(&self) -> u32 {
+        self.selected_engine_id
+    }
+
+    /// The operating-system id the caller asked to select.
+    pub fn selected_system_id(&self) -> u32 {
+        self.selected_system_id
+    }
+
+    /// Restores the saved process, thread and scope now, reporting whether all three succeeded.
+    pub fn restore(&self) -> Result<(), DbgEngError> {
+        self.engine.restore_thread_selection(&self.saved)
+    }
+}
+
+impl Drop for ThreadSelectionGuard<'_> {
+    fn drop(&mut self) {
+        // Best-effort on early return and panic paths. A target-generation mismatch is refused
+        // before any saved engine id or context is applied to the successor target.
+        let _ = self.engine.restore_thread_selection(&self.saved);
+    }
+}
+
 // Output callbacks implementation to capture command output
 #[windows::core::implement(
     windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacks
@@ -10356,6 +10497,7 @@ impl Drop for ScopedBreakpoint<'_> {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::System::Diagnostics::Debug::DebugBreak;
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
         DEBUG_CLASS_UNINITIALIZED, DEBUG_CLASS_USER_WINDOWS, DEBUG_KERNEL_CONNECTION,
         DEBUG_KERNEL_DUMP, DEBUG_KERNEL_FULL_DUMP, DEBUG_KERNEL_LOCAL, DEBUG_STATUS_BREAK,
@@ -15447,6 +15589,225 @@ mod tests {
             e.scope().expect("scope() failed"),
             before,
             "the guard did not restore the scope while unwinding"
+        );
+        let _ = e.end_session();
+    }
+
+    const THREAD_SELECTION_TARGET_ENV: &str = "DBGSCOPE_THREAD_SELECTION_TARGET";
+
+    #[test]
+    #[cfg(not(miri))]
+    #[ignore = "launched only as the debuggee for the thread-selection guard test"]
+    fn test_thread_selection_debuggee() {
+        if std::env::var_os(THREAD_SELECTION_TARGET_ENV).is_none() {
+            return;
+        }
+        std::thread::spawn(|| {
+            loop {
+                std::thread::park();
+            }
+        });
+        // SAFETY: this process was launched under DbgEng by the test below. The exception is the
+        // stable stopped point at which that test selects the parked worker thread.
+        unsafe { DebugBreak() };
+        loop {
+            std::thread::park();
+        }
+    }
+
+    fn current_process_thread_ids(engine: &DebugEngine) -> Vec<(u32, u32)> {
+        let objects = engine.system_objects().expect("system objects unavailable");
+        let count = unsafe { objects.GetNumberThreads() }.expect("thread count failed") as usize;
+        let mut engine_ids = vec![0u32; count];
+        let mut system_ids = vec![0u32; count];
+        unsafe {
+            objects.GetThreadIdsByIndex(
+                0,
+                count as u32,
+                Some(engine_ids.as_mut_ptr()),
+                Some(system_ids.as_mut_ptr()),
+            )
+        }
+        .expect("thread id listing failed");
+        engine_ids.into_iter().zip(system_ids).collect()
+    }
+
+    fn assert_thread_position(
+        engine: &DebugEngine,
+        process_system_id: u32,
+        thread_system_id: u32,
+        scope: &Scope,
+    ) {
+        assert_eq!(
+            engine
+                .current_process_system_id()
+                .expect("process id unavailable after restore"),
+            process_system_id,
+            "the guard did not restore the selected process"
+        );
+        assert_eq!(
+            engine
+                .current_thread_system_id()
+                .expect("thread id unavailable after restore"),
+            thread_system_id,
+            "the guard did not restore the selected thread"
+        );
+        assert_eq!(
+            engine.scope().expect("scope unavailable after restore"),
+            *scope,
+            "the guard did not restore the selected scope"
+        );
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn test_thread_selection_guard_restores_every_exit_path() {
+        let _debuggee = one_debuggee();
+        let e = DebugEngine::new();
+        let executable = std::env::current_exe().expect("test executable has no path");
+        let command = format!(
+            "\"{}\" --ignored --exact dbgeng::tests::test_thread_selection_debuggee --nocapture --test-threads=1",
+            executable.display()
+        );
+        let previous = std::env::var_os(THREAD_SELECTION_TARGET_ENV);
+        // SAFETY: the value is set only until CreateProcess inherits it. The helper is ignored in
+        // this parent and the engine tests serialize live debuggees with `one_debuggee`.
+        unsafe { std::env::set_var(THREAD_SELECTION_TARGET_ENV, "1") };
+        let launched = e.launch_process(&command);
+        match previous {
+            Some(value) => unsafe { std::env::set_var(THREAD_SELECTION_TARGET_ENV, value) },
+            None => unsafe { std::env::remove_var(THREAD_SELECTION_TARGET_ENV) },
+        }
+        launched.expect("launching the thread-selection fixture failed");
+        let run = e
+            .execute_and_wait("g", 10_000)
+            .expect("running to the fixture DebugBreak failed");
+        assert_eq!(run.cut_short, None, "fixture did not reach its DebugBreak");
+        assert!(!run.target_gone, "fixture exited before its DebugBreak");
+
+        let process_before = e
+            .current_process_system_id()
+            .expect("process id unavailable");
+        let thread_before = e.current_thread_system_id().expect("thread id unavailable");
+        let scope_before = e.scope().expect("scope unavailable");
+        let (other_engine_id, other_thread) = current_process_thread_ids(&e)
+            .into_iter()
+            .find(|(_, system_id)| *system_id != thread_before)
+            .expect("fixture created no second thread");
+
+        let invalid = match e.thread_selection_guard(u32::MAX) {
+            Ok(_) => panic!("an unknown system thread id was selected"),
+            Err(error) => error,
+        };
+        assert!(
+            invalid.to_string().contains("resolving system thread id"),
+            "wrong unknown-thread error: {invalid}"
+        );
+        assert_thread_position(&e, process_before, thread_before, &scope_before);
+
+        // Put a second process in the same session so every guard path has a real process move to
+        // undo, not just a process id that happened to stay equal.
+        let mut attached = a_process_to_attach_to();
+        e.attach_process(attached.id())
+            .expect("attaching the second process failed");
+        let objects = e.system_objects().expect("system objects unavailable");
+        let processes = e
+            .session_processes()
+            .expect("session process listing failed");
+        let attached_engine_id = processes
+            .iter()
+            .copied()
+            .into_iter()
+            .find_map(|(engine_id, system_id)| (system_id == attached.id()).then_some(engine_id))
+            .expect("attached process is absent from the session");
+        let process_engine_before = processes
+            .into_iter()
+            .find_map(|(engine_id, system_id)| (system_id == process_before).then_some(engine_id))
+            .expect("fixture process is absent from the session");
+        unsafe { objects.SetCurrentProcessId(process_engine_before) }
+            .expect("returning to the fixture process failed");
+        let thread_engine_before = unsafe { objects.GetThreadIdBySystemId(thread_before) }
+            .expect("remapping the fixture thread failed");
+        unsafe { objects.SetCurrentThreadId(thread_engine_before) }
+            .expect("returning to the fixture thread failed");
+        e.set_scope(&scope_before)
+            .expect("returning to the fixture scope failed");
+        assert_thread_position(&e, process_before, thread_before, &scope_before);
+
+        {
+            let guard = e
+                .thread_selection_guard(other_thread)
+                .expect("selecting another thread failed");
+            assert_eq!(guard.selected_system_id(), other_thread);
+            assert_eq!(guard.selected_engine_id(), other_engine_id);
+            assert_eq!(
+                e.current_thread_system_id()
+                    .expect("selected thread has no system id"),
+                other_thread
+            );
+            unsafe { objects.SetCurrentProcessId(attached_engine_id) }
+                .expect("moving to the attached process failed");
+            assert_eq!(
+                e.current_process_system_id()
+                    .expect("attached process has no system id"),
+                attached.id()
+            );
+            guard.restore().expect("explicit restore failed");
+        }
+        assert_thread_position(&e, process_before, thread_before, &scope_before);
+
+        let failed = (|| -> Result<(), DbgEngError> {
+            let _guard = e.thread_selection_guard(other_thread)?;
+            unsafe { objects.SetCurrentProcessId(attached_engine_id) }
+                .map_err(DbgEngError::OperationFailed)?;
+            Err(DbgEngError::InvalidOutput)
+        })();
+        assert!(matches!(failed, Err(DbgEngError::InvalidOutput)));
+        assert_thread_position(&e, process_before, thread_before, &scope_before);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = e
+                .thread_selection_guard(other_thread)
+                .expect("selecting another thread failed");
+            unsafe { objects.SetCurrentProcessId(attached_engine_id) }
+                .expect("moving to the attached process failed");
+            panic!("guarded caller gave up");
+        }))
+        .is_err();
+        assert!(panicked, "the guarded closure was supposed to panic");
+        assert_thread_position(&e, process_before, thread_before, &scope_before);
+
+        let stale = e
+            .thread_selection_guard(other_thread)
+            .expect("selecting another thread failed");
+        e.end_session().expect("ending the fixture session failed");
+        let _ = attached.kill();
+        let _ = attached.wait();
+        e.launch_process("cmd.exe /c exit")
+            .expect("opening the successor target failed");
+        let later_thread = e
+            .current_thread_system_id()
+            .expect("successor thread id unavailable");
+        let later_scope = e.scope().expect("successor scope unavailable");
+        let error = stale
+            .restore()
+            .expect_err("a selection from the previous target was restored");
+        assert!(
+            matches!(error, DbgEngError::ThreadSelectionFromAnotherTarget),
+            "wrong stale-selection error: {error}"
+        );
+        drop(stale);
+        assert_eq!(
+            e.current_thread_system_id()
+                .expect("successor thread id unavailable after stale drop"),
+            later_thread,
+            "dropping a stale guard moved the successor target's thread"
+        );
+        assert_eq!(
+            e.scope()
+                .expect("successor scope unavailable after stale drop"),
+            later_scope,
+            "dropping a stale guard moved the successor target's scope"
         );
         let _ = e.end_session();
     }

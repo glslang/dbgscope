@@ -49,6 +49,10 @@ see [Unknown, not absent](docs/unknown-not-absent.md).
   the debugger's scope — measured: `!analyze -v` discards a frame or `.ecxr` context the caller
   had selected — without the session ending up somewhere else. A `Scope` carries the target it
   was read from and is refused rather than applied to a later one.
+- **Typed thread selection** (`thread_selection_guard`) maps an operating-system thread id through
+  `IDebugSystemObjects` and restores the prior process, thread and scope on success, error or panic.
+  System ids and DbgEng's process-relative engine ids remain separate values, and a saved selection
+  is refused rather than applied to a later target.
 - **Kernel pool walking** (`pool::query`): `find_tag`, `chunk_at` with neighbours, `tag_census`,
   `snapshot_report` — every answer paired with the coverage of the walk it came from.
 - **User-mode Segment Heap walking** (`heap`): version-aware queries over the same page-segment,
