@@ -5332,21 +5332,7 @@ impl DebugEngine {
         thread_system_id: u32,
     ) -> Result<ThreadSelectionGuard<'_>, DbgEngError> {
         let objects = self.system_objects()?;
-        let process_system_id =
-            unsafe { objects.GetCurrentProcessSystemId() }.map_err(|source| {
-                DbgEngError::Context {
-                    operation: "reading the current process system id".into(),
-                    source,
-                }
-            })?;
-        let thread_system_id_before =
-            unsafe { objects.GetCurrentThreadSystemId() }.map_err(|source| {
-                DbgEngError::Context {
-                    operation: "reading the current thread system id".into(),
-                    source,
-                }
-            })?;
-        let scope = self.scope()?;
+        let saved = self.capture_thread_selection(&objects)?;
         let selected_engine_id = unsafe { objects.GetThreadIdBySystemId(thread_system_id) }
             .map_err(|source| DbgEngError::Context {
                 operation: format!("resolving system thread id {thread_system_id:#x}"),
@@ -5360,13 +5346,89 @@ impl DebugEngine {
         })?;
         Ok(ThreadSelectionGuard {
             engine: self,
-            saved: ThreadSelection {
-                process_system_id,
-                thread_system_id: thread_system_id_before,
-                scope,
-            },
+            saved,
             selected_engine_id,
             selected_system_id: thread_system_id,
+        })
+    }
+
+    /// Selects the process and thread recorded by a typed debugger event, restoring the prior
+    /// process, thread and scope when the returned guard is dropped.
+    ///
+    /// [`DebugEvent::process`] and [`DebugEvent::thread`] are DbgEng engine ids, not operating-
+    /// system ids. Taking the event rather than two integers preserves that distinction at the
+    /// API boundary and also supplies the target identity carried by its stored register context.
+    /// An event without a context is refused: it has no target provenance, and selecting ids from
+    /// an older target onto a successor can silently name valid but unrelated indices.
+    ///
+    /// The guard is installed before either selection call. If selecting the event's process,
+    /// thread, or system-id mapping fails, its drop path restores the original state before the
+    /// error leaves this method.
+    pub fn event_thread_selection_guard(
+        &self,
+        event: &DebugEvent,
+    ) -> Result<ThreadSelectionGuard<'_>, DbgEngError> {
+        let Some(context) = event.context.as_ref() else {
+            return Err(DbgEngError::Context {
+                operation: "selecting an event thread whose event carries no register context"
+                    .into(),
+                source: windows::core::Error::from(E_INVALIDARG),
+            });
+        };
+        if context.target != self.target_identity() {
+            return Err(DbgEngError::ThreadSelectionFromAnotherTarget);
+        }
+        let objects = self.system_objects()?;
+        let saved = self.capture_thread_selection(&objects)?;
+        let mut guard = ThreadSelectionGuard {
+            engine: self,
+            saved,
+            selected_engine_id: event.thread,
+            selected_system_id: 0,
+        };
+        unsafe { objects.SetCurrentProcessId(event.process) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: format!("selecting event process engine id {:#x}", event.process),
+                source,
+            }
+        })?;
+        unsafe { objects.SetCurrentThreadId(event.thread) }.map_err(|source| {
+            DbgEngError::Context {
+                operation: format!("selecting event thread engine id {:#x}", event.thread),
+                source,
+            }
+        })?;
+        guard.selected_system_id =
+            unsafe { objects.GetCurrentThreadSystemId() }.map_err(|source| {
+                DbgEngError::Context {
+                    operation: "reading the selected event thread's system id".into(),
+                    source,
+                }
+            })?;
+        Ok(guard)
+    }
+
+    fn capture_thread_selection(
+        &self,
+        objects: &IDebugSystemObjects,
+    ) -> Result<ThreadSelection, DbgEngError> {
+        let process_system_id =
+            unsafe { objects.GetCurrentProcessSystemId() }.map_err(|source| {
+                DbgEngError::Context {
+                    operation: "reading the current process system id".into(),
+                    source,
+                }
+            })?;
+        let thread_system_id = unsafe { objects.GetCurrentThreadSystemId() }.map_err(|source| {
+            DbgEngError::Context {
+                operation: "reading the current thread system id".into(),
+                source,
+            }
+        })?;
+        Ok(ThreadSelection {
+            process_system_id,
+            thread_system_id,
+            scope: self.scope()?,
         })
     }
 
@@ -15732,6 +15794,38 @@ mod tests {
             .expect("returning to the fixture thread failed");
         e.set_scope(&scope_before)
             .expect("returning to the fixture scope failed");
+        assert_thread_position(&e, process_before, thread_before, &scope_before);
+
+        let event = DebugEvent {
+            kind: 0,
+            process: process_engine_before,
+            thread: other_engine_id,
+            exception: None,
+            first_chance: false,
+            context: Some(ThreadContext {
+                bytes: vec![0],
+                target: e.target_identity(),
+            }),
+        };
+        {
+            let guard = e
+                .event_thread_selection_guard(&event)
+                .expect("selecting an event thread failed");
+            assert_eq!(guard.selected_system_id(), other_thread);
+            assert_eq!(guard.selected_engine_id(), other_engine_id);
+        }
+        assert_thread_position(&e, process_before, thread_before, &scope_before);
+
+        let mut contextless = event.clone();
+        contextless.context = None;
+        let error = match e.event_thread_selection_guard(&contextless) {
+            Ok(_) => panic!("an event without target provenance was selected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("no register context"),
+            "wrong contextless-event error: {error}"
+        );
         assert_thread_position(&e, process_before, thread_before, &scope_before);
 
         {
